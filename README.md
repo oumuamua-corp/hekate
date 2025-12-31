@@ -34,16 +34,27 @@ The result is absolute linearity. Infinite execution streams proved with flat, O
 
 ### THE KILL SHOT (BENCHMARKS)
 
-Toy Fibonacci sequences are irrelevant. The benchmark targets heavy ZK-Rollup state transitions (~50k txs batch, heavy hashing/storage).
+Benchmarks conducted on a consumer-grade M3 Max Laptop.
 
-| Metric | Monolithic Provers (The Industry Standard) | **Hekate Engine** (The New Reality) |
-| :--- | :--- | :--- |
-| **Architecture** | Trace Materialization (RAM Bloat) | Ephemeral Streaming (Zero-Allocation) |
-| **RAM (1M Cycles)** | > 100 GB (OOM on consumer hardware) | < 1 GB (Flat) |
-| **Disk I/O Overhead**| High (Spilling to swap) | Zero |
-| **Proving Location** | Centralized Cloud Clusters | Anywhere (Edge, Laptop, Cheap VPS) |
+*Note: To ensure a fair comparison with legacy provers (like Winterfell), which often use "packed" rows (2 terms per row) to hide FFT/LDE latency, Hekate was configured in the same "wide" mode.*
+
+### Winterfell
+
+| Complexity (Fibonacci) | Winterfell / Meta | Hekate Engine (Gen-5) | Result |
+| :--- | :--- | :--- | :--- |
+| **$2^{20}$ (1M steps)** | 691 ms | 378.9 ms | **1.8x Faster** |
+| **$2^{24}$ (16M steps)** | 16.1 sec | 3.45 sec | **4.6x Faster** |
+| **$2^{26}$ (67M steps)** | OOM (Out of Memory) | 14.9 sec (RAM peak 11GB) | **Total Dominance** |
+
+**Why we win:** While legacy provers struggle with $O(N \log N)$ complexity and massive memory blowup (LDE), Hekate scales linearly $O(N)$ using Binary Tower Fields and Streaming Brakedown LDT.
 
 ---
+
+### ARCHITECTURAL SUPERIORITY
+
+* **Legacy STARK:** Relies on $O(N \log N)$ FFT-based Low-Degree Extensions (LDE). As the trace grows, the "log" factor and massive memory requirements cause the prover to collapse on consumer hardware.
+* **Hekate:** Operates on a pure $O(N)$ linear-time architecture. It effectively "deletes" the FFT bottleneck, allowing proving of 67M+ rows on a laptop-workloads that literally break the industry's current standards.
+* **Zero-Knowledge Tax:** Hekate implements Information-Theoretic (Statistical) ZK with negligible overhead (~7.0s vs 6.4s), whereas legacy systems often see significant performance degradation when privacy is enabled.
 
 ### STATUS: PROPRIETARY
 
