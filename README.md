@@ -36,25 +36,21 @@ The result is absolute linearity. Infinite execution streams proved with flat, O
 
 Benchmarks conducted on a consumer-grade M3 Max Laptop.
 
-*Note: To ensure a fair comparison with legacy provers (like Winterfell), which often use "packed" rows (2 terms per row) to hide FFT/LDE latency, Hekate was configured in the same "wide" mode.*
+### Wintterfell
 
-### Winterfell
+> [!WARNING]
+> **The Handicap:**
+> * Winterfell: Configured in "Packed" mode (2 terms per row) to hide architectural latency.
+> * Hekate: Configured in "Pure" mode (1 term per row). Hekate performs 2x the logical work per row and still dominates.
 
-| Complexity (Fibonacci) | Winterfell / Meta | Hekate Engine (Gen-5) | Result |
+| Metric | Winterfell (Legacy / Miden Core) | **Hekate Engine** (Gen-5) | Kill Stats |
 | :--- | :--- | :--- | :--- |
-| **$2^{20}$ (1M steps)** | 691 ms | 378.9 ms | **1.8x Faster** |
-| **$2^{24}$ (16M steps)** | 16.1 sec | 3.45 sec | **4.6x Faster** |
-| **$2^{26}$ (67M steps)** | OOM (Out of Memory) | 14.9 sec (RAM peak 11GB) | **Total Dominance** |
+| **Security Level** | ~99 Bits (Proven <60) | **128 Bits** (Standard) | **Safer** |
+| **$2^{20}$ (1M Rows)** | 792 ms (~1GB RAM) | **397 ms** (170 MB RAM) | **2.0x Faster / 6x Less RAM** |
+| **$2^{24}$ (16M Rows)** | 18.34 s (**24 GB RAM**) | **6.39 s** (1.2 GB RAM) | **2.9x Faster / 20x Less RAM** |
+| **$2^{26}$ (67M Rows)** | **CRASH (Out of Memory)** | **28.2 s** (11.8 GB RAM) | **Infinite Scale vs Failure** |
 
-**Why we win:** While legacy provers struggle with $O(N \log N)$ complexity and massive memory blowup (LDE), Hekate scales linearly $O(N)$ using Binary Tower Fields and Streaming Brakedown LDT.
-
----
-
-### ARCHITECTURAL SUPERIORITY
-
-* **Legacy STARK:** Relies on $O(N \log N)$ FFT-based Low-Degree Extensions (LDE). As the trace grows, the "log" factor and massive memory requirements cause the prover to collapse on consumer hardware.
-* **Hekate:** Operates on a pure $O(N)$ linear-time architecture. It effectively "deletes" the FFT bottleneck, allowing proving of 67M+ rows on a laptop-workloads that literally break the industry's current standards.
-* **Zero-Knowledge Tax:** Hekate implements Information-Theoretic (Statistical) ZK with negligible overhead (~7.0s vs 6.4s), whereas legacy systems often see significant performance degradation when privacy is enabled.
+*Note: Winterfell crashes because it attempts to materialize the entire execution trace + LDE in RAM (O(N log N)). Hekate streams the computation (O(N)), keeping memory usage flat.*
 
 ### STATUS: PROPRIETARY
 
