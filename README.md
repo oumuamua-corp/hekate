@@ -43,6 +43,8 @@ Benchmarks conducted on a consumer-grade M3 Max Laptop.
 > * Winterfell: Configured in "Packed" mode (2 terms per row) to hide architectural latency.
 > * Hekate: Configured in "Pure" mode (1 term per row). Hekate performs 2x the logical work per row and still dominates.
 
+![Benchmark Chart](https://github.com/oumuamua-corp/hekate/blob/main/hekate_vs_winterfell_fibonacci.png?raw=true)
+
 | Metric | Winterfell (Legacy / Miden Core) | **Hekate Engine** (Gen-5) | Kill Stats |
 | :--- | :--- | :--- | :--- |
 | **Security Level** | ~99 Bits (Proven <60) | **128 Bits** (Standard) | **Safer** |
