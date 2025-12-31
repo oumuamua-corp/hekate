@@ -49,7 +49,7 @@ Benchmarks conducted on a consumer-grade M3 Max Laptop.
 | :--- | :--- | :--- | :--- |
 | **Security Level** | ~99 Bits (Proven <60) | **128 Bits** (Standard) | **Safer** |
 | **$2^{20}$ (1M Rows)** | 792 ms (~1GB RAM) | **397 ms** (170 MB RAM) | **2.0x Faster / 6x Less RAM** |
-| **$2^{24}$ (16M Rows)** | 18.34 s (**24 GB RAM**) | **6.39 s** (1.2 GB RAM) | **2.9x Faster / 20x Less RAM** |
+| **$2^{24}$ (16M Rows)** | 18.34 s (**24 GB RAM**) | **6.39 s** (2.72 GB RAM) | **2.9x Faster / ~9x Less RAM** |
 | **$2^{26}$ (67M Rows)** | **CRASH (Out of Memory)** | **28.2 s** (11.8 GB RAM) | **Infinite Scale vs Failure** |
 
 *Note: Winterfell crashes because it attempts to materialize the entire execution trace + LDE in RAM (O(N log N)). Hekate streams the computation (O(N)), keeping memory usage flat.*
