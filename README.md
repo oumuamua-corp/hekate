@@ -36,7 +36,7 @@ The result is absolute linearity. Infinite execution streams proved with flat, O
 
 Benchmarks conducted on a consumer-grade M3 Max Laptop.
 
-### Wintterfell
+### Winterfell
 
 > [!WARNING]
 > **The Handicap:**
