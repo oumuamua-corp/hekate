@@ -41,10 +41,6 @@ Benchmarks conducted on a consumer-grade M3 Max Laptop.
 > **The Workload:**
 > Unlike the synthetic Fibonacci test bellow, this benchmark runs Keccak-f[1600] (Ethereum-native hashing). This is a real-world, heavy-duty cryptographic workload.
 
-**The Reality Check:**
-Binius is a specialized race car. It is incredibly fast on small, perfect tracks ($2^{15}$).
-Hekate is an armored tank. It crushes industrial workloads ($2^{24}+$) where Binius engines melt down due to memory exhaustion.
-
 ![Benchmark Chart](https://github.com/oumuamua-corp/hekate/blob/main/hekate_vs_binius64_keccak_f1600.png?raw=true)
 
 | Metric (Keccak) | Binius64 (Bit-Level Optimization) | **Hekate Engine** (Zero-Copy) | Kill Stats |
