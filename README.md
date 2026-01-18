@@ -10,8 +10,7 @@
 The Zero-Knowledge industry is built on a lie. It sold scalable trust but delivered infrastructure debt.
 It builds server-grade dinosaurs in an era that demands edge-native agility.
 
-Current STARK provers (Stone, Winterfell, Miden) are architecturally obsolete. They suffer from the "Monolithic Trace Fallacy",
-the naive belief that the entire history of a computation must be materialized in RAM to be proven.
+Current STARK and Binary-Field provers (Stone/Stwo, Winterfell, Miden, Binius) are architecturally obsolete. They suffer from the "Monolithic Trace Fallacy", the naive belief that the entire history of a computation must be materialized in RAM to be proven.
 
 This architectural failure imposes a heavy "RAM Tax" on every rollup:
 * It demands 128GB+ server nodes for real-world workloads.
@@ -35,6 +34,26 @@ The result is absolute linearity. Infinite execution streams proved with flat, O
 ### THE KILL SHOT (BENCHMARKS)
 
 Benchmarks conducted on a consumer-grade M3 Max Laptop.
+
+### Binius64
+
+> [!CAUTION]
+> **The Workload:**
+> Unlike the synthetic Fibonacci test bellow, this benchmark runs Keccak-f[1600] (Ethereum-native hashing). This is a real-world, heavy-duty cryptographic workload.
+
+**The Reality Check:**
+Binius is a specialized race car. It is incredibly fast on small, perfect tracks ($2^{15}$).
+Hekate is an armored tank. It crushes industrial workloads ($2^{24}+$) where Binius engines melt down due to memory exhaustion.
+
+![Benchmark Chart](https://github.com/oumuamua-corp/hekate/blob/main/hekate_vs_binius64_keccak_f1600.png?raw=true)
+
+| Metric (Keccak) | Binius64 (Bit-Level Optimization) | **Hekate Engine** (Zero-Copy) | Kill Stats |
+| :--- | :--- | :--- | :--- |
+| **$2^{15}$ (1.3k Permutations)** | **147 ms** (~400 MB RAM) | 202 ms (**44 MB RAM**) | **~9x Less RAM Overhead** |
+| **$2^{20}$ (41k Permutations)** | SWAP HELL (**72 GB RAM**) | **4.74 s** (1.4 GB RAM) | **50x Less RAM** |
+| **$2^{24}$ (671k Permutations)** | **CRASH (Out of Memory)** | **88 s** (21.5 GB Peak) | **Operational vs Dead** |
+
+*Note: Binius64 scales linearly in time but exponentially in memory cost due to massive allocation requirements for binary field extensions. Hekate maintains a flat memory profile via streaming.*
 
 ### Winterfell
 
