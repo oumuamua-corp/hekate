@@ -21,8 +21,9 @@ extern crate alloc;
 
 mod brakedown;
 mod evaluator;
-mod logup;
 mod sumcheck;
+
+pub mod logup;
 
 pub use sumcheck::verify;
 
@@ -1082,7 +1083,7 @@ where
 /// MLE of `Source::RowIndexLeBytes` at `r_final`.
 /// Linear in `r_final` because `F::from`
 /// is XOR-additive over char-2.
-fn eval_row_idx_le_mle<F>(num_bytes: usize, r_final: &[Flat<F>]) -> Flat<F>
+pub fn eval_row_idx_le_mle<F>(num_bytes: usize, r_final: &[Flat<F>]) -> Flat<F>
 where
     F: TowerField + HardwareField + From<u128>,
 {
@@ -1099,7 +1100,7 @@ where
 /// MLE of `Source::RowIndexByte` at `r_final`.
 /// Same char-2 shortcut as `eval_row_idx_le_mle`,
 /// restricted to one byte.
-fn eval_row_idx_byte_mle<F>(byte_idx: usize, r_final: &[Flat<F>]) -> Flat<F>
+pub fn eval_row_idx_byte_mle<F>(byte_idx: usize, r_final: &[Flat<F>]) -> Flat<F>
 where
     F: TowerField + HardwareField + From<u128>,
 {
