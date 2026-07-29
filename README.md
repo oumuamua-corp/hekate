@@ -301,33 +301,24 @@ just example fibonacci_raw 26 public   # num_vars
 
 |              | ML-KEM-768 | ML-DSA-44 | ML-DSA-65 | ML-DSA-87 | AES-128   | AES-256   |
 |:-------------|:-----------|:----------|:----------|:----------|:----------|:----------|
-| Proving      | 893 ms     | 1.50 s    | 1.56 s    | 2.69 s    | 2.01 s    | 2.11 s    |
-| Verification | 17.5 ms    | 22.2 ms   | 22.2 ms   | 28.5 ms   | 14.1 ms   | 15.9 ms   |
-| Proof Size   | 3,389 KiB  | 4,607 KiB | 4,650 KiB | 6,142 KiB | 6,554 KiB | 7,298 KiB |
-| Peak memory  | 612 MiB    | 557 MiB   | 598 MiB   | 1,136 MiB | 1,586 MiB | 2,002 MiB |
+| Proving      | 919 ms     | 1.60 s    | 1.66 s    | 2.95 s    | 2.08 s    | 2.27 s    |
+| Verification | 23.6 ms    | 29.2 ms   | 29.5 ms   | 35.1 ms   | 18.2 ms   | 18.3 ms   |
+| Proof Size   | 4,459 KiB  | 5,823 KiB | 5,851 KiB | 7,897 KiB | 7,663 KiB | 8,404 KiB |
+| Peak memory  | 556 MiB    | 603 MiB   | 566 MiB   | 1,279 MiB | 1,631 MiB | 2,058 MiB |
 | Chiplets     | 6          | 7         | 7         | 7         | 2         | 2         |
 
-Chiplet trace sizes:
-
-- ML-KEM-768: Ctrl 2^16, Keccak 2^11, NTT 2^15, TwiddleROM 2^15, Basemul 2^12, RAM 2^16.
-- ML-DSA-44 / ML-DSA-65: Ctrl 2^16, Keccak 2^13, NTT 2^16, TwiddleROM 2^16, NormCheck 2^11, HighBits 2^11, RAM 2^16.
-- ML-DSA-87 doubles Ctrl and Keccak: 2^17 / 2^14.
-
 AES note: both AES-128 and AES-256 prove **31,250 blocks** (~500 KB plaintext) per run.
-CPU trace 2^16 rows; Round-AIR and S-box ROM chiplets at 2^19. Per-block proving cost: ~69 µs (AES-128) / ~73 µs (
+CPU trace 2^16 rows; Round-AIR and S-box ROM chiplets at 2^19. Per-block proving cost: ~67 µs (AES-128) / ~73 µs (
 AES-256).
 
 ### Keccak-f[1600], scaling
 
 `hekate/examples/keccak_inline.rs <num_vars>`, default 20.
 
-| Scale (rows) | Permutations | Hashed  | Proving  | Verify  | Proof Size | Peak memory |
-|:-------------|:-------------|:--------|:---------|:--------|:-----------|:------------|
-| 2^15         | 1,310        | ~178 KB | 323 ms   | 5.6 ms  | 958 KiB    | 181 MiB     |
-| 2^20         | 41,943       | ~5.4 MB | 7.78 s   | 10.8 ms | 4,796 KiB  | 3,495 MiB   |
-| 2^24 *       | 671,088      | ~91 MB  | 155.43 s | 70.7 ms | 18,860 KiB | 46,080 MiB  |
-
-\* 2^24 exceeds this host's 48 GB, its proving time includes compressor overhead.
+| Scale (rows) | Permutations | Hashed  | Proving | Verify  | Proof Size | Peak memory |
+|:-------------|:-------------|:--------|:--------|:--------|:-----------|:------------|
+| 2^15         | 1,310        | ~178 KB | 323 ms  | 6.1 ms  | 1,105 KiB  | 175 MiB     |
+| 2^20         | 41,943       | ~5.4 MB | 7.58 s  | 13.1 ms | 5,446 KiB  | 3,596 MiB   |
 
 ### Fibonacci (32-bit integer add), scaling
 
@@ -336,9 +327,9 @@ explicit carry chain, virtual-expanded into 32 bit + 32 sum + 32 carry columns.
 
 | Scale (rows) | Proving | Verify  | Proof Size | Peak memory |
 |:-------------|:--------|:--------|:-----------|:------------|
-| 2^20         | 504 ms  | 4.5 ms  | 1,034 KiB  | 233 MiB     |
-| 2^24         | 8.00 s  | 10.9 ms | 3,999 KiB  | 3,296 MiB   |
-| 2^26         | 33.18 s | 15.6 ms | 7,939 KiB  | 13,312 MiB  |
+| 2^20         | 509 ms  | 4.5 ms  | 1,034 KiB  | 226 MiB     |
+| 2^24         | 7.99 s  | 9.7 ms  | 3,998 KiB  | 3,297 MiB   |
+| 2^26         | 36.10 s | 16.8 ms | 7,926 KiB  | 13,312 MiB  |
 
 ---
 
