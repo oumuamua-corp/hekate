@@ -1,0 +1,307 @@
+// SPDX-License-Identifier: Apache-2.0
+// This file is part of the hekate project.
+// Copyright (C) 2026 Andrei Kochergin <andrei@oumuamua.dev>
+// Copyright (C) 2026 Oumuamua Labs <info@oumuamua.dev>.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use hekate_core::config::Config;
+use hekate_core::trace::{ColumnTrace, ColumnType, Trace, TraceBuilder};
+use hekate_crypto::DefaultHasher;
+use hekate_crypto::transcript::Transcript;
+use hekate_keccak::{
+    CpuKeccakColumns, CpuKeccakUnit, KeccakChiplet, KeccakWitness, generate_keccak_trace,
+};
+use hekate_math::{Bit, Block32, Block64, Block128, TowerField};
+use hekate_program::chiplet::ChipletDef;
+use hekate_program::constraint::builder::ConstraintSystem;
+use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
+use hekate_program::permutation::PermutationCheckSpec;
+use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_prover_sys::prove;
+use hekate_verifier::HekateVerifier;
+
+type F = Block128;
+type H = DefaultHasher;
+
+const ROUNDS: usize = 24;
+
+const ROWS_PER_CALL: usize = ROUNDS + 1;
+const ROWS: usize = 32;
+
+const PHYS_ROUND: usize = 25;
+const PHYS_REQUEST_IDX: usize = 26;
+const PHYS_S_ROUND: usize = 27;
+const PHYS_S_IN_OUT: usize = 28;
+const PHYS_IS_OUTPUT: usize = 29;
+
+#[derive(Clone)]
+struct KeccakTestProgram;
+
+impl Air<F> for KeccakTestProgram {
+    /// Which row sends the state and which receives
+    /// it is the statement, not a witness value.
+    fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
+        vec![CpuKeccakUnit::direction_boundary(0)]
+    }
+
+    fn column_layout(&self) -> &[ColumnType] {
+        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
+        LAYOUT.get_or_init(CpuKeccakColumns::build_layout)
+    }
+
+    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
+        vec![(KeccakChiplet::BUS_ID.into(), CpuKeccakUnit::linking_spec())]
+    }
+
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        let cs = ConstraintSystem::<F>::new();
+
+        CpuKeccakUnit::constrain(&cs, 0);
+
+        cs.build()
+    }
+}
+
+impl Program<F> for KeccakTestProgram {
+    fn num_public_inputs(&self) -> usize {
+        0
+    }
+
+    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
+        Ok(vec![ChipletDef::from_air(&KeccakChiplet::new(ROWS))?])
+    }
+}
+
+fn test_input() -> [u64; 25] {
+    core::array::from_fn(|i| (i as u64).wrapping_mul(0x9E37_79B9) | 1)
+}
+
+fn constant_schedule(constants: &[u64; ROUNDS]) -> Vec<(u32, u64)> {
+    constants
+        .iter()
+        .enumerate()
+        .map(|(round, &rc)| (1u32 << round, rc))
+        .collect()
+}
+
+fn subset_schedule(offsets: &[usize], steps: usize) -> Vec<(u32, u64)> {
+    (0..steps)
+        .map(|step| {
+            offsets.iter().fold((0u32, 0u64), |(word, rc), &offset| {
+                (
+                    word | (1u32 << (offset + step)),
+                    rc ^ KeccakChiplet::ROUND_CONSTANTS[offset + step],
+                )
+            })
+        })
+        .collect()
+}
+
+fn cpu_trace(input: [u64; 25], output: [u64; 25]) -> ColumnTrace {
+    let num_vars = ROWS.trailing_zeros() as usize;
+
+    let mut tb = TraceBuilder::new(&CpuKeccakColumns::build_layout(), num_vars).unwrap();
+
+    for i in 0..25 {
+        tb.set_b64(CpuKeccakColumns::LANES + i, 0, Block64(input[i]))
+            .unwrap();
+        tb.set_b64(CpuKeccakColumns::LANES + i, ROUNDS, Block64(output[i]))
+            .unwrap();
+    }
+
+    tb.set_bit(CpuKeccakColumns::SELECTOR, 0, Bit::ONE).unwrap();
+    tb.set_bit(CpuKeccakColumns::SELECTOR, ROUNDS, Bit::ONE)
+        .unwrap();
+
+    for row in 1..=ROUNDS {
+        tb.set_bit(CpuKeccakColumns::IS_OUTPUT, row, Bit::ONE)
+            .unwrap();
+    }
+
+    tb.build()
+}
+
+/// `partners` are the CPU rows the block's
+/// first and last row name on the bus.
+fn chiplet_trace(
+    input: [u64; 25],
+    schedule: &[(u32, u64)],
+    partners: (u32, u32),
+) -> (ColumnTrace, [u64; 25]) {
+    let layout = Air::<F>::column_layout(&KeccakChiplet::new(ROWS)).to_vec();
+    let num_vars = ROWS.trailing_zeros() as usize;
+
+    let mut tb = TraceBuilder::new(&layout, num_vars).unwrap();
+    let mut state = input;
+
+    for (row, &(word, rc)) in schedule.iter().enumerate() {
+        for (lane, &value) in state.iter().enumerate() {
+            tb.set_b64(lane, row, Block64(value)).unwrap();
+        }
+
+        tb.set_b32(PHYS_ROUND, row, Block32::from(word)).unwrap();
+        tb.set_bit(PHYS_S_ROUND, row, Bit::ONE).unwrap();
+
+        if row == 0 {
+            tb.set_bit(PHYS_S_IN_OUT, row, Bit::ONE).unwrap();
+            tb.set_b32(PHYS_REQUEST_IDX, row, Block32::from(partners.0))
+                .unwrap();
+        }
+
+        state = KeccakWitness::keccak_f_round(state, rc);
+    }
+
+    let out_row = schedule.len();
+
+    for (lane, &value) in state.iter().enumerate() {
+        tb.set_b64(lane, out_row, Block64(value)).unwrap();
+    }
+
+    tb.set_bit(PHYS_S_IN_OUT, out_row, Bit::ONE).unwrap();
+    tb.set_bit(PHYS_IS_OUTPUT, out_row, Bit::ONE).unwrap();
+    tb.set_b32(PHYS_REQUEST_IDX, out_row, Block32::from(partners.1))
+        .unwrap();
+
+    (tb.build(), state)
+}
+
+fn proves_and_verifies(schedule: &[(u32, u64)]) -> bool {
+    let input = test_input();
+    let (chiplet, output) = chiplet_trace(input, schedule, (0, ROUNDS as u32));
+
+    run(input, output, chiplet)
+}
+
+fn run(cpu_input: [u64; 25], cpu_output: [u64; 25], chiplet: ColumnTrace) -> bool {
+    let air = KeccakTestProgram;
+    let instance = ProgramInstance::new(ROWS, vec![]);
+    let witness =
+        ProgramWitness::new(cpu_trace(cpu_input, cpu_output)).with_chiplets(vec![chiplet]);
+
+    let config = Config {
+        sumcheck_blinding_factor: 2,
+        ..Config::dev()
+    };
+
+    let proof = match prove(
+        b"Keccak_RC",
+        &air,
+        &instance,
+        &witness,
+        &config,
+        [0xA5u8; 32],
+        None,
+    ) {
+        Ok(proof) => proof,
+        Err(e) => {
+            println!("prover refused: {e:?}");
+            return false;
+        }
+    };
+
+    let mut vt = Transcript::<H>::new(b"Keccak_RC");
+
+    HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config).unwrap_or(false)
+}
+
+#[test]
+fn layout_matches_crate() {
+    let chiplet = KeccakChiplet::new(ROWS);
+    let layout = Air::<F>::column_layout(&chiplet);
+
+    assert_eq!(layout.len(), PHYS_IS_OUTPUT + 1);
+    assert!(layout[..PHYS_ROUND].iter().all(|c| *c == ColumnType::B64));
+    assert_eq!(layout[PHYS_ROUND], ColumnType::B32);
+    assert_eq!(layout[PHYS_REQUEST_IDX], ColumnType::B32);
+    assert_eq!(layout[PHYS_S_ROUND], ColumnType::Bit);
+    assert_eq!(layout[PHYS_S_IN_OUT], ColumnType::Bit);
+    assert_eq!(layout[PHYS_IS_OUTPUT], ColumnType::Bit);
+}
+
+#[test]
+fn harness_matches_generate_keccak_trace() {
+    let input = test_input();
+    let block: [Block64; 25] = core::array::from_fn(|i| Block64(input[i]));
+
+    let reference = generate_keccak_trace(&[block], None, ROWS).unwrap();
+    let (mine, _) = chiplet_trace(
+        input,
+        &constant_schedule(&KeccakChiplet::ROUND_CONSTANTS),
+        (0, ROUNDS as u32),
+    );
+
+    for col in 0..=PHYS_S_IN_OUT {
+        for row in 0..ROWS_PER_CALL {
+            assert_eq!(
+                reference.get_element::<F>(col, row).unwrap(),
+                mine.get_element::<F>(col, row).unwrap(),
+                "column {col} row {row} diverges from generate_keccak_trace"
+            );
+        }
+    }
+}
+
+#[test]
+fn canonical_schedule_verifies() {
+    assert!(
+        proves_and_verifies(&constant_schedule(&KeccakChiplet::ROUND_CONSTANTS)),
+        "the harness itself is broken, every rejection below is unattributable"
+    );
+}
+
+/// The state chain is honest under a zero schedule,
+/// the trace is consistent while the permutation
+/// is not Keccak-f[1600].
+#[test]
+fn zero_schedule_rejected() {
+    assert!(!proves_and_verifies(&constant_schedule(&[0u64; ROUNDS])));
+}
+
+#[test]
+fn flipped_constant_rejected() {
+    let mut constants = KeccakChiplet::ROUND_CONSTANTS;
+    constants[7] ^= 1;
+
+    assert!(!proves_and_verifies(&constant_schedule(&constants)));
+}
+
+/// The activity constraint is a char-2 parity:
+/// an odd-weight set of round bits satisfies it,
+/// shifts in lockstep and feeds iota the XOR of its
+/// constants. Held by the input-row exactness pin.
+#[test]
+fn odd_weight_schedule_rejected() {
+    assert!(!proves_and_verifies(&subset_schedule(&[0, 5, 9], 15)));
+}
+
+/// Nothing forces the chain to reach round 23 unless the
+/// terminal constraint pins `next_s_round` on every round row.
+#[test]
+fn truncated_schedule_rejected() {
+    assert!(!proves_and_verifies(&subset_schedule(&[0], 5)));
+}
+
+/// The bus key carries no direction without `IS_OUTPUT`,
+/// which lets the block pair to the CPU backwards.
+#[test]
+fn reversed_pairing_rejected() {
+    let x = test_input();
+    let (chiplet, y) = chiplet_trace(
+        x,
+        &constant_schedule(&KeccakChiplet::ROUND_CONSTANTS),
+        (ROUNDS as u32, 0),
+    );
+
+    assert!(!run(y, x, chiplet));
+}
