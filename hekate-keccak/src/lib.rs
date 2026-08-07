@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // This file is part of the hekate project.
 // Copyright (C) 2026 Andrei Kochergin <andrei@oumuamua.dev>
-// Copyright (C) 2026 Oumuamua Labs <info@oumuamua.dev>. All rights reserved.
+// Copyright (C) 2026 Oumuamua Labs <info@oumuamua.dev>.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,14 +28,15 @@ use hekate_core::errors::Error;
 use hekate_core::trace::{ColumnTrace, ColumnType, TraceBuilder, TraceCompatibleField};
 use hekate_math::{Bit, Block64, TowerField};
 use hekate_program::Air;
-use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
+use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
 use hekate_program::define_columns;
 use hekate_program::expander::VirtualExpander;
 use hekate_program::permutation::{PermutationCheckSpec, REQUEST_IDX_LABEL, Source};
 use once_cell::race::OnceBox;
 
-// FIPS 202 sponge parameters.
+// FIPS 202 §6.1-6.2:
+// suffix bits folded into pad10*1.
 const SHA3_DOMAIN_SEP: u8 = 0x06;
 const SHAKE_DOMAIN_SEP: u8 = 0x1f;
 
@@ -44,17 +45,19 @@ const SHA3_512_RATE: usize = 72; // (1600 - 1024) / 8
 const SHAKE128_RATE: usize = 168; // (1600 - 256) / 8
 const SHAKE256_RATE: usize = 136; // (1600 - 512) / 8
 
-// Physical column indices for Keccak trace.
-// Distinct from virtual KeccakColumns
-// (1692 cols after bit-unpacking).
+// Physical indices. KeccakColumns indexes the virtual trace.
 const PHYS_LANES: usize = 0; // 0..24: B64 state lanes
-const PHYS_RC: usize = 25; // B64 round constant
+const PHYS_ROUND: usize = 25; // B32 one-hot round index
 const PHYS_REQUEST_IDX: usize = 26; // B32 partner-side row index
 const PHYS_S_ROUND: usize = 27; // Bit: active round
 const PHYS_S_IN_OUT: usize = 28; // Bit: input/output row
-const PHYS_NUM_COLS: usize = 29;
+const PHYS_IS_OUTPUT: usize = 29; // Bit: emit direction
+const PHYS_NUM_COLS: usize = 30;
 
-/// Shared labels for Keccak bus linking.
+/// Separates a block's two emit rows in the bus key.
+pub const KECCAK_DIRECTION_LABEL: &[u8] = b"keccak_is_output";
+
+/// Both bus endpoints must emit these labels in this order.
 pub const KECCAK_LANE_LABELS: [&[u8]; 25] = [
     b"keccak_lane_0",
     b"keccak_lane_1",
@@ -86,11 +89,12 @@ pub const KECCAK_LANE_LABELS: [&[u8]; 25] = [
 define_columns! {
     pub KeccakColumns {
         STATE_BITS: [Bit; 1600],
-        RC_BITS: [Bit; 64],
+        ROUND_BITS: [Bit; 32],
         LANES: [B64; 25],
         REQUEST_IDX: B32,
         S_ROUND: Bit,
         S_IN_OUT: Bit,
+        IS_OUTPUT: Bit,
     }
 }
 
@@ -98,28 +102,32 @@ define_columns! {
     pub CpuKeccakColumns {
         LANES: [B64; 25],
         SELECTOR: Bit,
+        IS_OUTPUT: Bit,
     }
 }
 
-/// CPU Interface for Keccak.
-///
-/// Represents the CPU side of the Keccak bus.
-/// The CPU provides/consumes 25 lanes (u64 packed)
-/// when the selector is active.
+/// The host writes `IS_OUTPUT` from the row after an input
+/// emit through the row that receives the permutation result,
+/// calls `constrain`, and pins `IS_OUTPUT` at row 0.
 #[derive(Clone, Debug)]
 pub struct CpuKeccakUnit;
 
 impl CpuKeccakUnit {
-    /// Returns the permutation check
-    /// specification for CPU Keccak side.
+    pub const NUM_ROOTS: usize = 2;
+
     pub fn linking_spec() -> PermutationCheckSpec {
-        let mut sources = Vec::with_capacity(26);
+        let mut sources = Vec::with_capacity(27);
+
         for (i, label) in KECCAK_LANE_LABELS.iter().enumerate() {
             let col_idx = CpuKeccakColumns::LANES + i;
             sources.push((Source::Column(col_idx), *label));
         }
 
         sources.push((Source::RowIndexLeBytes(4), REQUEST_IDX_LABEL));
+        sources.push((
+            Source::Column(CpuKeccakColumns::IS_OUTPUT),
+            KECCAK_DIRECTION_LABEL,
+        ));
 
         PermutationCheckSpec::new(sources, Some(CpuKeccakColumns::SELECTOR))
     }
@@ -127,15 +135,29 @@ impl CpuKeccakUnit {
     pub fn num_columns(&self) -> usize {
         CpuKeccakColumns::NUM_COLUMNS
     }
+
+    /// Caller anchors `IS_OUTPUT` at row 0 with `direction_boundary`;
+    /// the recurrence alone admits the complement.
+    ///
+    /// `offset` is where `CpuKeccakColumns` starts in the host layout.
+    pub fn constrain<F: TowerField>(cs: &ConstraintSystem<F>, offset: usize) {
+        let selector = cs.col(offset + CpuKeccakColumns::SELECTOR);
+        let is_output = cs.col(offset + CpuKeccakColumns::IS_OUTPUT);
+
+        cs.assert_boolean(selector);
+        cs.constrain(cs.next(offset + CpuKeccakColumns::IS_OUTPUT) + is_output + selector);
+    }
+
+    pub fn direction_boundary<F: TowerField>(offset: usize) -> BoundaryConstraint<F> {
+        BoundaryConstraint::with_constant(offset + CpuKeccakColumns::IS_OUTPUT, 0, F::ZERO)
+    }
 }
 
-/// Keccak-f[1600] Permutation Chiplet.
+/// Keccak-f[1600] as 24 round rows plus one output row per block.
 ///
-/// # Layout
-/// - 1 Row = 1 Round of Keccak-f.
-/// - 24 Rows = 1 Full Permutation.
-/// - State is stored as 1600 "Bit" columns (to allow native degree-2 algebraic constraints).
-/// - I/O is stored as 25 "Block64" columns (to link with CPU via GPA).
+/// State lives in 1600 virtual bit columns; Chi stays degree 2.
+/// The 25 B64 lanes carrying the bus key are the same physical
+/// columns those bits expand from.
 #[derive(Clone, Debug)]
 pub struct KeccakChiplet {
     pub num_rows: usize,
@@ -144,13 +166,7 @@ pub struct KeccakChiplet {
 impl KeccakChiplet {
     pub const BUS_ID: &'static str = "keccak_link";
 
-    /// The number of physical bytes occupied
-    /// by the Keccak Chiplet in a single row.
-    /// Layout:
-    /// 25 Lanes (u64) + 1 RC (u64) + 2 Selectors (u8) = 200 + 8 + 2 = 210 bytes.
-    pub const PHYSICAL_ROW_BYTES: usize = 25 * 8 + 8 + 2;
-
-    /// Rotation offsets for Rho step (x, y) -> r
+    /// FIPS 202 §3.2.2, indexed `[x][y]`.
     pub const RHO_OFFSETS: [[usize; 5]; 5] = [
         [0, 36, 3, 41, 18],
         [1, 44, 10, 45, 2],
@@ -159,7 +175,7 @@ impl KeccakChiplet {
         [27, 20, 39, 8, 14],
     ];
 
-    /// Round constants for Keccak-f[1600].
+    /// FIPS 202 §3.2.5.
     pub const ROUND_CONSTANTS: [u64; 24] = [
         0x0000000000000001,
         0x0000000000008082,
@@ -192,10 +208,7 @@ impl KeccakChiplet {
         Self { num_rows }
     }
 
-    /// Construct for constraint-only use
-    /// (constraints/constraint_ast).
-    /// No trace size needed, constraint
-    /// generation is size-independent.
+    /// `num_rows` does not reach constraint generation.
     pub fn for_constraints() -> Self {
         Self { num_rows: 0 }
     }
@@ -207,8 +220,8 @@ impl KeccakChiplet {
     }
 
     #[inline(always)]
-    pub fn get_rc_col(z: usize) -> usize {
-        KeccakColumns::RC_BITS + z
+    pub fn get_round_col(round: usize) -> usize {
+        KeccakColumns::ROUND_BITS + round
     }
 
     #[inline(always)]
@@ -216,10 +229,9 @@ impl KeccakChiplet {
         KeccakColumns::LANES + (y * 5 + x)
     }
 
-    /// Linking specification. Defines how the
-    /// 25 "Lane" columns match the Bus.
     pub fn linking_spec() -> PermutationCheckSpec {
-        let mut sources = Vec::with_capacity(26);
+        let mut sources = Vec::with_capacity(27);
+
         for y in 0..5 {
             for x in 0..5 {
                 let lane_idx = y * 5 + x;
@@ -235,7 +247,35 @@ impl KeccakChiplet {
             REQUEST_IDX_LABEL,
         ));
 
+        sources.push((
+            Source::Column(KeccakColumns::IS_OUTPUT),
+            KECCAK_DIRECTION_LABEL,
+        ));
+
         PermutationCheckSpec::new(sources, Some(KeccakColumns::S_IN_OUT))
+    }
+
+    pub fn physical_layout() -> &'static [ColumnType] {
+        static PHYSICAL_LAYOUT: OnceBox<Vec<ColumnType>> = OnceBox::new();
+        PHYSICAL_LAYOUT.get_or_init(|| {
+            let mut cols = Vec::with_capacity(PHYS_NUM_COLS);
+            cols.extend(vec![ColumnType::B64; 25]);
+            cols.extend(vec![ColumnType::B32; 2]);
+            cols.extend(vec![ColumnType::Bit; 3]);
+
+            Box::new(cols)
+        })
+    }
+
+    /// `phys_offset` is absolute in the host program's
+    /// physical layout, not relative to this chiplet.
+    pub fn expand_into(expander: VirtualExpander, phys_offset: usize) -> VirtualExpander {
+        expander
+            .expand_bits(25, ColumnType::B64)
+            .expand_bits(1, ColumnType::B32)
+            .reuse_pass_through(phys_offset, 25)
+            .pass_through(1, ColumnType::B32)
+            .control_bits(3)
     }
 }
 
@@ -245,20 +285,7 @@ impl<F: TowerField + TraceCompatibleField> Air<F> for KeccakChiplet {
     }
 
     fn column_layout(&self) -> &[ColumnType] {
-        // Physical layout:
-        // 25 B64 lanes
-        //   + 1 B64 RC
-        //   + 1 B32 request_idx
-        //   + 2 Bit selectors
-        static PHYSICAL_LAYOUT: OnceBox<Vec<ColumnType>> = OnceBox::new();
-        PHYSICAL_LAYOUT.get_or_init(|| {
-            let mut cols = Vec::with_capacity(PHYS_NUM_COLS);
-            cols.extend(vec![ColumnType::B64; 26]); // 25 lanes + RC
-            cols.push(ColumnType::B32); // request_idx
-            cols.extend(vec![ColumnType::Bit; 2]); // s_round, s_in_out
-
-            Box::new(cols)
-        })
+        Self::physical_layout()
     }
 
     fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
@@ -269,12 +296,7 @@ impl<F: TowerField + TraceCompatibleField> Air<F> for KeccakChiplet {
         static E: OnceBox<VirtualExpander> = OnceBox::new();
         Some(E.get_or_init(|| {
             Box::new(
-                VirtualExpander::new()
-                    .expand_bits(25, ColumnType::B64) // 25 lanes -> 1600 bits
-                    .expand_bits(1, ColumnType::B64) // RC -> 64 bits
-                    .reuse_pass_through(0, 25) // 25 lanes as IO B64
-                    .pass_through(1, ColumnType::B32) // request_idx
-                    .control_bits(2) // s_round, s_in_out
+                Self::expand_into(VirtualExpander::new(), PHYS_LANES)
                     .build()
                     .expect("KeccakChiplet expander"),
             )
@@ -287,8 +309,7 @@ impl<F: TowerField + TraceCompatibleField> Air<F> for KeccakChiplet {
         let s_round = cs.col(KeccakColumns::S_ROUND);
         let s_in_out = cs.col(KeccakColumns::S_IN_OUT);
 
-        // 1. Packing:
-        // lane = Σ bit[z] * 2^z, gated by s_in_out
+        // lane = Σ bit[z] · 2^z on emit rows
         for y in 0..5 {
             for x in 0..5 {
                 let lane = cs.col(Self::get_lane_col(x, y));
@@ -300,8 +321,7 @@ impl<F: TowerField + TraceCompatibleField> Air<F> for KeccakChiplet {
             }
         }
 
-        // 2. Column parity (CSE level 1):
-        // C[x,z] = Σ_{y=0..4} A[x,y,z]
+        // C[x,z] = Σ_y A[x,y,z]
         let col_parity: [[_; 64]; 5] = core::array::from_fn(|x| {
             core::array::from_fn(|z| {
                 cs.sum(
@@ -312,7 +332,6 @@ impl<F: TowerField + TraceCompatibleField> Air<F> for KeccakChiplet {
             })
         });
 
-        // 3. Theta (CSE level 2):
         // Theta(x,y,z) = A[x,y,z] + C[x-1,z] + C[x+1,z-1]
         let theta: [[[_; 64]; 5]; 5] = core::array::from_fn(|x| {
             core::array::from_fn(|y| {
@@ -326,8 +345,7 @@ impl<F: TowerField + TraceCompatibleField> Air<F> for KeccakChiplet {
             })
         });
 
-        // Helper:
-        // B[x,y,z] via inverse Pi + inverse Rho → Theta
+        // B[x,y,z] read through inverse Pi and Rho
         let get_b = |out_x: usize, out_y: usize, out_z: usize| {
             let in_x = (out_x + 3 * out_y) % 5;
             let in_y = out_x;
@@ -337,8 +355,6 @@ impl<F: TowerField + TraceCompatibleField> Air<F> for KeccakChiplet {
             theta[in_x][in_y][in_z]
         };
 
-        // 4. Round constraints:
-        // Chi + Iota
         for x in 0..5 {
             for y in 0..5 {
                 for z in 0..64 {
@@ -346,24 +362,30 @@ impl<F: TowerField + TraceCompatibleField> Air<F> for KeccakChiplet {
                     let b_next1 = get_b((x + 1) % 5, y, z);
                     let b_next2 = get_b((x + 2) % 5, y, z);
 
-                    // Chi = b_curr + b_next2 + b_next1 * b_next2
                     let chi = cs.sum(&[b_curr, b_next2, b_next1 * b_next2]);
                     let next_bit = cs.next(Self::get_bit_col(x, y, z));
 
-                    if x == 0 && y == 0 {
-                        let rc = cs.col(Self::get_rc_col(z));
-                        cs.assert_zero_when(s_round, cs.sum(&[next_bit, chi, rc]));
-                    } else {
-                        cs.assert_zero_when(s_round, next_bit + chi);
+                    // Iota's constant is a coefficient, never a witness column
+                    let flips: Vec<_> = match (x, y) {
+                        (0, 0) => (0..24)
+                            .filter(|&round| (Self::ROUND_CONSTANTS[round] >> z) & 1 == 1)
+                            .map(|round| cs.col(Self::get_round_col(round)))
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+
+                    match flips.is_empty() {
+                        true => cs.assert_zero_when(s_round, next_bit + chi),
+                        false => {
+                            cs.assert_zero_when(s_round, cs.sum(&[next_bit, chi, cs.sum(&flips)]))
+                        }
                     }
                 }
             }
         }
 
-        // 5. Ghost Protocol:
-        // Continuity, round row must be followed
-        // by round or I/O. Prevents mid-chain
-        // s_round deactivation.
+        // Ghost Protocol. A round row is followed
+        // by a round row or an output row.
         cs.assert_boolean(s_round);
         cs.assert_boolean(s_in_out);
 
@@ -373,11 +395,55 @@ impl<F: TowerField + TraceCompatibleField> Air<F> for KeccakChiplet {
 
         cs.constrain(s_round * (one + next_s_round + next_s_in_out));
 
-        // Output binding, row before any
-        // output must be a round row.
-        // MLE wrap (row 31->0) forces
-        // s_round=1 on input row.
+        // The row before an output row is a round row. `next`
+        // wraps at the trace end, which carries this onto row 0.
         cs.constrain(next_s_in_out * (one + next_s_round) * (one + s_round));
+
+        // Round index: one-hot at 0 on the input row, one
+        // shift per round row, block ends after round 23.
+        let round = |r: usize| cs.col(Self::get_round_col(r));
+        let weighted = |lo: usize, hi: usize| {
+            cs.sum(
+                &(lo..hi)
+                    .map(|r| cs.scale(F::from(1u128 << r), round(r)))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let weighted_next = |lo: usize, hi: usize| {
+            cs.sum(
+                &(lo..hi)
+                    .map(|r| cs.scale(F::from(1u128 << r), cs.next(Self::get_round_col(r))))
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        cs.constrain(weighted(24, 32));
+        cs.constrain(s_round + cs.sum(&(0..24).map(round).collect::<Vec<_>>()));
+
+        let input_row = s_in_out * s_round;
+
+        cs.assert_zero_when(input_row, one + round(0));
+        cs.assert_zero_when(input_row, weighted(1, 24));
+
+        // A chain may only begin on an input row
+        let not_round = one + s_round;
+
+        cs.assert_zero_when(not_round, weighted(0, 24));
+        cs.assert_zero_when(not_round, weighted_next(1, 24));
+        cs.constrain(round(0) * (one + s_in_out));
+
+        for r in 0..23 {
+            cs.constrain(s_round * (cs.next(Self::get_round_col(r + 1)) + round(r)));
+        }
+
+        cs.constrain(s_round * (next_s_round + one + round(23)));
+
+        // The bus key cannot tell a block's
+        // two emit rows apart without this.
+        let is_output = cs.col(KeccakColumns::IS_OUTPUT);
+
+        cs.assert_zero_when(s_in_out, is_output + one + s_round);
+        cs.assert_zero_when(one + s_in_out, is_output);
 
         cs.build()
     }
@@ -386,7 +452,6 @@ impl<F: TowerField + TraceCompatibleField> Air<F> for KeccakChiplet {
 pub struct KeccakWitness;
 
 impl KeccakWitness {
-    /// Performs one Keccak-f[1600] round in pure Rust.
     #[inline(always)]
     pub fn keccak_f_round(mut a: [u64; 25], rc: u64) -> [u64; 25] {
         // Theta
@@ -426,15 +491,10 @@ impl KeccakWitness {
         a
     }
 
-    /// Assigns a full 24-round
-    /// permutation to the trace (Row-by-Row).
+    /// Writes 25 rows from `start_row` and returns the permuted state.
     ///
-    /// # Note
-    /// This method is slower than
-    /// `KeccakSpongeNative::generate_trace`
-    /// and is intended primarily for testing
-    /// and manual trace construction where
-    /// batching is not applicable.
+    /// Row-at-a-time; use `KeccakSpongeNative::generate_trace`
+    /// outside tests and hand-built traces.
     pub fn assign_permutation<F: TowerField>(
         trace: &mut [Vec<F>],
         start_row: usize,
@@ -451,7 +511,8 @@ impl KeccakWitness {
             }
 
             Self::assign_state_at_row(trace, row, state);
-            Self::assign_rc_at_row(trace, row, rc);
+
+            trace[KeccakChiplet::get_round_col(round)][row] = F::ONE;
 
             state = Self::keccak_f_round(state, rc);
         }
@@ -478,31 +539,29 @@ impl KeccakWitness {
             }
         }
     }
-
-    fn assign_rc_at_row<F: TowerField>(trace: &mut [Vec<F>], row: usize, rc: u64) {
-        for z in 0..64 {
-            let rc_bit = (rc >> z) & 1;
-            trace[KeccakChiplet::get_rc_col(z)][row] = if rc_bit == 1 { F::ONE } else { F::ZERO };
-        }
-    }
 }
 
-/// Generates Keccak chiplet trace from
-/// raw keccak-f[1600] permutation calls.
+#[derive(Clone, Copy)]
+struct RowData {
+    state: [u64; 25],
+    round: u32,
+    s_round: bool,
+    s_in_out: bool,
+    request_idx: u32,
+}
+
+/// Lays each call out as 25 rows, 24 rounds
+/// plus one output row, in `physical_layout()`.
 ///
-/// Each call processes one full permutation
-/// (25 rows: 24 rounds + 1 output).
-/// Returns a `ColumnTrace` with 28 physical
-/// columns (same layout as sponge mode).
+/// `request_idx_pairs = None` names CPU rows `(25k, 25k+24)`;
+/// pass `Some` when the CPU emits elsewhere.
 ///
-/// `request_idx_pairs = None` defaults to
-/// `(25k, 25k+24)` to match CPU-side row layout
-/// (input row 25k, output row 25k+24); pass `Some`
-/// for non-default partner emit positions.
+/// Preferred over `KeccakSpongeNative::generate_trace` when
+/// the caller owns the input states, as in Merkle tree hashing.
 ///
-/// Use this instead of `KeccakSpongeNative::generate_trace`
-/// when the caller controls the input states directly
-/// (e.g., Merkle tree hashing).
+/// # Errors
+/// `request_idx_pairs` of a different length than
+/// `calls`, or more calls than `num_rows` holds.
 pub fn generate_keccak_trace(
     calls: &[[Block64; 25]],
     request_idx_pairs: Option<&[(u32, u32)]>,
@@ -524,16 +583,6 @@ pub fn generate_keccak_trace(
         });
     }
 
-    #[derive(Clone, Copy)]
-    struct RowData {
-        state: [u64; 25],
-        rc: u64,
-        s_round: bool,
-        s_in_out: bool,
-        request_idx: u32,
-    }
-
-    // 1. Compute Pass
     let mut rows = Vec::with_capacity(num_rows);
 
     for (call, &(in_idx, out_idx)) in calls.iter().zip(pairs.iter()) {
@@ -553,7 +602,7 @@ pub fn generate_keccak_trace(
             let rc = KeccakChiplet::ROUND_CONSTANTS[round];
             rows.push(RowData {
                 state,
-                rc,
+                round: 1u32 << round,
                 s_round: true,
                 s_in_out: round == 0,
                 request_idx: if round == 0 { in_idx } else { 0 },
@@ -564,36 +613,24 @@ pub fn generate_keccak_trace(
 
         rows.push(RowData {
             state,
-            rc: 0,
+            round: 0,
             s_round: false,
             s_in_out: true,
             request_idx: out_idx,
         });
     }
 
-    // TraceBuilder zero-fills padding,
-    // only iterate active rows.
-
-    // 2. Fill Pass
+    // TraceBuilder zero-fills padding
     let num_vars = num_rows.trailing_zeros() as usize;
-    let mut layout = Vec::with_capacity(PHYS_NUM_COLS);
 
-    for _ in 0..PHYS_REQUEST_IDX {
-        layout.push(ColumnType::B64);
-    }
-
-    layout.push(ColumnType::B32);
-    layout.push(ColumnType::Bit);
-    layout.push(ColumnType::Bit);
-
-    let mut tb = TraceBuilder::new(&layout, num_vars)?;
+    let mut tb = TraceBuilder::new(KeccakChiplet::physical_layout(), num_vars)?;
 
     for (i, row) in rows.iter().enumerate() {
         for lane in 0..25 {
             tb.set_b64(PHYS_LANES + lane, i, Block64::from(row.state[lane]))?;
         }
 
-        tb.set_b64(PHYS_RC, i, Block64::from(row.rc))?;
+        tb.set_b32(PHYS_ROUND, i, hekate_math::Block32::from(row.round))?;
         tb.set_b32(
             PHYS_REQUEST_IDX,
             i,
@@ -609,6 +646,15 @@ pub fn generate_keccak_trace(
             i,
             if row.s_in_out { Bit::ONE } else { Bit::ZERO },
         )?;
+        tb.set_bit(
+            PHYS_IS_OUTPUT,
+            i,
+            if row.s_in_out && !row.s_round {
+                Bit::ONE
+            } else {
+                Bit::ZERO
+            },
+        )?;
     }
 
     Ok(tb.build())
@@ -618,17 +664,11 @@ pub fn generate_keccak_trace(
 // Native Keccak Sponge
 // =================================================================
 
-/// (input_state, output_state) pair
-/// per Keccak-f permutation call.
-/// Used for chiplet trace generation.
+/// `(input_state, output_state)` of one Keccak-f call.
 pub type KeccakCall = ([u64; 25], [u64; 25]);
 
-/// Native Keccak sponge with traced
-/// permutation calls for chiplet witness.
-///
-/// Records every Keccak-f (input, output)
-/// state pair so the Keccak chiplet can
-/// reproduce the trace.
+/// Sponge that records every Keccak-f call;
+/// the chiplet can reproduce the trace.
 pub struct KeccakSpongeNative {
     state: [u64; 25],
     permutation_calls: Vec<KeccakCall>,
@@ -648,7 +688,8 @@ impl KeccakSpongeNative {
         }
     }
 
-    /// Absorb one rate-sized block and permute.
+    /// XORs `block` into the rate lanes, then permutes.
+    /// A short `block` is zero-extended, not padded.
     pub fn absorb_block(&mut self, block: &[u8], rate_bytes: usize) {
         let rate_lanes = rate_bytes / 8;
         for i in 0..rate_lanes {
@@ -670,7 +711,7 @@ impl KeccakSpongeNative {
         self.permutation_calls.push((input, self.state));
     }
 
-    /// Full absorb with domain-separated padding.
+    /// Applies FIPS 202 pad10*1 carrying `domain_sep`.
     pub fn absorb(&mut self, msg: &[u8], rate_bytes: usize, domain_sep: u8) {
         let mut offset = 0;
         while offset + rate_bytes <= msg.len() {
@@ -688,7 +729,6 @@ impl KeccakSpongeNative {
         self.absorb_block(&last, rate_bytes);
     }
 
-    /// Squeeze `out_len` bytes from the state.
     pub fn squeeze(&mut self, out_len: usize, rate_bytes: usize) -> Vec<u8> {
         let mut output = Vec::with_capacity(out_len);
         let rate_lanes = rate_bytes / 8;
@@ -718,14 +758,10 @@ impl KeccakSpongeNative {
         output
     }
 
-    /// Consume the sponge and return
-    /// all recorded permutation calls.
     pub fn into_calls(self) -> Vec<KeccakCall> {
         self.permutation_calls
     }
 
-    /// Consume the sponge and build trace
-    /// from the recorded permutation calls.
     pub fn generate_trace(
         self,
         request_idx_pairs: Option<&[(u32, u32)]>,
@@ -748,7 +784,6 @@ impl KeccakSpongeNative {
     }
 }
 
-/// SHA3-256
 pub fn sha3_256(msg: &[u8]) -> ([u8; 32], Vec<KeccakCall>) {
     let mut sponge = KeccakSpongeNative::new();
     sponge.absorb(msg, SHA3_256_RATE, SHA3_DOMAIN_SEP);
@@ -761,7 +796,6 @@ pub fn sha3_256(msg: &[u8]) -> ([u8; 32], Vec<KeccakCall>) {
     (hash, sponge.into_calls())
 }
 
-/// SHA3-512
 pub fn sha3_512(msg: &[u8]) -> ([u8; 64], Vec<KeccakCall>) {
     let mut sponge = KeccakSpongeNative::new();
     sponge.absorb(msg, SHA3_512_RATE, SHA3_DOMAIN_SEP);
@@ -774,7 +808,6 @@ pub fn sha3_512(msg: &[u8]) -> ([u8; 64], Vec<KeccakCall>) {
     (hash, sponge.into_calls())
 }
 
-/// SHAKE-128
 pub fn shake128(msg: &[u8], out_len: usize) -> (Vec<u8>, Vec<KeccakCall>) {
     let mut sponge = KeccakSpongeNative::new();
     sponge.absorb(msg, SHAKE128_RATE, SHAKE_DOMAIN_SEP);
@@ -784,7 +817,6 @@ pub fn shake128(msg: &[u8], out_len: usize) -> (Vec<u8>, Vec<KeccakCall>) {
     (out, sponge.into_calls())
 }
 
-/// SHAKE-256
 pub fn shake256(msg: &[u8], out_len: usize) -> (Vec<u8>, Vec<KeccakCall>) {
     let mut sponge = KeccakSpongeNative::new();
     sponge.absorb(msg, SHAKE256_RATE, SHAKE_DOMAIN_SEP);
@@ -794,7 +826,6 @@ pub fn shake256(msg: &[u8], out_len: usize) -> (Vec<u8>, Vec<KeccakCall>) {
     (out, sponge.into_calls())
 }
 
-/// Apply full Keccak-f (24 rounds).
 fn keccak_f(state: &mut [u64; 25]) {
     for &rc in &KeccakChiplet::ROUND_CONSTANTS {
         *state = KeccakWitness::keccak_f_round(*state, rc);
@@ -819,8 +850,8 @@ mod tests {
     #[test]
     fn keccak_layout_from_schema() {
         let layout = KeccakColumns::build_layout();
-        assert_eq!(KeccakColumns::NUM_COLUMNS, 1692);
-        assert_eq!(layout.len(), 1692);
+        assert_eq!(KeccakColumns::NUM_COLUMNS, 1661);
+        assert_eq!(layout.len(), 1661);
         assert_eq!(layout[0], ColumnType::Bit);
         assert_eq!(layout[KeccakColumns::LANES], ColumnType::B64);
     }
@@ -828,14 +859,13 @@ mod tests {
     #[test]
     fn keccak_chiplet_air_metadata() {
         let chiplet = KeccakChiplet::new(32);
-        assert_eq!(Air::<F>::num_columns(&chiplet), 1692);
+        assert_eq!(Air::<F>::num_columns(&chiplet), 1661);
         assert_eq!(Air::<F>::name(&chiplet), "KeccakChiplet".to_string());
     }
 
     #[test]
     fn keccak_round_function_zero_input() {
-        // Keccak-f round with zero state should
-        // only be affected by RC in A[0,0].
+        // From a zero state only Iota writes, and only A[0,0]
         let state = [0u64; 25];
         let rc = 0x800000000000808au64;
         let next_state = KeccakWitness::keccak_f_round(state, rc);
@@ -855,7 +885,6 @@ mod tests {
         let initial_state = [0xAAu64; 25];
         let final_state = KeccakWitness::assign_permutation(&mut trace, 0, initial_state);
 
-        // Check Input boundary (Row 0)
         assert_eq!(trace[KeccakColumns::S_IN_OUT][0], F::ONE);
         assert_eq!(trace[KeccakColumns::S_ROUND][0], F::ONE);
         assert_eq!(
@@ -863,11 +892,9 @@ mod tests {
             F::from(0xAAu128)
         );
 
-        // Check Round Transition (Row 23)
         assert_eq!(trace[KeccakColumns::S_ROUND][23], F::ONE);
         assert_eq!(trace[KeccakColumns::S_IN_OUT][23], F::ZERO);
 
-        // Check Output boundary (Row 24)
         assert_eq!(trace[KeccakColumns::S_IN_OUT][24], F::ONE);
         assert_eq!(trace[KeccakColumns::S_ROUND][24], F::ZERO);
         assert_eq!(
@@ -883,7 +910,6 @@ mod tests {
 
         KeccakWitness::assign_permutation(&mut trace, 0, state);
 
-        // Check Row 0, Lane (0,0)
         let lane_val = 0x123456789ABCDEF0u64;
         for z in 0..64 {
             let bit = (lane_val >> z) & 1;
@@ -894,17 +920,11 @@ mod tests {
 
     #[test]
     fn keccak_f_round_all_ones() {
-        // Edge case: All bits are 1
         let state = [u64::MAX; 25];
         let rc = KeccakChiplet::ROUND_CONSTANTS[0];
 
         let next_state = KeccakWitness::keccak_f_round(state, rc);
 
-        // Verify that Chi and Theta produced deterministic
-        // results for max values. After Theta, C should be
-        // 0xFF..FF since XOR of 5 u64::MAX is u64::MAX
-        // Chi step on all ones will result in specific
-        // bit patterns.
         assert_ne!(next_state[0], 0);
         assert_ne!(next_state[24], 0);
     }
@@ -912,10 +932,8 @@ mod tests {
     #[test]
     fn bit_packing_max_values() {
         let mut trace = vec![vec![F::ZERO; 32]; KeccakColumns::NUM_COLUMNS];
-
-        // Edge case: State with alternating bit
-        // patterns to check packing integrity.
         let mut state = [0u64; 25];
+
         for (i, s) in state.iter_mut().enumerate() {
             *s = if i % 2 == 0 {
                 0xAAAAAAAAAAAAAAAA
@@ -926,30 +944,27 @@ mod tests {
 
         KeccakWitness::assign_permutation(&mut trace, 0, state);
 
-        // Verify Lane (0,0) packing in the first row
         let lane_col = KeccakChiplet::get_lane_col(0, 0);
         assert_eq!(trace[lane_col][0], F::from(0xAAAAAAAAAAAAAAAAu128));
 
-        // Verify specific bits are correctly
-        // placed for the alternating pattern
-        // 0xA is 1010, so even bits should be 0,
-        // odd bits should be 1.
+        // 0xA is 1010: even bits clear, odd bits set.
         assert_eq!(trace[KeccakChiplet::get_bit_col(0, 0, 0)][0], F::ZERO);
         assert_eq!(trace[KeccakChiplet::get_bit_col(0, 0, 1)][0], F::ONE);
     }
 
     #[test]
-    fn round_constant_assignment() {
+    fn round_index_assignment() {
         let mut trace = vec![vec![F::ZERO; 32]; KeccakColumns::NUM_COLUMNS];
         let state = [0u64; 25];
 
         KeccakWitness::assign_permutation(&mut trace, 0, state);
 
-        // Verify RC bits for round 0 (RC = 0x0000000000000001)
-        assert_eq!(trace[KeccakChiplet::get_rc_col(0)][0], F::ONE);
-
-        for z in 1..64 {
-            assert_eq!(trace[KeccakChiplet::get_rc_col(z)][0], F::ZERO);
+        for r in 0..32 {
+            let column = &trace[KeccakChiplet::get_round_col(r)];
+            for (row, value) in column.iter().take(25).enumerate() {
+                let expected = if row == r && r < 24 { F::ONE } else { F::ZERO };
+                assert_eq!(*value, expected, "round column {r} at row {row}");
+            }
         }
     }
 
@@ -990,10 +1005,9 @@ mod tests {
         let num_rows = 64;
         let trace = keccak_trace(&message, num_rows).unwrap();
 
-        // Check Lane (Block64 type)
         let expected = 0x3400000000000012u64;
 
-        // Lane(0,0) is at index 0 in physical trace
+        // Lane(0,0) sits at physical index 0
         let lane00 = trace.columns[0].as_b64_slice().unwrap();
 
         assert_eq!(lane00[0].to_tower(), Block64::from(expected));
@@ -1011,8 +1025,10 @@ mod tests {
         );
         assert_eq!(
             ast.roots.len(),
-            25 + 1600 + 2 + 2,
-            "Expected 25 packing + 1600 round + 2 Ghost Protocol + 2 selector boolean"
+            25 + 1600 + 2 + 2 + 1 + 1 + 2 + 3 + 23 + 1 + 2,
+            "Expected 25 packing + 1600 round + 2 Ghost Protocol + 2 selector boolean \
+             + 1 unused-zero + 1 activity + 2 input pin + 3 chain start + 23 chain \
+             + 1 terminal + 2 emit direction"
         );
     }
 
@@ -1022,13 +1038,8 @@ mod tests {
         let ast: ConstraintAst<F> = chiplet.constraint_ast();
         let flat = ast.to_constraints();
 
-        // Verify structural equivalence:
-        // same number of constraints (roots)
         assert_eq!(ast.roots.len(), flat.len());
 
-        // Verify packing constraints have correct structure
-        // Each packing root:
-        // Mul(s_in_out, Sum(lane, -2^0*bit0, ..., -2^63*bit63))
         for i in 0..25 {
             let root = ast.roots[i];
             match ast.arena.get(root) {
@@ -1037,9 +1048,6 @@ mod tests {
             }
         }
 
-        // Verify round constraints have correct structure
-        // Each round root:
-        // Mul(s_round, Sum(next_bit, chi, ...))
         for i in 25..25 + 1600 {
             let root = ast.roots[i];
             match ast.arena.get(root) {
@@ -1048,7 +1056,6 @@ mod tests {
             }
         }
 
-        // Verify flat term count is massive while AST is compact
         let flat_term_count: usize = flat.iter().map(|c| c.terms.len()).sum();
         assert!(
             flat_term_count > 200_000,
@@ -1067,9 +1074,8 @@ mod tests {
         let chiplet = KeccakChiplet::new(1024);
         let ast: ConstraintAst<F> = chiplet.constraint_ast();
 
-        // Count column parity nodes:
-        // Sum with exactly 5 children.
-        // Should be exactly 320 (5 x-values * 64 z-values).
+        // Column parity is the only 5-child Sum:
+        // 5 x × 64 z.
         let parity_count = (0..ast.arena.len())
             .filter(|&i| {
                 matches!(
@@ -1079,11 +1085,8 @@ mod tests {
             })
             .count();
 
-        // Count Theta nodes:
-        // Sum with exactly 3 children.
-        // At least 1600 (5*5*64), but
-        // some Chi/round Sum nodes
-        // also have 3 children.
+        // Theta contributes 5·5·64 three-child Sums,
+        // and Chi adds more, hence the lower bound.
         let three_child_sum_count = (0..ast.arena.len())
             .filter(|&i| {
                 matches!(

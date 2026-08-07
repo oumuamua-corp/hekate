@@ -534,7 +534,7 @@ where
                 });
             }
 
-            info!(
+            debug!(
                 chiplet_idx = c_idx,
                 chiplet_name = def.name(),
                 "Chiplet verified"

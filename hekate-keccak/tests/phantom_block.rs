@@ -1,0 +1,314 @@
+// SPDX-License-Identifier: Apache-2.0
+// This file is part of the hekate project.
+// Copyright (C) 2026 Andrei Kochergin <andrei@oumuamua.dev>
+// Copyright (C) 2026 Oumuamua Labs <info@oumuamua.dev>.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! A block that starts on a bare round row never
+//! announces its input, and its state is free.
+//! Only the chain-start constraints stop it.
+
+use hekate_core::config::Config;
+use hekate_core::trace::{ColumnTrace, ColumnType, TraceBuilder};
+use hekate_crypto::DefaultHasher;
+use hekate_crypto::transcript::Transcript;
+use hekate_keccak::{CpuKeccakColumns, CpuKeccakUnit, KeccakChiplet, KeccakWitness};
+use hekate_math::{Bit, Block32, Block64, Block128, TowerField};
+use hekate_program::chiplet::ChipletDef;
+use hekate_program::constraint::builder::ConstraintSystem;
+use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
+use hekate_program::permutation::PermutationCheckSpec;
+use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_prover_sys::prove;
+use hekate_verifier::HekateVerifier;
+
+type F = Block128;
+type H = DefaultHasher;
+
+const ROUNDS: usize = 24;
+const CPU_ROWS: usize = 32;
+const KECCAK_ROWS: usize = 64;
+
+const PHYS_ROUND: usize = 25;
+const PHYS_REQUEST_IDX: usize = 26;
+const PHYS_S_ROUND: usize = 27;
+const PHYS_S_IN_OUT: usize = 28;
+const PHYS_IS_OUTPUT: usize = 29;
+
+/// CPU row the honest tail names;
+/// no CPU row emits there.
+const DANGLING_IDX: u32 = 7;
+
+struct Row {
+    state: [u64; 25],
+    round_word: u32,
+    s_round: bool,
+    s_in_out: bool,
+    request_idx: u32,
+}
+
+#[derive(Clone)]
+struct KeccakTestProgram;
+
+impl Air<F> for KeccakTestProgram {
+    fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
+        vec![CpuKeccakUnit::direction_boundary(0)]
+    }
+
+    fn column_layout(&self) -> &[ColumnType] {
+        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
+        LAYOUT.get_or_init(CpuKeccakColumns::build_layout)
+    }
+
+    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
+        vec![(KeccakChiplet::BUS_ID.into(), CpuKeccakUnit::linking_spec())]
+    }
+
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        let cs = ConstraintSystem::<F>::new();
+
+        CpuKeccakUnit::constrain(&cs, 0);
+
+        cs.build()
+    }
+}
+
+impl Program<F> for KeccakTestProgram {
+    fn num_public_inputs(&self) -> usize {
+        0
+    }
+
+    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
+        Ok(vec![ChipletDef::from_air(&KeccakChiplet::new(
+            KECCAK_ROWS,
+        ))?])
+    }
+}
+
+fn test_input() -> [u64; 25] {
+    core::array::from_fn(|i| (i as u64).wrapping_mul(0x9E37_79B9) | 1)
+}
+
+fn keccak_f(mut state: [u64; 25]) -> [u64; 25] {
+    for rc in KeccakChiplet::ROUND_CONSTANTS {
+        state = KeccakWitness::keccak_f_round(state, rc);
+    }
+
+    state
+}
+
+fn cpu_trace(input: [u64; 25], output: [u64; 25]) -> ColumnTrace {
+    let num_vars = CPU_ROWS.trailing_zeros() as usize;
+    let mut tb = TraceBuilder::new(&CpuKeccakColumns::build_layout(), num_vars).unwrap();
+
+    for i in 0..25 {
+        tb.set_b64(CpuKeccakColumns::LANES + i, 0, Block64(input[i]))
+            .unwrap();
+        tb.set_b64(CpuKeccakColumns::LANES + i, ROUNDS, Block64(output[i]))
+            .unwrap();
+    }
+
+    tb.set_bit(CpuKeccakColumns::SELECTOR, 0, Bit::ONE).unwrap();
+    tb.set_bit(CpuKeccakColumns::SELECTOR, ROUNDS, Bit::ONE)
+        .unwrap();
+
+    for row in 1..=ROUNDS {
+        tb.set_bit(CpuKeccakColumns::IS_OUTPUT, row, Bit::ONE)
+            .unwrap();
+    }
+
+    tb.build()
+}
+
+fn write_rows(rows: &[Row]) -> ColumnTrace {
+    let layout = Air::<F>::column_layout(&KeccakChiplet::new(KECCAK_ROWS)).to_vec();
+    let num_vars = KECCAK_ROWS.trailing_zeros() as usize;
+
+    let mut tb = TraceBuilder::new(&layout, num_vars).unwrap();
+
+    for (i, row) in rows.iter().enumerate() {
+        for (lane, &value) in row.state.iter().enumerate() {
+            tb.set_b64(lane, i, Block64(value)).unwrap();
+        }
+
+        tb.set_b32(PHYS_ROUND, i, Block32::from(row.round_word))
+            .unwrap();
+        tb.set_b32(PHYS_REQUEST_IDX, i, Block32::from(row.request_idx))
+            .unwrap();
+        tb.set_bit(
+            PHYS_S_ROUND,
+            i,
+            if row.s_round { Bit::ONE } else { Bit::ZERO },
+        )
+        .unwrap();
+        tb.set_bit(
+            PHYS_S_IN_OUT,
+            i,
+            if row.s_in_out { Bit::ONE } else { Bit::ZERO },
+        )
+        .unwrap();
+        tb.set_bit(
+            PHYS_IS_OUTPUT,
+            i,
+            if row.s_in_out && !row.s_round {
+                Bit::ONE
+            } else {
+                Bit::ZERO
+            },
+        )
+        .unwrap();
+    }
+
+    tb.build()
+}
+
+/// A 24-round block. `announce_input` false makes the
+/// head a bare round row, only the tail reaches the bus.
+fn block(input: [u64; 25], announce_input: bool, in_idx: u32, out_idx: u32, out: &mut Vec<Row>) {
+    let mut state = input;
+
+    for (round, rc) in KeccakChiplet::ROUND_CONSTANTS.iter().enumerate() {
+        out.push(Row {
+            state,
+            round_word: 1u32 << round,
+            s_round: true,
+            s_in_out: announce_input && round == 0,
+            request_idx: if announce_input && round == 0 {
+                in_idx
+            } else {
+                0
+            },
+        });
+
+        state = KeccakWitness::keccak_f_round(state, *rc);
+    }
+
+    out.push(Row {
+        state,
+        round_word: 0,
+        s_round: false,
+        s_in_out: true,
+        request_idx: out_idx,
+    });
+}
+
+/// Two rows:
+/// a lone round-23 row plus its output row.
+fn stub(seed: [u64; 25], out_idx: u32, out: &mut Vec<Row>) -> [u64; 25] {
+    let rc = KeccakChiplet::ROUND_CONSTANTS[23];
+    let image = KeccakWitness::keccak_f_round(seed, rc);
+
+    out.push(Row {
+        state: seed,
+        round_word: 1u32 << 23,
+        s_round: true,
+        s_in_out: false,
+        request_idx: 0,
+    });
+
+    out.push(Row {
+        state: image,
+        round_word: 0,
+        s_round: false,
+        s_in_out: true,
+        request_idx: out_idx,
+    });
+
+    image
+}
+
+fn run(cpu_input: [u64; 25], cpu_output: [u64; 25], chiplet: ColumnTrace) -> bool {
+    let air = KeccakTestProgram;
+    let instance = ProgramInstance::new(CPU_ROWS, vec![]);
+    let witness =
+        ProgramWitness::new(cpu_trace(cpu_input, cpu_output)).with_chiplets(vec![chiplet]);
+
+    let config = Config {
+        sumcheck_blinding_factor: 2,
+        ..Config::dev()
+    };
+
+    let proof = match prove(
+        b"Keccak_Phantom",
+        &air,
+        &instance,
+        &witness,
+        &config,
+        [0xA5u8; 32],
+        None,
+    ) {
+        Ok(proof) => proof,
+        Err(e) => {
+            println!("prover refused: {e:?}");
+            return false;
+        }
+    };
+
+    let mut vt = Transcript::<H>::new(b"Keccak_Phantom");
+
+    HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config).unwrap_or_else(|e| {
+        println!("verifier error: {e:?}");
+        false
+    })
+}
+
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn announced_block_verifies() {
+    let input = test_input();
+    let mut rows = Vec::new();
+
+    block(input, true, 0, ROUNDS as u32, &mut rows);
+
+    assert!(
+        run(input, keccak_f(input), write_rows(&rows)),
+        "the harness itself is broken, every rejection below is unattributable"
+    );
+}
+
+/// Emits `(honest, 7)` twice. Without the chain-start
+/// pin the pair cancels in char-2 and the announced
+/// block's tail leaves the bus.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn unannounced_block_rejected() {
+    let input = test_input();
+    let mut rows = Vec::new();
+
+    block(input, true, 0, DANGLING_IDX, &mut rows);
+    block(input, false, 0, DANGLING_IDX, &mut rows);
+
+    assert!(!run(input, keccak_f(input), write_rows(&rows)));
+}
+
+/// A two-row block reaching round 23 from a free
+/// state answers the CPU's output row with any value.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn phantom_output_rejected() {
+    let input = test_input();
+    let honest = keccak_f(input);
+
+    let mut rows = Vec::new();
+
+    block(input, true, 0, DANGLING_IDX, &mut rows);
+    block(input, false, 0, DANGLING_IDX, &mut rows);
+
+    let forged = stub([0x11u64; 25], ROUNDS as u32, &mut rows);
+
+    assert_ne!(forged, honest);
+    assert!(rows.len() <= KECCAK_ROWS);
+
+    assert!(!run(input, forged, write_rows(&rows)));
+}

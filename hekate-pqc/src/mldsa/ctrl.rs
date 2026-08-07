@@ -24,8 +24,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use hekate_core::trace::ColumnType;
 use hekate_gadgets::RamChiplet;
-use hekate_keccak::KECCAK_LANE_LABELS;
 use hekate_keccak::KeccakChiplet;
+use hekate_keccak::{KECCAK_DIRECTION_LABEL, KECCAK_LANE_LABELS};
 use hekate_math::TowerField;
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
@@ -202,12 +202,17 @@ impl MlDsaCtrlChiplet {
 
     /// Internal "keccak_link" bus.
     fn keccak_linking_spec() -> PermutationCheckSpec {
-        let mut sources = Vec::with_capacity(26);
+        let mut sources = Vec::with_capacity(27);
+
         for (i, label) in KECCAK_LANE_LABELS.iter().enumerate() {
             sources.push((Source::Column(MlDsaCtrlColumns::KECCAK_LANES + i), *label));
         }
 
         sources.push((Source::RowIndexLeBytes(4), REQUEST_IDX_LABEL));
+        sources.push((
+            Source::Column(MlDsaCtrlColumns::KEC_IS_OUTPUT),
+            KECCAK_DIRECTION_LABEL,
+        ));
 
         PermutationCheckSpec::new(sources, Some(MlDsaCtrlColumns::KECCAK_SELECTOR))
     }
@@ -853,6 +858,9 @@ impl<F: TowerField> Air<F> for MlDsaCtrlChiplet {
         let shake_128 = cs.col(MlDsaCtrlColumns::SHAKE_128);
         let kec_input = kec_sel * (one + kec_out);
 
+        // Subset of KECCAK_SELECTOR
+        cs.constrain(kec_out * (one + kec_sel));
+
         // reg[next] = reg (carry) when kec_out=0, init_next=0
         // reg[next] = lane (update) when kec_out=1, init_next=0
         // reg[next] = 0 (reset) when init_next=1
@@ -1044,5 +1052,37 @@ impl<F: TowerField> Air<F> for MlDsaCtrlChiplet {
         }
 
         cs.build()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hekate_math::Block128;
+
+    type F = Block128;
+
+    #[test]
+    fn keccak_bus_labels_match_ctrl_and_chiplet() {
+        let ctrl = MlDsaCtrlChiplet::new(16);
+        let ctrl_checks: Vec<(String, PermutationCheckSpec)> =
+            <MlDsaCtrlChiplet as Air<F>>::permutation_checks(&ctrl);
+
+        let keccak_spec = KeccakChiplet::linking_spec();
+
+        let ctrl_keccak = ctrl_checks
+            .iter()
+            .find(|(id, _)| id == KeccakChiplet::BUS_ID)
+            .expect("ctrl must declare keccak_link bus");
+
+        assert_eq!(
+            ctrl_keccak.1.sources.len(),
+            keccak_spec.sources.len(),
+            "keccak bus source count mismatch",
+        );
+
+        for (c, k) in ctrl_keccak.1.sources.iter().zip(keccak_spec.sources.iter()) {
+            assert_eq!(c.1, k.1, "keccak challenge label mismatch");
+        }
     }
 }

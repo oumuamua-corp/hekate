@@ -68,6 +68,7 @@ impl Air<F> for KeccakIsolatedChipletProgram {
 
         (0..4)
             .map(|i| BoundaryConstraint::with_public_input(i, last_output_row, i))
+            .chain([CpuKeccakUnit::direction_boundary(0)])
             .collect()
     }
 
@@ -82,7 +83,8 @@ impl Air<F> for KeccakIsolatedChipletProgram {
 
     fn constraint_ast(&self) -> ConstraintAst<F> {
         let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CpuKeccakColumns::SELECTOR));
+
+        CpuKeccakUnit::constrain(&cs, 0);
 
         cs.build()
     }
@@ -167,6 +169,11 @@ fn generate_cpu_trace(calls: &[([Block64; 25], [Block64; 25])], num_rows: usize)
 
         tb.set_bit(CpuKeccakColumns::SELECTOR, row, Bit::ONE)
             .unwrap();
+
+        for r in row + 1..=row + 24 {
+            tb.set_bit(CpuKeccakColumns::IS_OUTPUT, r, Bit::ONE)
+                .unwrap();
+        }
 
         // 24 rounds (no CPU activity)
         row += 24;

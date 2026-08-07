@@ -22,10 +22,10 @@ use hekate_crypto::transcript::Transcript;
 use hekate_keccak::{
     CpuKeccakColumns, CpuKeccakUnit, KeccakChiplet, KeccakWitness, generate_keccak_trace,
 };
-use hekate_math::{Bit, Block64, Block128, Flat, TowerField};
+use hekate_math::{Bit, Block32, Block64, Block128, Flat, TowerField};
 use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
+use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
 use hekate_program::permutation::PermutationCheckSpec;
 use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
@@ -41,7 +41,7 @@ const CPU_ROWS: usize = 32;
 const KECCAK_ROWS: usize = 32;
 
 const PHYS_LANES: usize = 0;
-const PHYS_RC: usize = 25;
+const PHYS_ROUND: usize = 25;
 const PHYS_S_ROUND: usize = 27;
 const PHYS_S_IN_OUT: usize = 28;
 
@@ -73,6 +73,10 @@ struct KeccakTestProgram {
 }
 
 impl Air<F> for KeccakTestProgram {
+    fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
+        vec![CpuKeccakUnit::direction_boundary(0)]
+    }
+
     fn column_layout(&self) -> &[ColumnType] {
         static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
         LAYOUT.get_or_init(CpuKeccakColumns::build_layout)
@@ -84,7 +88,8 @@ impl Air<F> for KeccakTestProgram {
 
     fn constraint_ast(&self) -> ConstraintAst<F> {
         let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CpuKeccakColumns::SELECTOR));
+
+        CpuKeccakUnit::constrain(&cs, 0);
 
         cs.build()
     }
@@ -125,6 +130,11 @@ fn build_cpu_trace(calls: &[([u64; 25], [u64; 25])], cpu_rows: usize) -> ColumnT
             .unwrap();
         tb.set_bit(CpuKeccakColumns::SELECTOR, out_row, Bit::ONE)
             .unwrap();
+
+        for row in in_row + 1..=out_row {
+            tb.set_bit(CpuKeccakColumns::IS_OUTPUT, row, Bit::ONE)
+                .unwrap();
+        }
     }
 
     tb.build()
@@ -252,6 +262,16 @@ where
 // Helpers
 // =================================================================
 
+fn flip_b32(trace: &mut ColumnTrace, col: usize, row: usize, mask: u32) {
+    match &mut trace.columns[col] {
+        TraceColumn::B32(data) => {
+            let original = data[row];
+            data[row] = Flat::from_raw(Block32(original.to_tower().0 ^ mask));
+        }
+        _ => panic!("expected B32 column at {col}"),
+    }
+}
+
 fn flip_b64(trace: &mut ColumnTrace, col: usize, row: usize, mask: u64) {
     match &mut trace.columns[col] {
         TraceColumn::B64(data) => {
@@ -333,15 +353,12 @@ fn exploit_round_state_tamper() {
 
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
-fn exploit_rc_tamper() {
+fn exploit_round_index_tamper() {
     let detected = run_tampered_keccak(|keccak, _| {
-        flip_b64(keccak, PHYS_RC, 3, 0x01);
+        flip_b32(keccak, PHYS_ROUND, 3, 0x01);
     });
 
-    assert!(
-        detected,
-        "RC tamper must be caught by Iota constraint on lane (0,0)"
-    );
+    assert!(detected);
 }
 
 #[test]
