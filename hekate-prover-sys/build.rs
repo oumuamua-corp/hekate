@@ -349,7 +349,33 @@ fn stage_into_outdir(src: &Path, filename: &str) -> Result<PathBuf, Box<dyn std:
     let dest = out.join(filename);
     fs::copy(src, &dest)?;
 
+    retarget_install_name(&dest)?;
+
     Ok(out)
+}
+
+fn retarget_install_name(dylib: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if !env::var("TARGET")?.ends_with("-apple-darwin") {
+        return Ok(());
+    }
+
+    let out = std::process::Command::new("install_name_tool")
+        .arg("-id")
+        .arg(dylib)
+        .arg(dylib)
+        .output()
+        .map_err(|e| format!("spawn install_name_tool: {e}"))?;
+
+    if !out.status.success() {
+        return Err(format!(
+            "install_name_tool -id {} failed: {}",
+            dylib.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+        .into());
+    }
+
+    Ok(())
 }
 
 fn main() {
