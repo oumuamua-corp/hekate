@@ -27,8 +27,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use hekate_core::trace::ColumnType;
 use hekate_gadgets::RamChiplet;
-use hekate_keccak::KECCAK_LANE_LABELS;
 use hekate_keccak::KeccakChiplet;
+use hekate_keccak::{KECCAK_DIRECTION_LABEL, KECCAK_LANE_LABELS};
 use hekate_math::TowerField;
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
@@ -278,12 +278,17 @@ impl MlKemCtrlChiplet {
     /// Linking spec for the
     /// internal "keccak_link" bus.
     fn keccak_linking_spec() -> PermutationCheckSpec {
-        let mut sources = Vec::with_capacity(26);
+        let mut sources = Vec::with_capacity(27);
+
         for (i, label) in KECCAK_LANE_LABELS.iter().enumerate() {
             sources.push((Source::Column(MlKemCtrlColumns::KECCAK_LANES + i), *label));
         }
 
         sources.push((Source::RowIndexLeBytes(4), REQUEST_IDX_LABEL));
+        sources.push((
+            Source::Column(MlKemCtrlColumns::KEC_IS_OUTPUT),
+            KECCAK_DIRECTION_LABEL,
+        ));
 
         PermutationCheckSpec::new(sources, Some(MlKemCtrlColumns::KECCAK_SELECTOR))
     }

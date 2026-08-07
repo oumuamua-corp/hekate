@@ -50,9 +50,8 @@ const KECCAK_OFFSET: usize = CpuKeccakColumns::NUM_COLUMNS;
 //
 // Mounted trace:
 // CPU columns + Keccak columns in one trace.
-// Keccak's 28 physical columns are virtually
-// expanded to 1691 columns via
-// KeccakTrace::get_poly_variants().
+// Keccak's 30 physical columns are virtually
+// expanded to 1661 columns.
 // The constraint AST references virtual
 // column indices (shifted by KECCAK_OFFSET).
 
@@ -77,6 +76,7 @@ impl Air<F> for KeccakInlineChipletProgram {
 
         (0..4)
             .map(|i| BoundaryConstraint::with_public_input(i, last_output_row, i))
+            .chain([CpuKeccakUnit::direction_boundary(0)])
             .collect()
     }
 
@@ -84,15 +84,7 @@ impl Air<F> for KeccakInlineChipletProgram {
         static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
         LAYOUT.get_or_init(|| {
             let mut cols = CpuKeccakColumns::build_layout();
-
-            // Keccak physical:
-            // 25 lanes (B64)
-            //   + 1 RC (B64)
-            //   + 1 REQUEST_IDX (B32)
-            //   + 2 selectors (Bit)
-            cols.extend(vec![ColumnType::B64; 26]);
-            cols.push(ColumnType::B32);
-            cols.extend(vec![ColumnType::Bit; 2]);
+            cols.extend_from_slice(KeccakChiplet::physical_layout());
 
             cols
         })
@@ -116,14 +108,11 @@ impl Air<F> for KeccakInlineChipletProgram {
     fn virtual_expander(&self) -> Option<&VirtualExpander> {
         static E: std::sync::OnceLock<VirtualExpander> = std::sync::OnceLock::new();
         Some(E.get_or_init(|| {
-            VirtualExpander::new()
+            let cpu = VirtualExpander::new()
                 .pass_through(25, ColumnType::B64)
-                .control_bits(1)
-                .expand_bits(25, ColumnType::B64)
-                .expand_bits(1, ColumnType::B64)
-                .reuse_pass_through(KECCAK_OFFSET, 25)
-                .pass_through(1, ColumnType::B32)
-                .control_bits(2)
+                .control_bits(2);
+
+            KeccakChiplet::expand_into(cpu, KECCAK_OFFSET)
                 .build()
                 .expect("keccak inline expander")
         }))
@@ -131,7 +120,8 @@ impl Air<F> for KeccakInlineChipletProgram {
 
     fn constraint_ast(&self) -> ConstraintAst<F> {
         let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CpuKeccakColumns::SELECTOR));
+
+        CpuKeccakUnit::constrain(&cs, 0);
 
         let mut ast = cs.build();
 
@@ -150,13 +140,9 @@ impl Air<F> for KeccakInlineChipletProgram {
     }
 
     fn inline_chiplet_kernels(&self) -> Vec<InlineKernelHint> {
-        // Program AST:
-        //   root 0            = CPU SELECTOR booleanity
-        //   roots [1, 1+1629) = Keccak chiplet
-        // Keccak columns sit at `KECCAK_OFFSET` after the CPU block.
         vec![InlineKernelHint {
             chiplet_idx: 0,
-            root_offset: 1,
+            root_offset: CpuKeccakUnit::NUM_ROOTS,
             column_offset: KECCAK_OFFSET,
         }]
     }
@@ -240,6 +226,10 @@ fn generate_combined_trace(
 
         tb.set_bit(CpuKeccakColumns::SELECTOR, row, Bit::ONE)?;
 
+        for r in row + 1..=row + 24 {
+            tb.set_bit(CpuKeccakColumns::IS_OUTPUT, r, Bit::ONE)?;
+        }
+
         row += 24;
 
         // Output row
@@ -293,8 +283,8 @@ fn main() {
     println!(
         "Physical: {} CPU + {} Keccak = {} columns",
         CpuKeccakColumns::NUM_COLUMNS,
-        28,
-        CpuKeccakColumns::NUM_COLUMNS + 28
+        KeccakChiplet::physical_layout().len(),
+        CpuKeccakColumns::NUM_COLUMNS + KeccakChiplet::physical_layout().len()
     );
     println!(
         "Virtual: {} CPU + {} Keccak = {} columns",
