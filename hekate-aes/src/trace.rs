@@ -30,7 +30,7 @@
 use alloc::vec::Vec;
 use hekate_core::errors::Error;
 use hekate_core::trace::{ColumnTrace, TraceBuilder};
-use hekate_math::{Bit, Block8, Block32, TowerField};
+use hekate_math::{Bit, Block8, Block16, Block32, TowerField};
 
 use super::aes128::PhysAes128Columns as P128;
 use super::aes256::PhysAes256Columns as P256;
@@ -58,13 +58,11 @@ struct RowData<const K: usize> {
     sbox_out: [u8; 16],
     round_key: [u8; 16],
     key_aux: [u8; 16],
-    round_num: u8,
-    rcon: u8,
+    round_idx: u16,
     s_round: bool,
     s_final: bool,
     s_in_out: bool,
     s_input: bool,
-    s_even: bool,
     k0: [u8; K],
     ks_input: [u8; 4],
     ks_sub: [u8; 4],
@@ -130,9 +128,6 @@ pub fn generate_aes_trace<const K: usize, const R: usize>(
     for (k, call) in calls.iter().enumerate() {
         let (link_in_idx, link_out_idx, key_idx) = triples[k];
 
-        let mut round_num: u8 = 1;
-        let mut rcon: u8 = 1;
-        let mut s_even = true;
         let mut prev_rk = call.round_keys[0];
         let mut state = call.plaintext;
 
@@ -160,7 +155,10 @@ pub fn generate_aes_trace<const K: usize, const R: usize>(
 
             state = after_shift;
 
-            let ks_bytes = if K == 32 && !s_even {
+            // FIPS 197 §5.2, Nk=8:
+            // RotWord only on the even half
+            // of the two-round key cadence.
+            let ks_bytes = if K == 32 && (r - 1) % 2 == 1 {
                 direct_bytes(&call.round_keys[r])
             } else {
                 rotword_bytes(&call.round_keys[r])
@@ -175,13 +173,11 @@ pub fn generate_aes_trace<const K: usize, const R: usize>(
                 sbox_out,
                 round_key: call.round_keys[r],
                 key_aux: if K == 32 { prev_rk } else { [0u8; 16] },
-                round_num,
-                rcon: if K == 32 { rcon } else { 0 },
+                round_idx: 1u16 << (r - 1),
                 s_round: true,
                 s_final: false,
                 s_in_out: is_input,
                 s_input: is_input,
-                s_even: K == 32 && s_even,
                 k0: if is_input { call.key } else { [0u8; K] },
                 ks_input: if K == 32 { ks_bytes } else { [0u8; 4] },
                 ks_sub,
@@ -208,15 +204,7 @@ pub fn generate_aes_trace<const K: usize, const R: usize>(
 
             if K == 32 {
                 prev_rk = call.round_keys[r];
-
-                if !s_even {
-                    rcon = xtime(rcon);
-                }
-
-                s_even = !s_even;
             }
-
-            round_num = xtime(round_num);
         }
 
         // Final round (no MixColumns)
@@ -237,13 +225,11 @@ pub fn generate_aes_trace<const K: usize, const R: usize>(
             sbox_out,
             round_key: call.round_keys[R - 1],
             key_aux: if K == 32 { prev_rk } else { [0u8; 16] },
-            round_num,
-            rcon,
+            round_idx: 1u16 << num_full_rounds,
             s_round: false,
             s_final: true,
             s_in_out: false,
             s_input: false,
-            s_even: false,
             k0: [0u8; K],
             ks_input: [0u8; 4],
             ks_sub: [0u8; 4],
@@ -262,13 +248,11 @@ pub fn generate_aes_trace<const K: usize, const R: usize>(
             sbox_out: [0u8; 16],
             round_key: [0u8; 16],
             key_aux: [0u8; 16],
-            round_num: 0,
-            rcon: 0,
+            round_idx: 0,
             s_round: false,
             s_final: false,
             s_in_out: true,
             s_input: false,
-            s_even: false,
             k0: [0u8; K],
             ks_input: [0u8; 4],
             ks_sub: [0u8; 4],
@@ -319,8 +303,8 @@ fn write_128_row<const K: usize>(
         });
     }
 
-    if row.round_num != 0 {
-        tb.set_b8(P128::P_ROUND_NUM, i, Block8(row.round_num))?;
+    if row.round_idx != 0 {
+        tb.set_b16(P128::P_ROUND_IDX, i, Block16::from(row.round_idx))?;
     }
 
     if row.s_round {
@@ -394,12 +378,8 @@ fn write_256_row<const K: usize>(
 
     tb.set_b8_array(P256::P_KEY_AUX, i, &row.key_aux.map(Block8))?;
 
-    if row.round_num != 0 {
-        tb.set_b8(P256::P_ROUND_NUM, i, Block8(row.round_num))?;
-    }
-
-    if row.rcon != 0 {
-        tb.set_b8(P256::P_RCON, i, Block8(row.rcon))?;
+    if row.round_idx != 0 {
+        tb.set_b16(P256::P_ROUND_IDX, i, Block16::from(row.round_idx))?;
     }
 
     if row.s_round {
@@ -416,10 +396,6 @@ fn write_256_row<const K: usize>(
 
     if row.s_round || row.s_final {
         tb.set_bit(P256::P_S_ACTIVE, i, Bit::ONE)?;
-    }
-
-    if row.s_even {
-        tb.set_bit(P256::P_S_EVEN, i, Bit::ONE)?;
     }
 
     if row.s_input {

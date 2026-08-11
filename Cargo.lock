@@ -706,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "hekate-aes"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "hekate-core",
  "hekate-crypto",
@@ -850,6 +850,7 @@ dependencies = [
  "hekate-program",
  "hekate-sdk",
  "proptest",
+ "rayon",
 ]
 
 [[package]]

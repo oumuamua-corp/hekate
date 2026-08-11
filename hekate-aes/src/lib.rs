@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // This file is part of the hekate project.
 // Copyright (C) 2026 Andrei Kochergin <andrei@oumuamua.dev>
-// Copyright (C) 2026 Oumuamua Labs <info@oumuamua.dev>. All rights reserved.
+// Copyright (C) 2026 Oumuamua Labs <info@oumuamua.dev>.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -47,6 +47,7 @@ pub use aes256::{
     Aes256Chiplet, Aes256Columns, AesRound256Air, CpuAes256Columns, CpuAes256Unit,
     PhysAes256Columns,
 };
+pub use sbox_rom::{PhysSboxRomColumns, SboxRomColumns};
 
 /// FIPS 197 §5.1.2:
 /// ShiftRows byte permutation.
@@ -78,6 +79,9 @@ const MC: [[u8; 4]; 4] = [
 /// index j (0..4) to the source byte
 /// offset in the key's last word.
 const ROT_MAP: [usize; 4] = [13, 14, 15, 12];
+
+/// Separates a block's two emit rows in the bus key.
+pub const AES_DIRECTION_LABEL: &[u8] = b"aes_is_input";
 
 pub const AES_BYTE_LABELS: [&[u8]; 16] = [
     b"aes_byte_0",

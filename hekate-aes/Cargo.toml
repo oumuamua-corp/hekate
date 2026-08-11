@@ -1,6 +1,6 @@
 [package]
 name = "hekate-aes"
-version = "0.5.0"
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 homepage.workspace = true
@@ -36,5 +36,5 @@ hekate-crypto = { workspace = true, features = ["std", "blake3"] }
 hekate-verifier = { workspace = true, features = ["std", "blake3"] }
 hekate-sdk = { workspace = true, features = ["std", "blake3"] }
 hekate-prover-sys = { workspace = true, features = ["blake3", "public"] }
-hekate-scribble = { workspace = true }
+hekate-scribble = { workspace = true, features = ["parallel"] }
 rand = "0.9"
