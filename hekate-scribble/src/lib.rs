@@ -15,13 +15,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Trace mutation fuzzer for
-//! the Hekate ZK proving system.
+//! Trace mutation fuzzer for the Hekate ZK proving system.
 //!
-//! Tampers valid execution traces
-//! and asserts `hekate_sdk::preflight`
-//! rejects every mutation. Scribble
-//! never invokes the prover or verifier,
+//! Tampers valid execution traces and asserts
+//! `hekate_sdk::preflight` rejects every mutation.
+//! Scribble never invokes the prover or verifier,
 //! preflight (row-by-row constraint evaluation
 //! plus bus multiset checking) is the oracle.
 
@@ -30,6 +28,7 @@
 pub mod apply;
 pub mod check;
 pub mod config;
+pub mod language;
 pub mod mutation;
 pub mod prelude;
 pub mod strategy;
