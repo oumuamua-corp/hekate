@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // This file is part of the hekate project.
 // Copyright (C) 2026 Andrei Kochergin <andrei@oumuamua.dev>
-// Copyright (C) 2026 Oumuamua Labs <info@oumuamua.dev>. All rights reserved.
+// Copyright (C) 2026 Oumuamua Labs <info@oumuamua.dev>.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,10 +19,8 @@
 //!
 //! 11 rows per block:
 //! 9 full rounds + 1 final + 1 output.
-//! Constraints operate at GF(2^8) byte
-//! level, the binary tower preserves
-//! subfield multiplication, so MixColumns
-//! ×2/×3 constants need no bit decomposition.
+//! Constraints operate at GF(2^8) byte level, the binary tower preserves
+//! subfield multiplication; MixColumns ×2/×3 constants need no bit decomposition.
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
@@ -41,7 +39,7 @@ use hekate_program::expander::VirtualExpander;
 use hekate_program::permutation::{PermutationCheckSpec, REQUEST_IDX_LABEL, Source};
 
 use super::sbox_rom;
-use super::{AES_BYTE_LABELS, ROT_MAP, SBOX_IN_LABELS, SBOX_OUT_LABELS};
+use super::{AES_BYTE_LABELS, AES_DIRECTION_LABEL, ROT_MAP, SBOX_IN_LABELS, SBOX_OUT_LABELS};
 
 #[rustfmt::skip]
 pub const AES_KEY_LABELS: [&[u8]; 16] = [
@@ -55,16 +53,14 @@ pub const AES_KEY_LABELS: [&[u8]; 16] = [
     b"aes_key_byte_14", b"aes_key_byte_15",
 ];
 
-// Physical layout. Column order must
-// match VirtualExpander sequence exactly.
-// KS_INV / K0_INV are B8 columns
-// bit-decomposed by the expander.
+// Physical layout. Column order must match VirtualExpander sequence
+// exactly. ROUND_IDX / KS_INV / K0_INV are bit-decomposed by the expander.
 define_columns! {
     pub PhysAes128Columns {
         P_STATE_IN: [B8; 16],
         P_SBOX_OUT: [B8; 16],
         P_ROUND_KEY: [B8; 16],
-        P_ROUND_NUM: B8,
+        P_ROUND_IDX: B16,
         P_S_ROUND: Bit,
         P_S_FINAL: Bit,
         P_S_IN_OUT: Bit,
@@ -90,14 +86,8 @@ define_columns! {
         SBOX_OUT: [B8; 16],
         ROUND_KEY: [B8; 16],
 
-        // GF(2^8) round counter.
-        // Doubles each round:
-        // 1, 2, 4, ..., 0x1B, 0x36.
-        // Enforces exactly 9 s_round
-        // rows before s_final.
-        // Also serves as Rcon
-        // for key schedule.
-        ROUND_NUM: B8,
+        // One-hot over the block's active rows
+        ROUND_BITS: [Bit; 16],
 
         S_ROUND: Bit,
         S_FINAL: Bit,
@@ -108,7 +98,7 @@ define_columns! {
         // (s_round OR s_final).
         S_ACTIVE: Bit,
 
-        // s_in_out ∧ s_round (input row only).
+        // s_in_out ∧ s_round (input row only)
         S_INPUT: Bit,
 
         // Raw AES-128 key. Populated
@@ -153,6 +143,13 @@ impl AesRound128Air {
     pub const LINK_BUS_ID: &'static str = "aes128_link";
     pub const KEY_BUS_ID: &'static str = "aes128_key_in";
 
+    /// 9 full rounds and the final round.
+    pub const ACTIVE_ROWS: usize = 10;
+
+    /// FIPS 197 §5.2 round constants.
+    const RCON: [u8; Self::ACTIVE_ROWS] =
+        [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36];
+
     pub(crate) fn new(num_rows: usize) -> Self {
         Self { num_rows }
     }
@@ -177,6 +174,7 @@ impl AesRound128Air {
             Source::Column(Aes128Columns::REQUEST_IDX_LINK),
             REQUEST_IDX_LABEL,
         ));
+        sources.push((Source::Column(Aes128Columns::S_INPUT), AES_DIRECTION_LABEL));
 
         PermutationCheckSpec::new(sources, Some(Aes128Columns::S_IN_OUT))
     }
@@ -210,11 +208,9 @@ impl AesRound128Air {
             ));
         }
 
-        let spec = PermutationCheckSpec::new(sources, Some(Aes128Columns::S_ACTIVE))
-            .with_clock_waiver(
-                "see hekate-chiplets/src/aes/aes128.rs: AES<>SboxRom internal; \
-                 phantom blocks caught at link+key v3",
-            );
+        sources.push((Source::RowIndexLeBytes(4), REQUEST_IDX_LABEL));
+
+        let spec = PermutationCheckSpec::new(sources, Some(Aes128Columns::S_ACTIVE));
 
         vec![(sbox_rom::SboxRomChiplet::BUS_ID.into(), spec)]
     }
@@ -244,7 +240,8 @@ impl<F: TowerField> Air<F> for AesRound128Air {
         Some(E.get_or_init(|| {
             Box::new(
                 VirtualExpander::new()
-                    .pass_through(49, ColumnType::B8) // STATE_IN..ROUND_NUM
+                    .pass_through(48, ColumnType::B8) // STATE_IN..ROUND_KEY
+                    .expand_bits(1, ColumnType::B16) // ROUND_IDX -> ROUND_BITS
                     .control_bits(5) // S_ROUND..S_INPUT
                     .pass_through(16, ColumnType::B8) // K0
                     .pass_through(4, ColumnType::B8) // KS_SUB
@@ -269,41 +266,63 @@ impl<F: TowerField> Air<F> for AesRound128Air {
         let s_in_out = cs.col(Aes128Columns::S_IN_OUT);
         let s_active = cs.col(Aes128Columns::S_ACTIVE);
 
-        cs.assert_boolean(s_round);
-        cs.assert_boolean(s_final);
+        let s_input = cs.col(Aes128Columns::S_INPUT);
+        let one = cs.one();
+
+        // Bus selectors: link, sbox, key
         cs.assert_boolean(s_in_out);
         cs.assert_boolean(s_active);
+        cs.assert_boolean(s_input);
 
-        cs.constrain(s_round * s_final);
+        // Round index: one-hot at 0 on the input row, one
+        // shift per active row, block ends after round 9.
+        const ACTIVE: usize = AesRound128Air::ACTIVE_ROWS;
 
-        // s_active = s_round | s_final
-        // (in GF(2): a + b + a*b)
-        cs.constrain(s_active + s_round + s_final + s_round * s_final);
+        let round = |k: usize| cs.col(Aes128Columns::ROUND_BITS + k);
+        let weighted = |lo: usize, hi: usize| {
+            cs.sum(
+                &(lo..hi)
+                    .map(|k| cs.scale(F::from(1u128 << k), round(k)))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let weighted_next = |lo: usize, hi: usize| {
+            cs.sum(
+                &(lo..hi)
+                    .map(|k| cs.scale(F::from(1u128 << k), cs.next(Aes128Columns::ROUND_BITS + k)))
+                    .collect::<Vec<_>>(),
+            )
+        };
 
-        // Prevents Ghost Protocol:
-        // zeroing s_round mid-block to skip a round.
-        // s_active and next_s_in_out are mutually
-        // exclusive, so the cross-term vanishes.
+        cs.constrain(weighted(ACTIVE, 16));
+
+        // Every selector is a function of the index;
+        // none of them is free witness anywhere.
+        cs.constrain(s_active + cs.sum(&(0..ACTIVE).map(round).collect::<Vec<_>>()));
+        cs.constrain(s_final + round(ACTIVE - 1));
+        cs.constrain(s_input + round(0));
+        cs.constrain(s_round + s_active + s_final);
+
+        // A run may only begin on an input row
+        let not_active = one + s_active;
+
+        cs.assert_zero_when(not_active, weighted(0, ACTIVE));
+        cs.assert_zero_when(not_active, weighted_next(1, ACTIVE));
+        cs.constrain(round(0) * (one + s_in_out));
+
+        for k in 0..ACTIVE - 1 {
+            cs.constrain(s_active * (cs.next(Aes128Columns::ROUND_BITS + k + 1) + round(k)));
+        }
+
         let next_s_active = cs.next(Aes128Columns::S_ACTIVE);
         let next_s_in_out = cs.next(Aes128Columns::S_IN_OUT);
 
-        cs.constrain(s_active * (cs.one() + next_s_active + next_s_in_out));
-
-        // Round counter
-        let round_num = cs.col(Aes128Columns::ROUND_NUM);
-        let next_round_num = cs.next(Aes128Columns::ROUND_NUM);
-        let s_input = cs.col(Aes128Columns::S_INPUT);
-
-        let one = cs.one();
-        let two = cs.constant(F::from(2u8));
-
-        cs.assert_boolean(s_input);
-
-        cs.constrain(s_input + s_in_out * s_round);
-
-        cs.assert_zero_when(s_input, round_num + one);
-        cs.assert_zero_when(s_round, next_round_num + two * round_num);
-        cs.assert_zero_when(s_final, round_num + cs.constant(F::from(0x36u8)));
+        // An active row is followed by an active row or an output
+        // row, and the row before an output row is active. `next`
+        // wraps at the trace end, which carries this onto row 0.
+        cs.constrain(s_active * (one + next_s_active + next_s_in_out));
+        cs.constrain(next_s_in_out * (one + next_s_active) * (one + s_active));
+        cs.constrain(s_active * (next_s_active + one + round(ACTIVE - 1)));
 
         super::build_round_constraints(
             &cs,
@@ -340,14 +359,22 @@ impl<F: TowerField> Air<F> for AesRound128Air {
             Aes128Columns::S_INPUT,
         );
 
+        // Rcon reads off the index;
+        // no round constant is ever a witness.
+        let rcon_next = cs.sum(
+            &(0..ACTIVE - 1)
+                .map(|k| cs.scale(F::from(Self::RCON[k + 1]), round(k)))
+                .collect::<Vec<_>>(),
+        );
+
         // Forward chain word cascade:
-        // next_RK = expand(RK, KS_SUB, next_round_num)
+        // next_RK = expand(RK, KS_SUB, rcon_next)
         for j in 0..16usize {
             let next_rk = cs.next(Aes128Columns::ROUND_KEY + j);
             let rk = cs.col(Aes128Columns::ROUND_KEY + j);
 
             let body = match j {
-                0 => next_rk + rk + cs.col(Aes128Columns::KS_SUB) + next_round_num,
+                0 => next_rk + rk + cs.col(Aes128Columns::KS_SUB) + rcon_next,
                 1..=3 => next_rk + rk + cs.col(Aes128Columns::KS_SUB + j),
                 4..=15 => next_rk + rk + cs.next(Aes128Columns::ROUND_KEY + j - 4),
                 _ => unreachable!(),
@@ -357,13 +384,15 @@ impl<F: TowerField> Air<F> for AesRound128Air {
         }
 
         // Init word cascade:
-        // RK (= K1) = expand(K0, K0_SUB, round_num)
+        // RK (= K1) = expand(K0, K0_SUB, RCON[0])
+        let rcon_init = cs.constant(F::from(Self::RCON[0]));
+
         for j in 0..16usize {
             let rk = cs.col(Aes128Columns::ROUND_KEY + j);
             let k0 = cs.col(Aes128Columns::K0 + j);
 
             let body = match j {
-                0 => rk + k0 + cs.col(Aes128Columns::K0_SUB) + round_num,
+                0 => rk + k0 + cs.col(Aes128Columns::K0_SUB) + rcon_init,
                 1..=3 => rk + k0 + cs.col(Aes128Columns::K0_SUB + j),
                 4..=15 => rk + k0 + cs.col(Aes128Columns::ROUND_KEY + j - 4),
                 _ => unreachable!(),
@@ -376,8 +405,6 @@ impl<F: TowerField> Air<F> for AesRound128Air {
         // only on s_round rows.
         let not_s_round = one + s_round;
         for i in 0..4 {
-            cs.assert_zero_when(not_s_round, cs.col(Aes128Columns::KS_Z + i));
-
             let ks_inv_byte = cs.sum(
                 &(0..8)
                     .map(|k| {
@@ -389,6 +416,7 @@ impl<F: TowerField> Air<F> for AesRound128Air {
                     .collect::<Vec<_>>(),
             );
 
+            cs.assert_zero_when(not_s_round, cs.col(Aes128Columns::KS_Z + i));
             cs.assert_zero_when(not_s_round, ks_inv_byte);
         }
 
@@ -396,8 +424,6 @@ impl<F: TowerField> Air<F> for AesRound128Air {
         // only on s_input (init row).
         let not_s_input = one + s_input;
         for i in 0..4 {
-            cs.assert_zero_when(not_s_input, cs.col(Aes128Columns::K0_Z + i));
-
             let k0_inv_byte = cs.sum(
                 &(0..8)
                     .map(|k| {
@@ -409,6 +435,7 @@ impl<F: TowerField> Air<F> for AesRound128Air {
                     .collect::<Vec<_>>(),
             );
 
+            cs.assert_zero_when(not_s_input, cs.col(Aes128Columns::K0_Z + i));
             cs.assert_zero_when(not_s_input, k0_inv_byte);
         }
 
@@ -429,13 +456,38 @@ define_columns! {
     }
 }
 
+/// The host writes `KEY_SELECTOR` on each block's input
+/// row, `SELECTOR` on both emit rows, and calls `constrain`.
 pub struct CpuAes128Unit;
 
 impl CpuAes128Unit {
+    pub const NUM_ROOTS: usize = 5;
+
     pub fn num_columns() -> usize {
         CpuAes128Columns::NUM_COLUMNS
     }
 
+    /// Requires each call's two emits on adjacent rows;
+    /// a host that separates them pins `KEY_SELECTOR` itself.
+    ///
+    /// `offset` is where `CpuAes128Columns` starts in the host layout.
+    pub fn constrain<F: TowerField>(cs: &ConstraintSystem<F>, offset: usize) {
+        let sel = cs.col(offset + CpuAes128Columns::SELECTOR);
+        let dir = cs.col(offset + CpuAes128Columns::KEY_SELECTOR);
+        let next_sel = cs.next(offset + CpuAes128Columns::SELECTOR);
+        let next_dir = cs.next(offset + CpuAes128Columns::KEY_SELECTOR);
+        let one = cs.one();
+
+        cs.assert_boolean(sel);
+        cs.assert_boolean(dir);
+
+        cs.constrain(dir * (one + sel));
+        cs.constrain(sel * (dir + next_dir + next_sel));
+        cs.constrain(next_sel * (one + sel) * (one + next_dir));
+    }
+
+    /// `KEY_SELECTOR` doubles as the emit direction;
+    /// it must fire on exactly the block's input row.
     pub fn linking_spec() -> PermutationCheckSpec {
         let mut sources: Vec<_> = (0..16)
             .map(|i| {
@@ -447,6 +499,10 @@ impl CpuAes128Unit {
             .collect();
 
         sources.push((Source::RowIndexLeBytes(4), REQUEST_IDX_LABEL));
+        sources.push((
+            Source::Column(CpuAes128Columns::KEY_SELECTOR),
+            AES_DIRECTION_LABEL,
+        ));
 
         PermutationCheckSpec::new(sources, Some(CpuAes128Columns::SELECTOR))
     }
@@ -543,7 +599,11 @@ where
                     .0;
             }
 
-            sbox_rounds.push(sbox_rom::SboxRound { inputs, outputs });
+            sbox_rounds.push(sbox_rom::SboxRound {
+                inputs,
+                outputs,
+                request_idx: row as u32,
+            });
         }
 
         let sbox_trace = sbox_rom::generate_sbox_rom_trace(&sbox_rounds, self.sbox_rom_rows)?;
@@ -561,25 +621,25 @@ mod tests {
 
     #[test]
     fn virtual_column_count() {
-        assert_eq!(Aes128Columns::NUM_COLUMNS, 152);
+        assert_eq!(Aes128Columns::NUM_COLUMNS, 167);
         assert_eq!(Aes128Columns::STATE_IN, 0);
         assert_eq!(Aes128Columns::SBOX_OUT, 16);
         assert_eq!(Aes128Columns::ROUND_KEY, 32);
-        assert_eq!(Aes128Columns::ROUND_NUM, 48);
-        assert_eq!(Aes128Columns::S_ROUND, 49);
-        assert_eq!(Aes128Columns::S_FINAL, 50);
-        assert_eq!(Aes128Columns::S_IN_OUT, 51);
-        assert_eq!(Aes128Columns::S_ACTIVE, 52);
-        assert_eq!(Aes128Columns::S_INPUT, 53);
-        assert_eq!(Aes128Columns::K0, 54);
-        assert_eq!(Aes128Columns::KS_SUB, 70);
-        assert_eq!(Aes128Columns::KS_INV_BITS, 74);
-        assert_eq!(Aes128Columns::KS_Z, 106);
-        assert_eq!(Aes128Columns::K0_SUB, 110);
-        assert_eq!(Aes128Columns::K0_INV_BITS, 114);
-        assert_eq!(Aes128Columns::K0_Z, 146);
-        assert_eq!(Aes128Columns::REQUEST_IDX_LINK, 150);
-        assert_eq!(Aes128Columns::REQUEST_IDX_KEY, 151);
+        assert_eq!(Aes128Columns::ROUND_BITS, 48);
+        assert_eq!(Aes128Columns::S_ROUND, 64);
+        assert_eq!(Aes128Columns::S_FINAL, 65);
+        assert_eq!(Aes128Columns::S_IN_OUT, 66);
+        assert_eq!(Aes128Columns::S_ACTIVE, 67);
+        assert_eq!(Aes128Columns::S_INPUT, 68);
+        assert_eq!(Aes128Columns::K0, 69);
+        assert_eq!(Aes128Columns::KS_SUB, 85);
+        assert_eq!(Aes128Columns::KS_INV_BITS, 89);
+        assert_eq!(Aes128Columns::KS_Z, 121);
+        assert_eq!(Aes128Columns::K0_SUB, 125);
+        assert_eq!(Aes128Columns::K0_INV_BITS, 129);
+        assert_eq!(Aes128Columns::K0_Z, 161);
+        assert_eq!(Aes128Columns::REQUEST_IDX_LINK, 165);
+        assert_eq!(Aes128Columns::REQUEST_IDX_KEY, 166);
     }
 
     #[test]
@@ -589,6 +649,7 @@ mod tests {
         assert_eq!(PhysAes128Columns::NUM_COLUMNS, 96);
 
         assert_eq!(PhysAes128Columns::P_STATE_IN, 0);
+        assert_eq!(PhysAes128Columns::P_ROUND_IDX, 48);
         assert_eq!(PhysAes128Columns::P_S_ROUND, 49);
         assert_eq!(PhysAes128Columns::P_K0, 54);
         assert_eq!(PhysAes128Columns::P_KS_SUB, 70);
@@ -604,16 +665,36 @@ mod tests {
     #[test]
     fn constraint_count() {
         let ast: ConstraintAst<F> = AesRound128Air::for_constraints().constraint_ast();
-
-        assert_eq!(ast.roots.len(), 196);
+        assert_eq!(ast.roots.len(), 207);
     }
 
     #[test]
     fn link_spec_structure() {
         let spec = AesRound128Air::link_spec();
-        assert_eq!(spec.num_sources(), 17);
+        assert_eq!(spec.num_sources(), 18);
         assert_eq!(spec.selector, Some(Aes128Columns::S_IN_OUT));
         assert_eq!(spec.sources[16].1, REQUEST_IDX_LABEL);
+        assert_eq!(spec.sources[17].1, AES_DIRECTION_LABEL);
+    }
+
+    #[test]
+    fn cpu_num_roots_matches_constrain() {
+        let cs = ConstraintSystem::<F>::new();
+        CpuAes128Unit::constrain(&cs, 0);
+
+        assert_eq!(cs.build().roots.len(), CpuAes128Unit::NUM_ROOTS);
+    }
+
+    #[test]
+    fn link_endpoints_agree() {
+        let chiplet = AesRound128Air::link_spec();
+        let cpu = CpuAes128Unit::linking_spec();
+
+        assert_eq!(chiplet.num_sources(), cpu.num_sources());
+
+        for (c, p) in chiplet.sources.iter().zip(cpu.sources.iter()) {
+            assert_eq!(c.1, p.1);
+        }
     }
 
     #[test]
@@ -623,8 +704,10 @@ mod tests {
 
         let (bus_id, spec) = &specs[0];
         assert_eq!(bus_id, sbox_rom::SboxRomChiplet::BUS_ID);
-        assert_eq!(spec.num_sources(), 32);
+        assert_eq!(spec.num_sources(), 33);
+        assert_eq!(spec.sources[32].1, REQUEST_IDX_LABEL);
         assert_eq!(spec.selector, Some(Aes128Columns::S_ACTIVE));
+        assert!(spec.clock_waiver.is_none());
     }
 
     #[test]

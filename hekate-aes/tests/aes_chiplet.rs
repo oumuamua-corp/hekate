@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // This file is part of the hekate project.
 // Copyright (C) 2026 Andrei Kochergin <andrei@oumuamua.dev>
-// Copyright (C) 2026 Oumuamua Labs <info@oumuamua.dev>. All rights reserved.
+// Copyright (C) 2026 Oumuamua Labs <info@oumuamua.dev>.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,9 +16,8 @@
 // limitations under the License.
 
 use hekate_aes::{
-    Aes128Chiplet, Aes128Columns, Aes256Chiplet, Aes256Columns, AesRound128Air, AesRound256Air,
-    CpuAes128Columns, CpuAes128Unit, CpuAes256Columns, CpuAes256Unit, PhysAes128Columns,
-    PhysAes256Columns,
+    Aes128Chiplet, Aes256Chiplet, AesRound128Air, AesRound256Air, CpuAes128Columns, CpuAes128Unit,
+    CpuAes256Columns, CpuAes256Unit, PhysAes128Columns, PhysAes256Columns, PhysSboxRomColumns,
     trace::{Aes128Call, Aes256Call, expand_key, expand_key_256},
 };
 use hekate_core::config::Config;
@@ -26,7 +25,7 @@ use hekate_core::errors;
 use hekate_core::trace::{ColumnTrace, ColumnType, TraceBuilder, TraceColumn};
 use hekate_crypto::DefaultHasher;
 use hekate_crypto::transcript::Transcript;
-use hekate_math::{Bit, Block8, Block64, Block128, Flat, TowerField};
+use hekate_math::{Bit, Block8, Block16, Block64, Block128, HardwareField, TowerField};
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
 use hekate_program::permutation::PermutationCheckSpec;
@@ -99,8 +98,7 @@ impl Air<F> for Aes128TestProgram {
 
     fn constraint_ast(&self) -> ConstraintAst<F> {
         let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CpuAes128Columns::SELECTOR));
-        cs.assert_boolean(cs.col(CpuAes128Columns::KEY_SELECTOR));
+        CpuAes128Unit::constrain(&cs, 0);
 
         cs.build()
     }
@@ -279,28 +277,31 @@ where
 // Helpers
 // =================================================================
 
-// S-box ROM physical column indices
-const ROM_PHYS_INV: usize = 0;
-const ROM_PHYS_INPUT: usize = 2;
-const ROM_PHYS_OUTPUT: usize = 18;
-const ROM_PHYS_Z: usize = 34;
-const ROM_PHYS_SELECTOR: usize = 50;
-
 fn flip_b8(trace: &mut ColumnTrace, col: usize, row: usize, mask: u8) {
     match &mut trace.columns[col] {
         TraceColumn::B8(data) => {
-            let original = data[row];
-            data[row] = Flat::from_raw(Block8(original.to_tower().0 ^ mask));
+            let original = data[row].to_tower().0;
+            data[row] = Block8(original ^ mask).to_hardware();
         }
         _ => panic!("expected B8 column at {col}"),
+    }
+}
+
+fn flip_b16(trace: &mut ColumnTrace, col: usize, row: usize, mask: u16) {
+    match &mut trace.columns[col] {
+        TraceColumn::B16(data) => {
+            let original = data[row].to_tower().0;
+            data[row] = Block16(original ^ mask).to_hardware();
+        }
+        _ => panic!("expected B16 column at {col}"),
     }
 }
 
 fn flip_b64(trace: &mut ColumnTrace, col: usize, row: usize, mask: u64) {
     match &mut trace.columns[col] {
         TraceColumn::B64(data) => {
-            let original = data[row];
-            data[row] = Flat::from_raw(Block64(original.to_tower().0 ^ mask));
+            let original = data[row].to_tower().0;
+            data[row] = Block64(original ^ mask).to_hardware();
         }
         _ => panic!("expected B64 column at {col}"),
     }
@@ -340,7 +341,7 @@ fn copy_b8_block(trace: &mut ColumnTrace, base: usize, len: usize, src: usize, d
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_128_sbox_substitution() {
     let detected = run_tampered_aes128(|traces, _| {
-        flip_b8(&mut traces[0], Aes128Columns::SBOX_OUT, 0, 0x01);
+        flip_b8(&mut traces[0], PhysAes128Columns::P_SBOX_OUT, 0, 0x01);
     });
 
     assert!(detected, "wrong S-box output must be caught by sbox bus");
@@ -352,7 +353,7 @@ fn exploit_128_round_key_swap() {
     let detected = run_tampered_aes128(|traces, _| {
         let aes = &mut traces[0];
         for j in 0..16 {
-            match &mut aes.columns[Aes128Columns::ROUND_KEY + j] {
+            match &mut aes.columns[PhysAes128Columns::P_ROUND_KEY + j] {
                 TraceColumn::B8(data) => data.swap(0, 1),
                 _ => panic!("expected B8"),
             }
@@ -369,7 +370,7 @@ fn exploit_128_round_key_swap() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_128_mixcol_bypass() {
     let detected = run_tampered_aes128(|traces, _| {
-        flip_b8(&mut traces[0], Aes128Columns::STATE_IN, 1, 0x01);
+        flip_b8(&mut traces[0], PhysAes128Columns::P_STATE_IN, 1, 0x01);
     });
 
     assert!(detected, "MixColumns output tamper must be caught");
@@ -380,7 +381,10 @@ fn exploit_128_mixcol_bypass() {
 fn exploit_128_shiftrows_bypass() {
     let detected = run_tampered_aes128(|traces, _| {
         let aes = &mut traces[0];
-        let (col1, col5) = (Aes128Columns::SBOX_OUT + 1, Aes128Columns::SBOX_OUT + 5);
+        let (col1, col5) = (
+            PhysAes128Columns::P_SBOX_OUT + 1,
+            PhysAes128Columns::P_SBOX_OUT + 5,
+        );
 
         let v1 = match &aes.columns[col1] {
             TraceColumn::B8(d) => d[0],
@@ -406,7 +410,7 @@ fn exploit_128_shiftrows_bypass() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_128_round_skip() {
     let detected = run_tampered_aes128(|traces, _| {
-        set_bit_val(&mut traces[0], Aes128Columns::S_ROUND, 4, Bit::ZERO);
+        set_bit_val(&mut traces[0], PhysAes128Columns::P_S_ROUND, 4, Bit::ZERO);
     });
 
     assert!(detected, "deactivating s_round must be caught");
@@ -416,7 +420,7 @@ fn exploit_128_round_skip() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_128_ghost_injection() {
     let detected = run_tampered_aes128(|traces, _| {
-        set_bit_val(&mut traces[0], Aes128Columns::S_ROUND, 12, Bit::ONE);
+        set_bit_val(&mut traces[0], PhysAes128Columns::P_S_ROUND, 12, Bit::ONE);
     });
 
     assert!(detected, "ghost row activation must be caught");
@@ -426,7 +430,7 @@ fn exploit_128_ghost_injection() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_128_io_bus_unbind() {
     let detected = run_tampered_aes128(|traces, _| {
-        flip_b8(&mut traces[0], Aes128Columns::STATE_IN, 10, 0x01);
+        flip_b8(&mut traces[0], PhysAes128Columns::P_STATE_IN, 10, 0x01);
     });
 
     assert!(
@@ -481,9 +485,9 @@ fn exploit_aes128_key_in_duplicate_cpu_request_rejected() {
 fn exploit_aes128_sbox_phantom_active_without_link_rejected() {
     let detected = run_tampered_aes128(|traces, _| {
         let aes = &mut traces[0];
-        set_bit_val(aes, Aes128Columns::S_ACTIVE, 15, Bit::ONE);
-        set_bit_val(aes, Aes128Columns::S_INPUT, 15, Bit::ZERO);
-        set_bit_val(aes, Aes128Columns::S_IN_OUT, 15, Bit::ZERO);
+        set_bit_val(aes, PhysAes128Columns::P_S_ACTIVE, 15, Bit::ONE);
+        set_bit_val(aes, PhysAes128Columns::P_S_INPUT, 15, Bit::ZERO);
+        set_bit_val(aes, PhysAes128Columns::P_S_IN_OUT, 15, Bit::ZERO);
     });
 
     assert!(
@@ -495,46 +499,49 @@ fn exploit_aes128_sbox_phantom_active_without_link_rejected() {
 }
 
 // =================================================================
-// Round Counter Exploits
+// Round Index Exploits
 // =================================================================
 
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
-fn exploit_128_round_counter_tamper() {
+fn exploit_128_round_index_shift() {
     let detected = run_tampered_aes128(|traces, _| {
-        flip_b8(&mut traces[0], Aes128Columns::ROUND_NUM, 3, 0x01);
+        flip_b16(&mut traces[0], PhysAes128Columns::P_ROUND_IDX, 3, 0x000C);
     });
 
-    assert!(
-        detected,
-        "round_num tamper must be caught by doubling constraint"
-    );
+    assert!(detected);
 }
 
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
-fn exploit_128_round_counter_init() {
+fn exploit_128_round_index_init() {
     let detected = run_tampered_aes128(|traces, _| {
-        flip_b8(&mut traces[0], Aes128Columns::ROUND_NUM, 0, 0x02);
+        flip_b16(&mut traces[0], PhysAes128Columns::P_ROUND_IDX, 0, 0x0003);
     });
 
-    assert!(
-        detected,
-        "round_num init tamper must be caught by s_input constraint"
-    );
+    assert!(detected);
 }
 
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
-fn exploit_128_round_counter_final() {
+fn exploit_128_round_index_final() {
     let detected = run_tampered_aes128(|traces, _| {
-        flip_b8(&mut traces[0], Aes128Columns::ROUND_NUM, 9, 0x01);
+        flip_b16(&mut traces[0], PhysAes128Columns::P_ROUND_IDX, 9, 0x0300);
     });
 
-    assert!(
-        detected,
-        "round_num final tamper must be caught by s_final constraint"
-    );
+    assert!(detected);
+}
+
+/// A bit above the active range is pinned to zero,
+/// an out-of-range index cannot hide the row's activity.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn exploit_128_round_index_out_of_range() {
+    let detected = run_tampered_aes128(|traces, _| {
+        flip_b16(&mut traces[0], PhysAes128Columns::P_ROUND_IDX, 5, 0x8000);
+    });
+
+    assert!(detected);
 }
 
 // =================================================================
@@ -545,7 +552,7 @@ fn exploit_128_round_counter_final() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_128_s_active_desync() {
     let detected = run_tampered_aes128(|traces, _| {
-        set_bit_val(&mut traces[0], Aes128Columns::S_ACTIVE, 3, Bit::ZERO);
+        set_bit_val(&mut traces[0], PhysAes128Columns::P_S_ACTIVE, 3, Bit::ZERO);
     });
 
     assert!(
@@ -558,7 +565,7 @@ fn exploit_128_s_active_desync() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_128_s_input_forgery() {
     let detected = run_tampered_aes128(|traces, _| {
-        set_bit_val(&mut traces[0], Aes128Columns::S_INPUT, 3, Bit::ONE);
+        set_bit_val(&mut traces[0], PhysAes128Columns::P_S_INPUT, 3, Bit::ONE);
     });
 
     assert!(
@@ -571,7 +578,7 @@ fn exploit_128_s_input_forgery() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_128_mutual_exclusivity() {
     let detected = run_tampered_aes128(|traces, _| {
-        set_bit_val(&mut traces[0], Aes128Columns::S_FINAL, 3, Bit::ONE);
+        set_bit_val(&mut traces[0], PhysAes128Columns::P_S_FINAL, 3, Bit::ONE);
     });
 
     assert!(
@@ -588,7 +595,7 @@ fn exploit_128_mutual_exclusivity() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_128_sbox_inv_tamper() {
     let detected = run_tampered_aes128(|traces, _| {
-        flip_b64(&mut traces[1], ROM_PHYS_INV, 0, 0x01);
+        flip_b64(&mut traces[1], PhysSboxRomColumns::P_INV, 0, 0x01);
     });
 
     assert!(
@@ -602,16 +609,18 @@ fn exploit_128_sbox_inv_tamper() {
 fn exploit_128_sbox_z_forgery() {
     let detected = run_tampered_aes128(|traces, _| {
         let rom = &mut traces[1];
-        let active = rows_with_bit(rom, ROM_PHYS_SELECTOR);
+        let active = rows_with_bit(rom, PhysSboxRomColumns::P_SELECTOR);
         let target = active.iter().find(|&&r| {
-            rom.columns[ROM_PHYS_INPUT].as_b8_slice().unwrap()[r]
+            rom.columns[PhysSboxRomColumns::P_INPUT]
+                .as_b8_slice()
+                .unwrap()[r]
                 .to_tower()
                 .0
                 != 0
         });
 
         if let Some(&row) = target {
-            set_bit_val(rom, ROM_PHYS_Z, row, Bit::ONE);
+            set_bit_val(rom, PhysSboxRomColumns::P_Z, row, Bit::ONE);
         }
     });
 
@@ -626,9 +635,9 @@ fn exploit_128_sbox_z_forgery() {
 fn exploit_128_sbox_rom_deactivation() {
     let detected = run_tampered_aes128(|traces, _| {
         let rom = &mut traces[1];
-        let active = rows_with_bit(rom, ROM_PHYS_SELECTOR);
+        let active = rows_with_bit(rom, PhysSboxRomColumns::P_SELECTOR);
 
-        set_bit_val(rom, ROM_PHYS_SELECTOR, active[0], Bit::ZERO);
+        set_bit_val(rom, PhysSboxRomColumns::P_SELECTOR, active[0], Bit::ZERO);
     });
 
     assert!(
@@ -642,9 +651,9 @@ fn exploit_128_sbox_rom_deactivation() {
 fn exploit_128_sbox_output_forgery() {
     let detected = run_tampered_aes128(|traces, _| {
         let rom = &mut traces[1];
-        let active = rows_with_bit(rom, ROM_PHYS_SELECTOR);
+        let active = rows_with_bit(rom, PhysSboxRomColumns::P_SELECTOR);
 
-        flip_b8(rom, ROM_PHYS_OUTPUT, active[0], 0xFF);
+        flip_b8(rom, PhysSboxRomColumns::P_OUTPUT, active[0], 0xFF);
     });
 
     assert!(
@@ -661,9 +670,9 @@ fn exploit_128_sbox_output_forgery() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_128_ghost_protocol_mid_block() {
     let detected = run_tampered_aes128(|traces, _| {
-        set_bit_val(&mut traces[0], Aes128Columns::S_ROUND, 4, Bit::ZERO);
-        set_bit_val(&mut traces[0], Aes128Columns::S_ACTIVE, 4, Bit::ZERO);
-        set_bit_val(&mut traces[1], ROM_PHYS_SELECTOR, 4, Bit::ZERO);
+        set_bit_val(&mut traces[0], PhysAes128Columns::P_S_ROUND, 4, Bit::ZERO);
+        set_bit_val(&mut traces[0], PhysAes128Columns::P_S_ACTIVE, 4, Bit::ZERO);
+        set_bit_val(&mut traces[1], PhysSboxRomColumns::P_SELECTOR, 4, Bit::ZERO);
     });
 
     assert!(
@@ -818,8 +827,7 @@ impl Air<F> for Aes256TestProgram {
 
     fn constraint_ast(&self) -> ConstraintAst<F> {
         let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CpuAes256Columns::SELECTOR));
-        cs.assert_boolean(cs.col(CpuAes256Columns::KEY_SELECTOR));
+        CpuAes256Unit::constrain(&cs, 0);
 
         cs.build()
     }
@@ -999,7 +1007,7 @@ where
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_aes256_sbox_substitution() {
     let detected = run_tampered_aes256(|traces, _| {
-        flip_b8(&mut traces[0], Aes256Columns::SBOX_OUT, 0, 0x01);
+        flip_b8(&mut traces[0], PhysAes256Columns::P_SBOX_OUT, 0, 0x01);
     });
 
     assert!(detected, "wrong S-box output must be caught by sbox bus");
@@ -1011,7 +1019,7 @@ fn exploit_aes256_round_key_swap() {
     let detected = run_tampered_aes256(|traces, _| {
         let aes = &mut traces[0];
         for j in 0..16 {
-            match &mut aes.columns[Aes256Columns::ROUND_KEY + j] {
+            match &mut aes.columns[PhysAes256Columns::P_ROUND_KEY + j] {
                 TraceColumn::B8(data) => data.swap(0, 1),
                 _ => panic!("expected B8"),
             }
@@ -1028,7 +1036,7 @@ fn exploit_aes256_round_key_swap() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_aes256_mixcol_bypass() {
     let detected = run_tampered_aes256(|traces, _| {
-        flip_b8(&mut traces[0], Aes256Columns::STATE_IN, 1, 0x01);
+        flip_b8(&mut traces[0], PhysAes256Columns::P_STATE_IN, 1, 0x01);
     });
 
     assert!(detected, "MixColumns output tamper must be caught");
@@ -1038,7 +1046,7 @@ fn exploit_aes256_mixcol_bypass() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_aes256_round_skip() {
     let detected = run_tampered_aes256(|traces, _| {
-        set_bit_val(&mut traces[0], Aes256Columns::S_ROUND, 4, Bit::ZERO);
+        set_bit_val(&mut traces[0], PhysAes256Columns::P_S_ROUND, 4, Bit::ZERO);
     });
 
     assert!(detected, "deactivating s_round must be caught");
@@ -1048,7 +1056,7 @@ fn exploit_aes256_round_skip() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_aes256_ghost_injection() {
     let detected = run_tampered_aes256(|traces, _| {
-        set_bit_val(&mut traces[0], Aes256Columns::S_ROUND, 15, Bit::ONE);
+        set_bit_val(&mut traces[0], PhysAes256Columns::P_S_ROUND, 15, Bit::ONE);
     });
 
     assert!(detected, "ghost row activation must be caught");
@@ -1058,7 +1066,7 @@ fn exploit_aes256_ghost_injection() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_aes256_io_bus_unbind() {
     let detected = run_tampered_aes256(|traces, _| {
-        flip_b8(&mut traces[0], Aes256Columns::STATE_IN, 14, 0x01);
+        flip_b8(&mut traces[0], PhysAes256Columns::P_STATE_IN, 14, 0x01);
     });
 
     assert!(
@@ -1113,9 +1121,9 @@ fn exploit_aes256_key_in_duplicate_cpu_request_rejected() {
 fn exploit_aes256_sbox_phantom_active_without_link_rejected() {
     let detected = run_tampered_aes256(|traces, _| {
         let aes = &mut traces[0];
-        set_bit_val(aes, Aes256Columns::S_ACTIVE, 15, Bit::ONE);
-        set_bit_val(aes, Aes256Columns::S_INPUT, 15, Bit::ZERO);
-        set_bit_val(aes, Aes256Columns::S_IN_OUT, 15, Bit::ZERO);
+        set_bit_val(aes, PhysAes256Columns::P_S_ACTIVE, 15, Bit::ONE);
+        set_bit_val(aes, PhysAes256Columns::P_S_INPUT, 15, Bit::ZERO);
+        set_bit_val(aes, PhysAes256Columns::P_S_IN_OUT, 15, Bit::ZERO);
     });
 
     assert!(
@@ -1128,45 +1136,51 @@ fn exploit_aes256_sbox_phantom_active_without_link_rejected() {
 
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
-fn exploit_aes256_round_counter_tamper() {
+fn exploit_aes256_round_index_shift() {
     let detected = run_tampered_aes256(|traces, _| {
-        flip_b8(&mut traces[0], Aes256Columns::ROUND_NUM, 3, 0x01);
+        flip_b16(&mut traces[0], PhysAes256Columns::P_ROUND_IDX, 3, 0x000C);
     });
 
-    assert!(
-        detected,
-        "round_num tamper must be caught by doubling constraint"
-    );
+    assert!(detected);
 }
 
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
-fn exploit_aes256_round_counter_init() {
+fn exploit_aes256_round_index_init() {
     let detected = run_tampered_aes256(|traces, _| {
-        flip_b8(&mut traces[0], Aes256Columns::ROUND_NUM, 0, 0x02);
+        flip_b16(&mut traces[0], PhysAes256Columns::P_ROUND_IDX, 0, 0x0003);
     });
 
-    assert!(detected, "round_num init tamper must be caught");
+    assert!(detected);
 }
 
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
-fn exploit_aes256_round_counter_final() {
+fn exploit_aes256_round_index_final() {
     let detected = run_tampered_aes256(|traces, _| {
-        flip_b8(&mut traces[0], Aes256Columns::ROUND_NUM, 13, 0x01);
+        flip_b16(&mut traces[0], PhysAes256Columns::P_ROUND_IDX, 13, 0x3000);
     });
 
-    assert!(
-        detected,
-        "round_num final tamper must be caught by s_final constraint"
-    );
+    assert!(detected);
+}
+
+/// A bit above the active range is pinned to zero;
+/// an out-of-range index cannot hide the row's activity.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn exploit_aes256_round_index_out_of_range() {
+    let detected = run_tampered_aes256(|traces, _| {
+        flip_b16(&mut traces[0], PhysAes256Columns::P_ROUND_IDX, 5, 0x8000);
+    });
+
+    assert!(detected);
 }
 
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_aes256_s_active_desync() {
     let detected = run_tampered_aes256(|traces, _| {
-        set_bit_val(&mut traces[0], Aes256Columns::S_ACTIVE, 3, Bit::ZERO);
+        set_bit_val(&mut traces[0], PhysAes256Columns::P_S_ACTIVE, 3, Bit::ZERO);
     });
 
     assert!(detected, "s_active=0 on s_round=1 row must be caught");
@@ -1176,7 +1190,7 @@ fn exploit_aes256_s_active_desync() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_aes256_s_input_forgery() {
     let detected = run_tampered_aes256(|traces, _| {
-        set_bit_val(&mut traces[0], Aes256Columns::S_INPUT, 3, Bit::ONE);
+        set_bit_val(&mut traces[0], PhysAes256Columns::P_S_INPUT, 3, Bit::ONE);
     });
 
     assert!(detected, "s_input=1 on non-input row must be caught");
@@ -1186,7 +1200,7 @@ fn exploit_aes256_s_input_forgery() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_aes256_mutual_exclusivity() {
     let detected = run_tampered_aes256(|traces, _| {
-        set_bit_val(&mut traces[0], Aes256Columns::S_FINAL, 3, Bit::ONE);
+        set_bit_val(&mut traces[0], PhysAes256Columns::P_S_FINAL, 3, Bit::ONE);
     });
 
     assert!(detected, "s_round=1 AND s_final=1 must be caught");
@@ -1240,7 +1254,10 @@ fn exploit_aes256_k0_bus_unbind() {
 fn exploit_aes256_shiftrows_bypass() {
     let detected = run_tampered_aes256(|traces, _| {
         let aes = &mut traces[0];
-        let (col1, col5) = (Aes256Columns::SBOX_OUT + 1, Aes256Columns::SBOX_OUT + 5);
+        let (col1, col5) = (
+            PhysAes256Columns::P_SBOX_OUT + 1,
+            PhysAes256Columns::P_SBOX_OUT + 5,
+        );
 
         let v1 = match &aes.columns[col1] {
             TraceColumn::B8(d) => d[0],
@@ -1266,7 +1283,7 @@ fn exploit_aes256_shiftrows_bypass() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_aes256_sbox_inv_tamper() {
     let detected = run_tampered_aes256(|traces, _| {
-        flip_b64(&mut traces[1], ROM_PHYS_INV, 0, 0x01);
+        flip_b64(&mut traces[1], PhysSboxRomColumns::P_INV, 0, 0x01);
     });
 
     assert!(
@@ -1280,16 +1297,18 @@ fn exploit_aes256_sbox_inv_tamper() {
 fn exploit_aes256_sbox_z_forgery() {
     let detected = run_tampered_aes256(|traces, _| {
         let rom = &mut traces[1];
-        let active = rows_with_bit(rom, ROM_PHYS_SELECTOR);
+        let active = rows_with_bit(rom, PhysSboxRomColumns::P_SELECTOR);
         let target = active.iter().find(|&&r| {
-            rom.columns[ROM_PHYS_INPUT].as_b8_slice().unwrap()[r]
+            rom.columns[PhysSboxRomColumns::P_INPUT]
+                .as_b8_slice()
+                .unwrap()[r]
                 .to_tower()
                 .0
                 != 0
         });
 
         if let Some(&row) = target {
-            set_bit_val(rom, ROM_PHYS_Z, row, Bit::ONE);
+            set_bit_val(rom, PhysSboxRomColumns::P_Z, row, Bit::ONE);
         }
     });
 
@@ -1304,9 +1323,9 @@ fn exploit_aes256_sbox_z_forgery() {
 fn exploit_aes256_sbox_rom_deactivation() {
     let detected = run_tampered_aes256(|traces, _| {
         let rom = &mut traces[1];
-        let active = rows_with_bit(rom, ROM_PHYS_SELECTOR);
+        let active = rows_with_bit(rom, PhysSboxRomColumns::P_SELECTOR);
 
-        set_bit_val(rom, ROM_PHYS_SELECTOR, active[0], Bit::ZERO);
+        set_bit_val(rom, PhysSboxRomColumns::P_SELECTOR, active[0], Bit::ZERO);
     });
 
     assert!(
@@ -1320,9 +1339,9 @@ fn exploit_aes256_sbox_rom_deactivation() {
 fn exploit_aes256_sbox_output_forgery() {
     let detected = run_tampered_aes256(|traces, _| {
         let rom = &mut traces[1];
-        let active = rows_with_bit(rom, ROM_PHYS_SELECTOR);
+        let active = rows_with_bit(rom, PhysSboxRomColumns::P_SELECTOR);
 
-        flip_b8(rom, ROM_PHYS_OUTPUT, active[0], 0xFF);
+        flip_b8(rom, PhysSboxRomColumns::P_OUTPUT, active[0], 0xFF);
     });
 
     assert!(
@@ -1348,30 +1367,16 @@ fn exploit_aes256_key_aux_tamper() {
     );
 }
 
+/// Moving the index two places keeps the
+/// RotWord/direct parity and changes only Rcon.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
-fn exploit_aes256_rcon_tamper() {
+fn exploit_aes256_round_index_parity_preserved() {
     let detected = run_tampered_aes256(|traces, _| {
-        flip_b8(&mut traces[0], PhysAes256Columns::P_RCON, 0, 0x02);
+        flip_b16(&mut traces[0], PhysAes256Columns::P_ROUND_IDX, 2, 0x0014);
     });
 
-    assert!(
-        detected,
-        "RCON tamper must be caught by init or doubling constraint"
-    );
-}
-
-#[test]
-#[cfg_attr(debug_assertions, ignore)]
-fn exploit_aes256_s_even_tamper() {
-    let detected = run_tampered_aes256(|traces, _| {
-        set_bit_val(&mut traces[0], Aes256Columns::S_EVEN, 1, Bit::ONE);
-    });
-
-    assert!(
-        detected,
-        "S_EVEN tamper must be caught by toggle constraint"
-    );
+    assert!(detected);
 }
 
 #[test]
@@ -1417,9 +1422,9 @@ fn exploit_aes256_init_key_aux_tamper() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_aes256_ghost_protocol_mid_block() {
     let detected = run_tampered_aes256(|traces, _| {
-        set_bit_val(&mut traces[0], Aes256Columns::S_ROUND, 4, Bit::ZERO);
-        set_bit_val(&mut traces[0], Aes256Columns::S_ACTIVE, 4, Bit::ZERO);
-        set_bit_val(&mut traces[1], ROM_PHYS_SELECTOR, 4, Bit::ZERO);
+        set_bit_val(&mut traces[0], PhysAes256Columns::P_S_ROUND, 4, Bit::ZERO);
+        set_bit_val(&mut traces[0], PhysAes256Columns::P_S_ACTIVE, 4, Bit::ZERO);
+        set_bit_val(&mut traces[1], PhysSboxRomColumns::P_SELECTOR, 4, Bit::ZERO);
     });
 
     assert!(

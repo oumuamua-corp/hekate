@@ -10,11 +10,16 @@ description = "Trace mutation fuzzer for Hekate ZK programs and chiplets. Tamper
 keywords = ["zk", "fuzzer", "proptest", "hekate", "trace"]
 categories = ["cryptography", "development-tools::testing"]
 
+[features]
+default = ["parallel"]
+parallel = ["dep:rayon"]
+
 [dependencies]
 hekate-math = { workspace = true, features = ["std"] }
 hekate-sdk = { workspace = true, default-features = false, features = ["std", "blake3"] }
 hekate-core = { workspace = true, default-features = false, features = ["std", "blake3"] }
 hekate-program = { workspace = true, default-features = false, features = ["std"] }
+rayon = { workspace = true, optional = true }
 proptest = "1.5"
 
 [dev-dependencies]

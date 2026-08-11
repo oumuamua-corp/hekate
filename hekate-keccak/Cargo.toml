@@ -36,7 +36,7 @@ hekate-crypto = { workspace = true, features = ["std", "blake3"] }
 hekate-verifier = { workspace = true, features = ["std", "blake3"] }
 hekate-sdk = { workspace = true, features = ["std", "blake3"] }
 hekate-prover-sys = { workspace = true, features = ["blake3", "public"] }
-hekate-scribble = { workspace = true }
+hekate-scribble = { workspace = true, features = ["parallel"] }
 criterion = "0.8"
 rand = "0.9"
 keccak = "0.2"

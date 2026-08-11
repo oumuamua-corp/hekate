@@ -93,8 +93,7 @@ impl Air<F> for Aes128ExampleProgram {
 
     fn constraint_ast(&self) -> ConstraintAst<F> {
         let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CpuAes128Columns::SELECTOR));
-        cs.assert_boolean(cs.col(CpuAes128Columns::KEY_SELECTOR));
+        CpuAes128Unit::constrain(&cs, 0);
 
         cs.build()
     }
@@ -132,8 +131,7 @@ impl Air<F> for Aes256ExampleProgram {
 
     fn constraint_ast(&self) -> ConstraintAst<F> {
         let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CpuAes256Columns::SELECTOR));
-        cs.assert_boolean(cs.col(CpuAes256Columns::KEY_SELECTOR));
+        CpuAes256Unit::constrain(&cs, 0);
 
         cs.build()
     }

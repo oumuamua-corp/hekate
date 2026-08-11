@@ -22,7 +22,7 @@ use hekate_crypto::transcript::Transcript;
 use hekate_keccak::{
     CpuKeccakColumns, CpuKeccakUnit, KeccakChiplet, KeccakWitness, generate_keccak_trace,
 };
-use hekate_math::{Bit, Block32, Block64, Block128, Flat, TowerField};
+use hekate_math::{Bit, Block32, Block64, Block128, Flat, HardwareField, TowerField};
 use hekate_program::chiplet::ChipletDef;
 use hekate_program::constraint::builder::ConstraintSystem;
 use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
@@ -265,8 +265,8 @@ where
 fn flip_b32(trace: &mut ColumnTrace, col: usize, row: usize, mask: u32) {
     match &mut trace.columns[col] {
         TraceColumn::B32(data) => {
-            let original = data[row];
-            data[row] = Flat::from_raw(Block32(original.to_tower().0 ^ mask));
+            let original = data[row].to_tower().0;
+            data[row] = Block32(original ^ mask).to_hardware();
         }
         _ => panic!("expected B32 column at {col}"),
     }
@@ -275,8 +275,8 @@ fn flip_b32(trace: &mut ColumnTrace, col: usize, row: usize, mask: u32) {
 fn flip_b64(trace: &mut ColumnTrace, col: usize, row: usize, mask: u64) {
     match &mut trace.columns[col] {
         TraceColumn::B64(data) => {
-            let original = data[row];
-            data[row] = Flat::from_raw(Block64(original.to_tower().0 ^ mask));
+            let original = data[row].to_tower().0;
+            data[row] = Block64(original ^ mask).to_hardware();
         }
         _ => panic!("expected B64 column at {col}"),
     }
