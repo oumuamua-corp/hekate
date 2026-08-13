@@ -868,6 +868,7 @@ mod tests {
         assert_eq!(e.physical_row_bytes(), 80);
 
         let layout = e.virtual_layout();
+
         assert_eq!(layout.len(), 82);
         assert!(layout[..64].iter().all(|&t| t == ColumnType::Bit));
         assert!(layout[64..77].iter().all(|&t| t == ColumnType::B32));
@@ -890,6 +891,7 @@ mod tests {
         assert_eq!(e.physical_row_bytes(), 210);
 
         let layout = e.virtual_layout();
+
         assert_eq!(layout.len(), 1691);
         assert!(layout[..1600].iter().all(|&t| t == ColumnType::Bit));
         assert!(layout[1600..1664].iter().all(|&t| t == ColumnType::Bit));
@@ -899,9 +901,12 @@ mod tests {
 
     #[test]
     fn ring_switch_plan_rejects_uncovered_columns() {
-        let entries = keccak_expander().expansion_entries();
+        let expander = keccak_expander();
+        let entries = expander.expansion_entries();
+
         let mut layout = keccak_physical_layout();
 
+        assert_eq!(expander.num_physical_columns(), layout.len());
         assert!(RingSwitchPlan::new(&layout, Some(&entries), 0).is_ok());
 
         layout.push(ColumnType::B64);
@@ -941,6 +946,7 @@ mod tests {
         assert_eq!(e.physical_row_bytes(), 40);
 
         let layout = e.virtual_layout();
+
         assert_eq!(layout[320..324].len(), 4);
         assert!(layout[320..324].iter().all(|&t| t == ColumnType::B32));
     }
@@ -951,6 +957,7 @@ mod tests {
             .expand_bits(5, ColumnType::B32)
             .reuse_pass_through(3, 5)
             .build();
+
         assert!(result.is_err());
     }
 
@@ -967,6 +974,7 @@ mod tests {
         assert_eq!(e.num_virtual_columns(), 4 + 256);
 
         let layout = e.virtual_layout();
+
         assert!(layout[0..4].iter().all(|&t| t == ColumnType::B64));
         assert!(layout[4..260].iter().all(|&t| t == ColumnType::Bit));
     }
@@ -977,6 +985,7 @@ mod tests {
             .pass_through(4, ColumnType::B64)
             .reuse_expand_bits(2, 4)
             .build();
+
         assert!(result.is_err());
     }
 
@@ -986,6 +995,7 @@ mod tests {
             .pass_through(1, ColumnType::B128)
             .reuse_expand_bits(0, 1)
             .build();
+
         assert!(result.is_err());
     }
 
@@ -994,6 +1004,7 @@ mod tests {
         let result = VirtualExpander::new()
             .expand_bits(1, ColumnType::Bit)
             .build();
+
         assert!(result.is_err());
     }
 
@@ -1002,6 +1013,7 @@ mod tests {
         let result = VirtualExpander::new()
             .expand_bits(1, ColumnType::B128)
             .build();
+
         assert!(result.is_err());
     }
 

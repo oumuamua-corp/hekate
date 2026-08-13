@@ -51,8 +51,7 @@ pub struct ChipletDef<F: TowerField> {
 
 impl<F: TowerField> ChipletDef<F> {
     /// Snapshot a chiplet's full AIR definition.
-    /// Call once at setup; the source
-    /// chiplet can be dropped after.
+    /// Call once at setup; the source chiplet can be dropped after.
     pub fn from_air<P: Air<F> + Send + 'static>(p: &P) -> errors::Result<Self>
     where
         F: TraceCompatibleField + PackableField + HardwareField + 'static,
@@ -64,13 +63,13 @@ impl<F: TowerField> ChipletDef<F> {
         }
 
         let constraint_ast = p.constraint_ast();
-        validate_paired_bus_mutex(&permutation_checks, &constraint_ast)?;
-
         let boundary_constraints = p.boundary_constraints();
-        validate_chiplet_boundaries(&boundary_constraints, p.num_columns())?;
-
         let fixed_columns = p.fixed_columns();
+
+        validate_paired_bus_mutex(&permutation_checks, &constraint_ast)?;
+        validate_chiplet_boundaries(&boundary_constraints, p.num_columns())?;
         validate_fixed_columns(&fixed_columns, p.virtual_column_layout(), None)?;
+        validate_expander_coverage(p.virtual_expander(), p.column_layout())?;
 
         Ok(Self {
             name: p.name(),
@@ -99,9 +98,8 @@ impl<F: TowerField> ChipletDef<F> {
         }
     }
 
-    /// Expand physical ColumnTrace into virtual
-    /// PolyVariants. Uses embedded expander
-    /// if present, else 1:1 mapping.
+    /// Expand physical ColumnTrace into virtual PolyVariants.
+    /// Uses embedded expander if present, else 1:1 mapping.
     pub fn expand_variants<'a>(
         &self,
         trace: &'a ColumnTrace,
@@ -242,8 +240,7 @@ impl<F: TowerField> Air<F> for ChipletDef<F> {
 // Composite Chiplet Composition
 // =================================================================
 
-/// Factory trait for deterministic
-/// ChipletDef construction.
+/// Factory trait for deterministic ChipletDef construction.
 trait AirFactory<F: TowerField>: Send + Sync {
     fn build(&self) -> errors::Result<ChipletDef<F>>;
     fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)>;
@@ -349,14 +346,12 @@ impl<F: TraceCompatibleField> CompositeChiplet<F> {
         self.external_buses.clone()
     }
 
-    /// Number of flattened
-    /// chiplets in this composite.
+    /// Number of flattened chiplets in this composite.
     pub fn len(&self) -> usize {
         self.chiplets.len()
     }
 
-    /// Returns true if this
-    /// composite contains no chiplets.
+    /// Returns true if this composite contains no chiplets.
     pub fn is_empty(&self) -> bool {
         self.chiplets.is_empty()
     }
@@ -388,8 +383,7 @@ impl<F: TraceCompatibleField> CompositeChipletBuilder<F> {
         self
     }
 
-    /// Declare an external bus
-    /// (connects to the main trace).
+    /// Declare an external bus (connects to the main trace).
     pub fn external_bus(mut self, bus_id: &str, spec: PermutationCheckSpec) -> Self {
         self.external_bus_ids.push(String::from(bus_id));
         self.external_buses.push((String::from(bus_id), spec));
@@ -400,10 +394,8 @@ impl<F: TraceCompatibleField> CompositeChipletBuilder<F> {
     /// Finalize the composite.
     ///
     /// Validates selector orthogonality:
-    /// two specs on different bus_ids must
-    /// not share a selector column index.
-    /// Same bus_id is exempt for
-    /// dual-spec intra-table check.
+    /// two specs on different bus_ids must not share a selector column
+    /// index. Same bus_id is exempt for dual-spec intra-table check.
     pub fn build(self) -> errors::Result<CompositeChiplet<F>> {
         for (bus_id, spec) in &self.external_buses {
             spec.validate_clock_stitching(bus_id)?;
@@ -442,12 +434,10 @@ impl<F: TraceCompatibleField> CompositeChipletBuilder<F> {
 // Multi-Composite Helpers
 // =================================================================
 
-/// Flatten multiple composites
-/// into a single chiplet def list.
+/// Flatten multiple composites into a single chiplet def list.
 ///
-/// Validates that no two composites
-/// share the same name (would cause
-/// bus namespace collisions).
+/// Validates that no two composites share the same name
+/// (would cause bus namespace collisions).
 pub fn compose_chiplet_defs<F: TraceCompatibleField>(
     composites: &[&CompositeChiplet<F>],
 ) -> errors::Result<Vec<ChipletDef<F>>> {
@@ -476,8 +466,7 @@ pub fn compose_chiplet_defs<F: TraceCompatibleField>(
     Ok(defs)
 }
 
-/// Collect external buses
-/// from multiple composites.
+/// Collect external buses from multiple composites.
 pub fn compose_external_buses<F: TraceCompatibleField>(
     composites: &[&CompositeChiplet<F>],
 ) -> Vec<(String, PermutationCheckSpec)> {
@@ -489,11 +478,10 @@ pub fn compose_external_buses<F: TraceCompatibleField>(
     buses
 }
 
-/// Without the mutex root, both selectors high
-/// collapse the bus numerator to zero in char-2;
-/// without the boolean roots, the mutex admits
-/// non-zero field-element selectors that bypass
-/// binary on/off semantics.
+/// Without the mutex root, both selectors high collapse
+/// the bus numerator to zero in char-2; without the
+/// boolean roots, the mutex admits non-zero field-element
+/// selectors that bypass binary on/off semantics.
 pub fn validate_paired_bus_mutex<F: TowerField>(
     specs: &[(String, PermutationCheckSpec)],
     ast: &ConstraintAst<F>,
@@ -535,9 +523,9 @@ pub fn validate_paired_bus_mutex<F: TowerField>(
     Ok(())
 }
 
-/// Chiplets carry no `public_inputs`, so a `PublicInput`
-/// boundary target is unsatisfiable; reject it at snapshot
-/// time. Also rejects out-of-range `col_idx`.
+/// Chiplets carry no `public_inputs`; a `PublicInput`
+/// boundary target is unsatisfiable; reject it at
+/// snapshot time. Also rejects out-of-range `col_idx`.
 fn validate_chiplet_boundaries<F>(
     boundaries: &[BoundaryConstraint<F>],
     num_columns: usize,
@@ -561,11 +549,31 @@ fn validate_chiplet_boundaries<F>(
     Ok(())
 }
 
-/// Non-paired `Bit` selectors with no direct
-/// `s·s + s` boolean root, each tagged with the
-/// declaring `bus_id`. Advisory only: booleanness
-/// can hold indirectly (one-hot, disjoint
-/// products), callers warn rather than reject.
+/// Physical columns outside every expansion entry enter
+/// no master fold; nothing binds their committed cells.
+fn validate_expander_coverage(
+    expander: Option<&VirtualExpander>,
+    layout: &[ColumnType],
+) -> errors::Result<()> {
+    let covered = match expander {
+        Some(e) => e.num_physical_columns(),
+        None => layout.len(),
+    };
+
+    if covered != layout.len() {
+        return Err(errors::Error::Protocol {
+            protocol: "chiplet",
+            message: "virtual_expander does not tile column_layout",
+        });
+    }
+
+    Ok(())
+}
+
+/// Non-paired `Bit` selectors with no direct `s·s + s` boolean root,
+/// each tagged with the declaring `bus_id`. Advisory only:
+/// booleanness can hold indirectly (one-hot, disjoint products),
+/// callers warn rather than reject.
 pub fn unconstrained_bit_selectors<'a, F: TowerField>(
     specs: &'a [(String, PermutationCheckSpec)],
     ast: &ConstraintAst<F>,
@@ -680,6 +688,29 @@ mod tests {
             KEY: B32,
             S_SEND: Bit,
             S_RECV: Bit,
+        }
+    }
+
+    #[derive(Clone)]
+    struct ExpanderAir {
+        expander: VirtualExpander,
+    }
+
+    impl Air<F> for ExpanderAir {
+        fn num_columns(&self) -> usize {
+            self.expander.virtual_layout().len()
+        }
+
+        fn column_layout(&self) -> &[ColumnType] {
+            &[ColumnType::B32, ColumnType::Bit]
+        }
+
+        fn virtual_expander(&self) -> Option<&VirtualExpander> {
+            Some(&self.expander)
+        }
+
+        fn constraint_ast(&self) -> ConstraintAst<F> {
+            ConstraintSystem::<F>::new().build()
         }
     }
 
@@ -932,6 +963,28 @@ mod tests {
     #[test]
     fn chiplet_def_rejects_paired_spec_without_boolean_roots() {
         assert_logup_bus_err(ChipletDef::<F>::from_air(&PairedNoBoolAir));
+    }
+
+    #[test]
+    fn chiplet_def_requires_expander_to_tile_the_layout() {
+        let tiled = ExpanderAir {
+            expander: VirtualExpander::new()
+                .expand_bits(1, ColumnType::B32)
+                .control_bits(1)
+                .build()
+                .unwrap(),
+        };
+
+        ChipletDef::<F>::from_air(&tiled).expect("tiling expander must snapshot");
+
+        let short = ExpanderAir {
+            expander: VirtualExpander::new()
+                .expand_bits(1, ColumnType::B32)
+                .build()
+                .unwrap(),
+        };
+
+        assert!(ChipletDef::<F>::from_air(&short).is_err());
     }
 
     #[test]
