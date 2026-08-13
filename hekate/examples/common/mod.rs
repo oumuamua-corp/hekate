@@ -126,7 +126,8 @@ where
     // Eval batch argument breakdown
     let eval_sc_sz = enc_size(&proof.eval_proof.sumcheck_proof, bin_cfg);
     let eval_tensor_sz = enc_size(&proof.eval_proof.tensor_vec, bin_cfg);
-    let eval_pt_sz = enc_size(&proof.eval_proof.point_evaluations, bin_cfg);
+    let eval_tensor_ring_sz = enc_size(&proof.eval_proof.tensor_vec_ring, bin_cfg);
+    let eval_pt_sz = enc_size(&proof.eval_proof.point_evaluation, bin_cfg);
     let ldt_batch_sz = enc_size(&proof.eval_proof.ldt_proof.batch_path, bin_cfg);
     let ldt_opened_sz = enc_size(&proof.eval_proof.ldt_proof.opened_columns, bin_cfg);
 
@@ -138,7 +139,8 @@ where
     println!("  Eval Batch Argument:");
     println!("    Eval Sumcheck:        {:>8} bytes", eval_sc_sz);
     println!("    Tensor Vector (q):    {:>8} bytes", eval_tensor_sz);
-    println!("    Point Evaluations:    {:>8} bytes", eval_pt_sz);
+    println!("    Ring Tensor Vector:   {:>8} bytes", eval_tensor_ring_sz);
+    println!("    Point Evaluation:     {:>8} bytes", eval_pt_sz);
     println!("    LDT Batch Path:       {:>8} bytes", ldt_batch_sz);
     println!("    LDT Opened Columns:   {:>8} bytes", ldt_opened_sz);
 
