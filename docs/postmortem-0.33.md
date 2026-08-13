@@ -544,6 +544,15 @@ hashed into the tree, and not opened at a query. Verification stays flat at 6 to
 32 ms, because the verifier trades two opened halves for two weight evaluations
 it computes in `O(n)`.
 
+The prove column is not the layout alone, and the proof column is. Nothing else
+in this release moves proof bytes. Prove time carries two further changes landing
+in the same window: `hekate-math` 0.10.0, whose NEON flat multiply kernels move
+to the vector domain and take Block128 dependent-chain latency from 7.27 to
+4.64 ns/mul with a 12% end-to-end gate, and prover-internal work that is not
+described here, the prover being a closed-source cdylib. The three are not
+separated by measurement, and reading the whole column as the commitment layout
+would overstate it.
+
 This is the first change in the sequence that gives cost back rather than
 spending it. It is also the only one a reader should not treat as mandatory: the
 three fixes before it bought soundness, and this one bought bytes.
