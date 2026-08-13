@@ -40,6 +40,10 @@ and that host still accepts.
 | 0.32.0 and earlier, AES    | 4, 5, 6, 7                        | Upgrade to 0.33.0 and re-prove. |
 | 0.33.0                     | Data plane and bus keys unchecked | Current.                        |
 
+The wire format has moved three releases running: v2 in 0.31.0, v3 in 0.32.0, v4
+here. Each rejects its predecessor. Whatever version you are on, reaching 0.33.0
+means re-proving, and no proof crosses any of those boundaries.
+
 That last row states coverage instead of absence, which is the one difference
 between this table and the one it follows. Checked: the control-plane language of
 both chiplets is enumerated and equals the honest automaton, and the host-side
@@ -60,7 +64,11 @@ Neither fix touches the wire format, `Config`, or transcript ordering. What
 changes is the committed column layout on both chiplets and on the S-box ROM,
 and with it `program_id` for any program embedding them. Existing proofs are
 rejected and must be re-proved against a prover release built for the new
-layout; the pinned prover release for 0.33.0 is 0.10.0.
+layout; the pinned prover cdylib release for 0.33.0 is 0.11.0.
+
+0.33.0 carries one further change that is not a soundness fix and closes no gap
+here: the Brakedown commitment layout, which moves the wire format to v4. It is
+described with its measurements at the end of the cost section.
 
 Upgrading the crates is not sufficient by itself. Both fixes have a host-side
 half, and a host that takes the new crates without migrating its own AIR has
@@ -472,7 +480,7 @@ End to end, against 0.32.0. Signed public cdylib 0.10.0, `table-math`, Apple
 M3 Max, `-C target-cpu=native`, mean of three runs, peak memory as
 `phys_footprint_peak`:
 
-| Workload           | Prove 0.32.0 | Prove 0.33.0 | Change | Proof 0.33.0 | Peak 0.33.0 |
+| Workload           | Prove 0.32.0 | Prove, fixes | Change | Proof, fixes | Peak, fixes |
 |:-------------------|-------------:|-------------:|-------:|-------------:|------------:|
 | ML-KEM-768         |       919 ms |       918 ms |     0% |    4,461 KiB |     556 MiB |
 | ML-DSA-44          |       1.60 s |       1.58 s |    -1% |    5,821 KiB |     575 MiB |
@@ -491,32 +499,80 @@ the chiplet gave up 3 bytes of row and took on 33 more constraint roots, and at
 2^20 the roots cost more than the narrower row saves. AES pays 3% for 11 and 8
 more roots.
 
-Nothing in the wire format, `Config`, or transcript ordering moved. The cost that
-matters is `program_id`: every program embedding either chiplet gets a new one,
-and every existing proof has to be re-proved.
+Nothing in the wire format, `Config`, or transcript ordering moved for these two
+fixes. The cost that matters is `program_id`: every program embedding either
+chiplet gets a new one, and every existing proof has to be re-proved.
+
+### The commitment layout, in the same release
+
+The numbers above are the chiplet fixes measured alone. 0.33.0 also carries a
+change to the Brakedown commitment layout, and the rest of this section is that
+change rather than a soundness gap.
+
+The commitment used to encode every physical column twice, once as-is and once
+shifted by one row, because the evaluation argument had to open the shifted
+polynomial at the same point. The second copy is gone. Shifted claims are now
+proven through weights the verifier evaluates for itself: a carry-chain form of
+`eq(prev(·), P)` paired with the whole-column master, and its ring-switch
+counterpart paired with the bit-plane master. Same hash, same code, same Merkle
+structure, half the codeword. The wire format moves to v4 and no 0.32.0 verifier
+accepts a v4 proof.
+
+Binding does not move with it. The second copy was another opening of data the
+first copy already committed, never an independent constraint, and the weight
+replacing it is transparent: the verifier evaluates it from the point and its own
+sumcheck challenges, leaving the prover nothing to choose.
+
+Measured the same way, signed public cdylib 0.11.0, peak memory as the larger of
+`phys_footprint_peak` and `ru_maxrss`, because sampling misses a peak reached
+between polls and the compressor caps the other under pressure:
+
+| Workload           | Prove above | Prove now | Change | Proof now | Peak now  |
+|:-------------------|------------:|----------:|-------:|----------:|----------:|
+| ML-KEM-768         |      918 ms |    626 ms |   -32% | 3,576 KiB |   459 MiB |
+| ML-DSA-44          |      1.58 s |    926 ms |   -41% | 4,403 KiB |   459 MiB |
+| ML-DSA-65          |      1.69 s |    969 ms |   -43% | 4,436 KiB |   478 MiB |
+| ML-DSA-87          |      2.84 s |    1.50 s |   -47% | 5,922 KiB |   869 MiB |
+| AES-128            |      2.14 s |    1.44 s |   -33% | 5,628 KiB | 1,182 MiB |
+| AES-256            |      2.34 s |    1.55 s |   -34% | 5,962 KiB | 1,480 MiB |
+| keccak_inline 2^15 |      341 ms |    203 ms |   -40% |   793 KiB |   143 MiB |
+| keccak_inline 2^20 |      8.06 s |    4.08 s |   -49% | 4,220 KiB | 2,486 MiB |
+
+Proof size falls 20 to 29% and peak memory 13 to 31%, for one reason in three
+places: a byte the commitment no longer carries is a byte not encoded, not
+hashed into the tree, and not opened at a query. Verification stays flat at 6 to
+32 ms, because the verifier trades two opened halves for two weight evaluations
+it computes in `O(n)`.
+
+This is the first change in the sequence that gives cost back rather than
+spending it. It is also the only one a reader should not treat as mandatory: the
+three fixes before it bought soundness, and this one bought bytes.
 
 ### The bill for the whole sequence
 
-0.33.0 being cheap is only interesting next to what it follows. Against 0.29.1,
-the last release measured before any of the three protocol fixes, with a derived
-code distance, a committed `h` and a bound schedule now all underneath it:
+The table above isolates one change. This one stacks all four. Against 0.29.1,
+the last release measured before any of the protocol fixes, with a derived code
+distance, a committed `h`, a bound schedule and the new layout all underneath
+it:
 
 | Circuit    | 0.29.1 | 0.33.0 | Change |
 |:-----------|-------:|-------:|-------:|
-| ML-KEM-768 | 945 ms | 918 ms |    -3% |
-| ML-DSA-44  | 1.70 s | 1.58 s |    -7% |
-| ML-DSA-65  | 1.81 s | 1.69 s |    -7% |
-| ML-DSA-87  | 2.95 s | 2.84 s |    -4% |
-| AES-128    | 1.68 s | 2.14 s |   +27% |
-| AES-256    | 1.80 s | 2.34 s |   +30% |
+| ML-KEM-768 | 945 ms | 626 ms |   -34% |
+| ML-DSA-44  | 1.70 s | 926 ms |   -46% |
+| ML-DSA-65  | 1.81 s | 969 ms |   -46% |
+| ML-DSA-87  | 2.95 s | 1.50 s |   -49% |
+| AES-128    | 1.68 s | 1.44 s |   -14% |
+| AES-256    | 1.80 s | 1.55 s |   -14% |
 
-Four of the six prove faster today than they did before any of this existed.
-Prover-internal optimization in the same window paid for the added work. AES is
-the exception, and it is the most commit-bound workload in the set.
+All six prove faster today than they did before any of this existed, AES
+included. Through 0.32.0 that was true of four, and AES ran 27 to 30% slower as
+the most commit-bound workload in the set; halving the codeword is worth most
+exactly where commit dominates.
 
-Proof size did not come back and is not going to. Against 0.30.0, the smallest we
-ever shipped, ML-KEM-768 is up 58%, ML-DSA-65 67%, ML-DSA-87 79%, and AES-128
-169%. That is the standing price of a proximity layer whose distance is derived
+Proof size did not come all the way back. Against 0.30.0, the smallest we ever
+shipped, ML-KEM-768 is up about 27%, ML-DSA-65 26%, ML-DSA-87 34%, and AES-128
+97%. Through 0.32.0 those same four stood at 58%, 67%, 79% and 169%. What
+remains is the standing price of a proximity layer whose distance is derived
 rather than assumed, and of a bus helper that is committed rather than reported.
 We would rather pay it there than in the number it replaced, which was a 54%
 acceptance rate against the real verifier.
