@@ -39,7 +39,6 @@ use hekate_core::proofs::InnerProof;
 use hekate_core::protocol;
 use hekate_core::tensor::TensorProduct;
 use hekate_core::trace::{ColumnType, TraceCompatibleField};
-use hekate_core::utils::{compute_split_vars, opened_row_bytes};
 use hekate_crypto::Hasher;
 use hekate_crypto::transcript::Transcript;
 use hekate_math::{BinaryFieldExtras, Block128, Flat, HardwareField, PackableField, TowerField};
@@ -62,21 +61,16 @@ where
         + Into<Block128>
         + From<u128>,
 {
-    /// Verifies an `InnerProof` produced
-    /// by `HekateProver::prove`.
+    /// Verifies an `InnerProof` produced by `HekateProver::prove`.
     ///
     /// Replays the prover's phase ordering:
-    /// 1. Bind public inputs, config,
-    ///    and trace root into the transcript.
-    /// 2. Absorb each chiplet header
-    ///    (name, rows, cols, row_bytes, root).
+    /// 1. Bind public inputs, config, and trace root into the transcript.
+    /// 2. Absorb each chiplet header (name, rows, cols, row_bytes, root).
     /// 3. Draw global LogUp challenges γ, β.
     /// 4. Per chiplet:
-    ///    verify ZeroCheck (with LogUp,
-    ///    opening the committed `h` at `r_final`)
-    ///    and the trace eval at `r_final`.
-    /// 5. Verify the main AIR ZeroCheck
-    ///    (with LogUp, same `h` opening).
+    ///    verify ZeroCheck (with LogUp, opening the committed `h`
+    ///    at `r_final`) and the trace eval at `r_final`.
+    /// 5. Verify the main AIR ZeroCheck (with LogUp, same `h` opening).
     /// 6. Verify the main eval at `r_final`.
     /// 7. Check that LogUp `claimed_sum` totals cancel per `bus_id`.
     #[instrument(skip_all, name = "Hekate::verify")]
@@ -117,22 +111,14 @@ where
             });
         }
 
-        let main_data_bytes: usize = program
-            .column_layout()
-            .iter()
-            .map(|ct| ct.byte_size())
-            .sum();
+        let main_entries = program.virtual_expander().map(|e| e.expansion_entries());
+        let main_plan = RingSwitchPlan::new(
+            program.column_layout(),
+            main_entries.as_deref(),
+            config.sumcheck_blinding_factor,
+        )?;
 
-        let main_row_bytes =
-            opened_row_bytes(main_data_bytes, config.sumcheck_blinding_factor, true);
-
-        let main_grid_cols = 1
-            << compute_split_vars(
-                num_vars,
-                config.num_queries,
-                config.ldt_support_size,
-                main_row_bytes,
-            );
+        let main_grid_cols = 1 << main_plan.split_vars(num_vars, config);
 
         let field_bits = size_of::<F>() * 8;
         let metrics = config.security_metrics(field_bits, main_grid_cols);
@@ -144,22 +130,8 @@ where
 
         config.check_security(field_bits, main_grid_cols)?;
 
-        if proof.eval_proof.point_evaluations.is_empty() {
-            return Err(errors::Error::Protocol {
-                protocol: "verifier",
-                message: "eval_proof is missing point evaluations",
-            });
-        }
-
-        if proof.eval_proof.point_evaluations.len() != 1 {
-            return Err(errors::Error::Protocol {
-                protocol: "verifier",
-                message: "main eval_proof must carry exactly one point (r_final)",
-            });
-        }
-
         let expected_trace_len = trace_width + config.sumcheck_blinding_factor;
-        let combined_vals = &proof.eval_proof.point_evaluations[0].1;
+        let combined_vals = &proof.eval_proof.point_evaluation.1;
 
         if combined_vals.len() != expected_trace_len * 2 {
             return Err(errors::Error::Protocol {
@@ -259,19 +231,13 @@ where
         // =========================================================
         // PHASE 1: TRACE COMMITMENT & FIAT-SHAMIR BINDING
         // =========================================================
-        Self::verify_trace_commitment(
-            program,
-            instance,
-            proof,
-            transcript,
-            config,
-            main_row_bytes,
-        )?;
+        Self::verify_trace_commitment(program, instance, proof, transcript, config, &main_plan)?;
 
         // =========================================================
         // PHASE 2: COMMIT EACH CHIPLET (absorb roots)
         // =========================================================
-        Self::verify_chiplet_commitments_only(program, proof, transcript, config)?;
+        let chiplet_plans =
+            Self::verify_chiplet_commitments_only(program, proof, transcript, config)?;
 
         // =========================================================
         // PHASE 3: DRAW GLOBAL γ, β, AND r_bus PER LOOKUP BUS
@@ -292,6 +258,7 @@ where
             gamma,
             beta,
             &lookup_bus_points,
+            &chiplet_plans,
         )?;
 
         // =========================================================
@@ -317,10 +284,9 @@ where
             None => return Ok(false),
         };
 
-        // The eval_proof's stored r_final
-        // must match the Sumcheck-derived
-        // r_final exactly.
-        let stored_pt = canonical_slice_to_flat(&proof.eval_proof.point_evaluations[0].0);
+        // The eval_proof's stored r_final must match
+        // the Sumcheck-derived r_final exactly.
+        let stored_pt = canonical_slice_to_flat(&proof.eval_proof.point_evaluation.0);
         if stored_pt != r_final {
             return Err(errors::Error::Protocol {
                 protocol: "verifier",
@@ -332,7 +298,7 @@ where
         // PHASE 6: MAIN EVAL AT r_final (single point)
         // =========================================================
         if !Self::verify_eval_at_r_final(
-            program,
+            &main_plan,
             &proof.trace_commitment,
             &proof.eval_proof,
             transcript,
@@ -374,7 +340,7 @@ where
         proof: &InnerProof<F>,
         transcript: &mut Transcript<H>,
         config: &Config,
-    ) -> errors::Result<()> {
+    ) -> errors::Result<Vec<RingSwitchPlan>> {
         let chiplet_defs = program.chiplet_defs()?;
 
         if proof.chiplet_commitments.len() != chiplet_defs.len() {
@@ -384,38 +350,44 @@ where
             });
         }
 
+        let mut plans = Vec::with_capacity(chiplet_defs.len());
+
         for (c_idx, def) in chiplet_defs.iter().enumerate() {
             let c_comm = &proof.chiplet_commitments[c_idx];
             let c_num_rows = c_comm.num_rows;
 
-            let c_data_bytes: usize = Air::<F>::column_layout(def)
-                .iter()
-                .map(|ct| ct.byte_size())
-                .sum();
-
-            let c_row_bytes = opened_row_bytes(c_data_bytes, config.sumcheck_blinding_factor, true);
+            let c_entries = Air::<F>::virtual_expander(def).map(|e| e.expansion_entries());
+            let c_plan = RingSwitchPlan::new(
+                Air::<F>::column_layout(def),
+                c_entries.as_deref(),
+                config.sumcheck_blinding_factor,
+            )?;
 
             protocol::absorb_chiplet_header(
                 transcript,
                 &def.name(),
                 c_num_rows,
                 def.num_columns(),
-                c_row_bytes,
+                c_plan.opened_row_bytes(),
+                c_plan.num_master_vectors(),
                 &c_comm.root,
             );
 
             for bc in &Air::<F>::boundary_constraints(def) {
                 bc.absorb_into(transcript);
             }
+
+            plans.push(c_plan);
         }
 
-        Ok(())
+        Ok(plans)
     }
 
     /// PHASE 4:
     /// Per-chiplet fused verification.
     /// Mirrors prover's fused_chiplet_loop.
     #[instrument(skip_all, name = "verify_chiplet_fused")]
+    #[allow(clippy::too_many_arguments)]
     fn verify_chiplet_fused<P: Program<F>>(
         program: &P,
         proof: &InnerProof<F>,
@@ -424,8 +396,16 @@ where
         gamma: Flat<F>,
         beta: Flat<F>,
         lookup_bus_points: &BTreeMap<String, Vec<Flat<F>>>,
+        chiplet_plans: &[RingSwitchPlan],
     ) -> errors::Result<()> {
         let chiplet_defs = program.chiplet_defs()?;
+
+        if chiplet_plans.len() != chiplet_defs.len() {
+            return Err(errors::Error::Protocol {
+                protocol: "verifier",
+                message: "chiplet ring-switch plan count mismatch",
+            });
+        }
 
         if proof.chiplet_zerocheck_proofs.len() != chiplet_defs.len() {
             return Err(errors::Error::Protocol {
@@ -459,14 +439,7 @@ where
             let c_num_cols = def.num_columns();
             let c_trace_width = c_num_cols + config.sumcheck_blinding_factor;
 
-            if c_eval_proof.point_evaluations.len() != 1 {
-                return Err(errors::Error::Protocol {
-                    protocol: "verifier",
-                    message: "chiplet eval_proof must carry exactly one point",
-                });
-            }
-
-            let c_combined = &c_eval_proof.point_evaluations[0].1;
+            let c_combined = &c_eval_proof.point_evaluation.1;
             if c_combined.len() != c_trace_width * 2 {
                 return Err(errors::Error::Protocol {
                     protocol: "verifier",
@@ -506,7 +479,7 @@ where
                 }
             };
 
-            let stored_pt = canonical_slice_to_flat(&c_eval_proof.point_evaluations[0].0);
+            let stored_pt = canonical_slice_to_flat(&c_eval_proof.point_evaluation.0);
             if stored_pt != r_final {
                 return Err(errors::Error::Protocol {
                     protocol: "verifier",
@@ -515,7 +488,7 @@ where
             }
 
             if !Self::verify_eval_at_r_final(
-                def,
+                &chiplet_plans[c_idx],
                 c_comm,
                 c_eval_proof,
                 transcript,
@@ -545,12 +518,11 @@ where
     }
 
     /// PHASE 6 helper:
-    /// single-point eval verify. Mirrors
-    /// prover's prove_eval_at_r_final.
+    /// single-point eval verify. Mirrors prover's prove_eval_at_r_final.
     #[instrument(skip_all, name = "verify_eval_at_r_final")]
     #[allow(clippy::too_many_arguments)]
-    fn verify_eval_at_r_final<A: Air<F> + Sync>(
-        air: &A,
+    fn verify_eval_at_r_final(
+        ring_plan: &RingSwitchPlan,
         commitment: &hekate_core::proofs::BrakedownCommitment,
         eval_proof: &hekate_core::proofs::EvalBatchProof<F>,
         transcript: &mut Transcript<H>,
@@ -559,22 +531,12 @@ where
         r_final: &[Flat<F>],
         claimed_values: &[Flat<F>],
     ) -> errors::Result<bool> {
-        let blinding_factor = config.sumcheck_blinding_factor;
-        let layout: Vec<ColumnType> = air.column_layout().to_vec();
-
-        let data_bytes: usize = layout.iter().map(|ct| ct.byte_size()).sum();
-        let expected_row_bytes = opened_row_bytes(data_bytes, blinding_factor, true);
-
-        let entries = air.virtual_expander().map(|e| e.expansion_entries());
-        let ring_plan = RingSwitchPlan::new(&layout, entries.as_deref(), blinding_factor)?;
-
         let ctx = EvalVerifyContext {
-            points: vec![r_final],
-            claimed_values_per_point: vec![claimed_values],
+            point: r_final,
+            claimed_values,
             num_vars,
-            row_bytes: expected_row_bytes,
-            ring_plan: &ring_plan,
-            next_row: true,
+            ring_plan,
+            shifted_claims: true,
         };
 
         EvaluatorVerifier::<F, H>::verify(commitment, eval_proof, transcript, ctx, config)
@@ -590,7 +552,7 @@ where
         proof: &InnerProof<F>,
         transcript: &mut Transcript<H>,
         config: &Config,
-        main_row_bytes: usize,
+        main_plan: &RingSwitchPlan,
     ) -> errors::Result<()> {
         let num_rows = instance.num_rows();
         let num_cols = program.num_columns();
@@ -606,7 +568,11 @@ where
 
         // Bind the MDS row-code rate
         transcript.append_u64(b"inv_rate", config.inv_rate as u64);
-        transcript.append_u64(b"main_row_bytes", main_row_bytes as u64);
+        transcript.append_u64(b"main_row_bytes", main_plan.opened_row_bytes() as u64);
+        transcript.append_u64(
+            b"main_master_vectors",
+            main_plan.num_master_vectors() as u64,
+        );
 
         for val in instance.public_inputs() {
             transcript.append_field(b"public_input", *val);
@@ -623,9 +589,8 @@ where
 
     /// Verifies AIR + LogUp ZeroCheck.
     ///
-    /// The initial sumcheck claim is `Σ_k α^k · claimed_sum_k`
-    /// (LogUp bus-sum total), not zero. The consistency
-    /// check at `r_final` covers AIR, boundary,
+    /// The initial sumcheck claim is `Σ_k α^k · claimed_sum_k` (LogUp bus-sum total),
+    /// not zero. The consistency check at `r_final` covers AIR, boundary,
     /// ZK blinding, and LogUp contributions.
     #[instrument(skip_all, name = "verify_zerocheck")]
     #[allow(clippy::too_many_arguments)]
@@ -785,14 +750,7 @@ where
         ) {
             let num_buses = bus_specs.len();
 
-            if h_proof.point_evaluations.len() != 1 {
-                return Err(errors::Error::Protocol {
-                    protocol: "verifier",
-                    message: "logup h_eval_proof must carry exactly one point",
-                });
-            }
-
-            let (h_point, h_opened_canon) = &h_proof.point_evaluations[0];
+            let (h_point, h_opened_canon) = &h_proof.point_evaluation;
 
             if canonical_slice_to_flat(h_point) != r_final {
                 return Err(errors::Error::Protocol {
@@ -815,16 +773,14 @@ where
 
             let h_layout = vec![ColumnType::B128; num_buses];
             let h_ring_plan = RingSwitchPlan::new(&h_layout, None, 0)?;
-            let h_row_bytes = opened_row_bytes(num_buses * 16, 0, false);
             let h_opened = canonical_slice_to_flat(h_opened_canon);
 
             let ctx = EvalVerifyContext {
-                points: vec![r_final.as_slice()],
-                claimed_values_per_point: vec![h_opened.as_slice()],
+                point: r_final.as_slice(),
+                claimed_values: h_opened.as_slice(),
                 num_vars,
-                row_bytes: h_row_bytes,
                 ring_plan: &h_ring_plan,
-                next_row: false,
+                shifted_claims: false,
             };
 
             if !EvaluatorVerifier::<F, H>::verify(h_comm, h_proof, transcript, ctx, &h_config)? {
@@ -1045,9 +1001,8 @@ where
         Ok(Some(r_final))
     }
 
-    /// Aggregates lookup-bus heights from
-    /// main + chiplet commitments and draws
-    /// one `r_bus` per bus_id in sorted order.
+    /// Aggregates lookup-bus heights from main + chiplet commitments
+    /// and draws one `r_bus` per bus_id in sorted order.
     fn draw_lookup_bus_points<P: Program<F>>(
         program: &P,
         proof: &InnerProof<F>,
@@ -1080,9 +1035,8 @@ where
     }
 }
 
-/// MLE of `Source::RowIndexLeBytes` at `r_final`.
-/// Linear in `r_final` because `F::from`
-/// is XOR-additive over char-2.
+/// MLE of `Source::RowIndexLeBytes` at `r_final`. Linear
+/// in `r_final` because `F::from` is XOR-additive over char-2.
 pub fn eval_row_idx_le_mle<F>(num_bytes: usize, r_final: &[Flat<F>]) -> Flat<F>
 where
     F: TowerField + HardwareField + From<u128>,

@@ -43,7 +43,7 @@ table PointEvaluation {
 table EvalBatchProof {
   sumcheck_proof: SumcheckProof;
   ldt_proof: BrakedownProof;
-  point_evaluations: [PointEvaluation];
+  point_evaluation: PointEvaluation;
   tensor_vec: [Block128];
   tensor_vec_ring: [Block128];
 }

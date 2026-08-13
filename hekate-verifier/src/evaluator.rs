@@ -25,14 +25,13 @@ use hekate_core::errors;
 use hekate_core::proofs::{BrakedownCommitment, EvalBatchProof};
 use hekate_core::tensor::TensorProduct;
 use hekate_core::trace::{ColumnType, TraceCompatibleField};
-use hekate_core::utils;
 use hekate_crypto::Hasher;
 use hekate_crypto::transcript::Transcript;
 use hekate_math::{
     AdditiveFft, BinaryFieldExtras, Block128, Flat, HardwareField, PackableField, TowerField,
 };
 use hekate_program::expander::RingSwitchPlan;
-use tracing::{instrument, warn};
+use tracing::{debug, instrument, warn};
 
 #[cfg(feature = "parallel")]
 const PARALLEL_PROXIMITY_THRESHOLD: usize = 1 << 18;
@@ -44,14 +43,14 @@ pub struct EvaluatorVerifier<F, H: Hasher> {
 }
 
 pub struct EvalVerifyContext<'a, F: HardwareField> {
-    pub points: Vec<&'a [Flat<F>]>,
-    pub claimed_values_per_point: Vec<&'a [Flat<F>]>,
+    pub point: &'a [Flat<F>],
+    pub claimed_values: &'a [Flat<F>],
     pub num_vars: usize,
-    pub row_bytes: usize,
     pub ring_plan: &'a RingSwitchPlan,
 
-    /// `false` opens base columns only (no next-row shift).
-    pub next_row: bool,
+    /// `true` when the claims carry a next-row half,
+    /// proven through the K_P / A_next weights.
+    pub shifted_claims: bool,
 }
 
 impl<F, H: Hasher> EvaluatorVerifier<F, H>
@@ -59,11 +58,12 @@ where
     F: HardwareField + PackableField + TraceCompatibleField,
 {
     /// Verifies the ring-switch TensorPCS evaluation argument,
-    /// binding the claimed virtual evals to the Brakedown commitment.
-    /// A degree-2 sumcheck reduces `A·master_bit + master_whole·Eq(P)`
-    /// to `r_final`; the final check pairs `A(r')` and `Eq(P,r')`
-    /// with two whole-column openings that the proximity test
-    /// binds to the committed codewords.
+    /// binding the claimed virtual evals to the base-only
+    /// Brakedown commitment. A degree-2 sumcheck reduces
+    /// `[A + η^U·A_next]·master_bit + [Eq + η^U·K_P]·master_whole`
+    /// to `r_final`; the final check pairs the transparent weight
+    /// evals at `r'` with two whole-column openings that the
+    /// proximity test binds to the committed codewords.
     #[instrument(skip_all, name = "Evaluator::verify")]
     pub fn verify(
         commitment: &BrakedownCommitment,
@@ -75,25 +75,15 @@ where
     where
         F: BinaryFieldExtras + Into<Block128> + From<u128>,
     {
-        let points = ctx.points;
-        let claimed = ctx.claimed_values_per_point;
+        let point = ctx.point;
+        let claims = ctx.claimed_values;
         let num_vars = ctx.num_vars;
-        let row_bytes = ctx.row_bytes;
         let plan = ctx.ring_plan;
-        let next_row = ctx.next_row;
-        let variants = if next_row { 2 } else { 1 };
+        let shifted_claims = ctx.shifted_claims;
+        let claim_halves = if shifted_claims { 2 } else { 1 };
+        let zero = Flat::from_raw(F::ZERO);
 
-        if points.len() != 1 || claimed.len() != 1 {
-            return Err(errors::Error::Protocol {
-                protocol: "evaluator_verifier",
-                message: "ring-switch evaluation expects a single point",
-            });
-        }
-
-        let point = points[0];
-        let claims = claimed[0];
-
-        if claims.len() != plan.total_claims() * variants {
+        if claims.len() != plan.total_claims() * claim_halves {
             return Err(errors::Error::Protocol {
                 protocol: "evaluator_verifier",
                 message: "ring-switch plan claim count does not match the claimed evaluations",
@@ -107,11 +97,6 @@ where
         }
 
         let eta_tower = transcript.challenge_field::<F>(b"eval_eta")?;
-
-        // Drawn for transcript parity with the prover's multi-point path;
-        // production is single-point, rho is unused.
-        let _rho = transcript.challenge_field::<F>(b"eval_rho")?;
-
         let eta = eta_tower.to_hardware();
 
         let has_ring = plan.has_ring();
@@ -138,7 +123,7 @@ where
             Vec::new()
         };
 
-        let target = ring_target::<F>(plan, claims, eta_tower, &r_mix, next_row);
+        let target = ring_target::<F>(plan, claims, eta_tower, &r_mix, shifted_claims);
         let target_flat = F::from(target.0).to_hardware();
 
         let sc_res = verify(num_vars, 2, target_flat, &proof.sumcheck_proof, transcript)?;
@@ -159,17 +144,24 @@ where
             transcript.append_field_list(b"tensor_q_ring", q_ring);
         }
 
-        let split_vars = utils::compute_split_vars(
-            num_vars,
-            config.num_queries,
-            config.ldt_support_size,
-            row_bytes,
-        );
+        let split_vars = plan.split_vars(num_vars, config);
 
         let grid_cols = 1 << split_vars;
         let grid_rows = 1 << (num_vars - split_vars);
         let geom = config.table_geom(grid_cols);
         let encoded_width = geom.encoded_width;
+        let phys_row_bytes = plan.opened_row_bytes();
+
+        debug!(
+            num_vars,
+            split_vars,
+            grid_cols,
+            encoded_width,
+            support = geom.support_size,
+            row_bytes = phys_row_bytes,
+            fractional = encoded_width == grid_cols * config.inv_rate,
+            "table geometry"
+        );
 
         if grid_cols + geom.support_size > encoded_width {
             warn!("support + data message exceeds the codeword width");
@@ -179,8 +171,9 @@ where
         config.check_security(size_of::<F>() * 8, grid_cols)?;
 
         let expected_len = grid_cols + geom.support_size;
+        let expected_ring_len = if has_ring { expected_len } else { 0 };
 
-        if q_whole.len() != expected_len || (has_ring && q_ring.len() != expected_len) {
+        if q_whole.len() != expected_len || q_ring.len() != expected_ring_len {
             warn!("tensor_q length mismatch");
             return Ok(false);
         }
@@ -222,7 +215,7 @@ where
         let tensor_col = build_tensor_table::<F>(r_col_low);
 
         let master_eval = |q: &[Flat<F>]| {
-            let mut acc = Flat::from_raw(F::ZERO);
+            let mut acc = zero;
             for (&val, &t) in q.iter().take(grid_cols).zip(&tensor_col) {
                 acc += val * t;
             }
@@ -231,25 +224,22 @@ where
         };
 
         let master_whole_eval = master_eval(&q_whole_flat);
-        let master_bit_eval = if has_ring {
-            master_eval(&q_ring_flat)
-        } else {
-            Flat::from_raw(F::ZERO)
+        let master_bit_eval = match has_ring {
+            true => master_eval(&q_ring_flat),
+            false => zero,
         };
 
-        // A(r') and Eq(P,r') are transparent; the two master evals
-        // are bound by the whole-column proximity check below.
-        let eq_at_r = TensorProduct::evaluate_eq_slice(point, &r_row);
-        let a_r = if has_ring {
-            let point_b: Vec<Block128> = point.iter().map(|f| f.to_tower().into()).collect();
-            let r_row_b: Vec<Block128> = r_row.iter().map(|f| f.to_tower().into()).collect();
+        let (coeff_bit, coeff_whole, eta_shift) = plan.column_coeffs::<F>(eta);
 
-            F::from(ring_switch_a_at(&point_b, &r_row_b, &r_mix).0).to_hardware()
-        } else {
-            Flat::from_raw(F::ZERO)
-        };
+        // The weight evals at r' are transparent;
+        // the two master evals are bound by the
+        // whole-column proximity check below.
+        let (whole_weight_at_r, ring_weight_at_r) =
+            master_weights_at::<F>(point, &r_row, &r_mix, eta_shift, has_ring, shifted_claims);
 
-        if sumcheck_final_eval != a_r * master_bit_eval + eq_at_r * master_whole_eval {
+        if sumcheck_final_eval
+            != ring_weight_at_r * master_bit_eval + whole_weight_at_r * master_whole_eval
+        {
             warn!("ring-switch final check failed");
             return Ok(false);
         }
@@ -265,7 +255,7 @@ where
             &proof.ldt_proof,
             transcript, // advances the real transcript
             config,
-            row_bytes,
+            split_vars,
         )?;
 
         let opened_columns = openings.columns;
@@ -295,26 +285,10 @@ where
         }
 
         let num_phys = plan.phys_rs.len();
-        let (coeff_bit, coeff_whole, eta_shift) = plan.column_coeffs::<F>(eta);
-        let phys_row_bytes: usize = plan
-            .phys_rs
-            .iter()
-            .map(|ct| variants * ct.byte_size())
-            .sum();
 
-        // eta^U is row-invariant:
-        // fold it into the shift coefficients once.
-        let coeff_whole_shift: Vec<Flat<F>> = coeff_whole.iter().map(|&c| c * eta_shift).collect();
-        let coeff_bit_shift: Vec<Flat<F>> = if has_ring {
-            coeff_bit.iter().map(|&c| c * eta_shift).collect()
-        } else {
-            Vec::new()
-        };
-
-        // Re-derive both folded openings from the physical columns
-        // in the opened leaf; RS commutes with a whole-column fold,
-        // this must match the RS re-encodings of the prover's
-        // committed q vectors.
+        // Re-derive both folded openings from the physical columns in the
+        // opened leaf; RS commutes with a whole-column fold, this must
+        // match the RS re-encodings of the prover's committed q vectors.
         let check_query =
             |q_idx: usize, col_idx: usize, phys_row: &mut Vec<Flat<F>>| -> errors::Result<bool> {
                 let col_bytes = &opened_columns[slot_map[q_idx]];
@@ -324,34 +298,25 @@ where
                     return Ok(false);
                 }
 
-                let mut q_whole_val = Flat::from_raw(F::ZERO);
-                let mut q_ring_val = Flat::from_raw(F::ZERO);
+                let mut q_whole_val = zero;
+                let mut q_ring_val = zero;
 
                 for r in 0..grid_rows {
                     let row_data = &col_bytes[r * phys_row_bytes..(r + 1) * phys_row_bytes];
 
                     phys_row.clear();
 
-                    parse_physical_row::<F>(row_data, &plan.phys_rs, phys_row, next_row);
+                    parse_physical_row::<F>(row_data, &plan.phys_rs, phys_row);
 
-                    let mut fold_whole = Flat::from_raw(F::ZERO);
-                    let mut fold_bit = Flat::from_raw(F::ZERO);
+                    let mut fold_whole = zero;
+                    let mut fold_bit = zero;
 
                     for p in 0..num_phys {
-                        let base = phys_row[variants * p];
+                        let base = phys_row[p];
                         fold_whole += base * coeff_whole[p];
 
                         if has_ring {
                             fold_bit += base * coeff_bit[p];
-                        }
-
-                        if next_row {
-                            let shift = phys_row[variants * p + 1];
-                            fold_whole += shift * coeff_whole_shift[p];
-
-                            if has_ring {
-                                fold_bit += shift * coeff_bit_shift[p];
-                            }
                         }
                     }
 
@@ -371,7 +336,7 @@ where
             };
 
         let run_sequential = |indices: &[usize]| -> errors::Result<bool> {
-            let mut phys_row = Vec::with_capacity(2 * num_phys);
+            let mut phys_row = Vec::with_capacity(num_phys);
             for (q_idx, &col_idx) in indices.iter().enumerate() {
                 if !check_query(q_idx, col_idx, &mut phys_row)? {
                     return Ok(false);
@@ -393,7 +358,7 @@ where
                     .par_iter()
                     .enumerate()
                     .map_init(
-                        || Vec::<Flat<F>>::with_capacity(2 * num_phys),
+                        || Vec::<Flat<F>>::with_capacity(num_phys),
                         |phys_row, (q_idx, &col_idx)| check_query(q_idx, col_idx, phys_row),
                     )
                     .try_reduce(|| true, |a, b| Ok(a && b))?
@@ -485,32 +450,127 @@ fn eq_tensor_b(r: &[Block128]) -> Vec<Block128> {
 }
 
 fn transpose128(cols: &[Block128; NBITS]) -> [Block128; NBITS] {
-    let mut rows = [Block128::ZERO; NBITS];
-    for (v, cv) in cols.iter().enumerate() {
-        for (u, ru) in rows.iter_mut().enumerate() {
-            ru.0 |= ((cv.0 >> u) & 1) << v;
+    let mut m = *cols;
+    let mut j = NBITS / 2;
+    let mut mask = (1u128 << (NBITS / 2)) - 1;
+
+    while j != 0 {
+        let mut k = 0;
+
+        while k < NBITS {
+            for i in k..k + j {
+                let a = m[i].0;
+                let b = m[i + j].0;
+                let t = ((a >> j) ^ b) & mask;
+
+                m[i] = Block128(a ^ (t << j));
+                m[i + j] = Block128(b ^ t);
+            }
+
+            k += j << 1;
         }
+
+        j >>= 1;
+        mask ^= mask << j;
     }
 
-    rows
+    m
 }
 
-/// A(r') via the tensor algebra, without a materialized Dense A.
-/// `e := eq~(phi0(P), phi1(r'))`;
-/// `A(r') = Σ_u eq(r'',u)·e_row[u]`.
-fn ring_switch_a_at(point: &[Block128], r_final: &[Block128], r_mix: &[Block128]) -> Block128 {
-    let mut e = [Block128::ZERO; NBITS];
-    e[0] = Block128::ONE;
+/// `(whole, ring)` master weights at `r'`, pairing with
+/// `master_whole` and `master_bit` in the final check.
+fn master_weights_at<F>(
+    point: &[Flat<F>],
+    r_row: &[Flat<F>],
+    r_mix: &[Block128],
+    eta_shift: Flat<F>,
+    has_ring: bool,
+    shifted_claims: bool,
+) -> (Flat<F>, Flat<F>)
+where
+    F: HardwareField + Into<Block128> + From<u128>,
+{
+    let zero = Flat::from_raw(F::ZERO);
+    let eq_at_r = TensorProduct::evaluate_eq_slice(point, r_row);
 
-    for (a, b) in point.iter().zip(r_final) {
+    if !has_ring && !shifted_claims {
+        return (eq_at_r, zero);
+    }
+
+    let point_b: Vec<Block128> = point.iter().map(|f| f.to_tower().into()).collect();
+    let r_row_b: Vec<Block128> = r_row.iter().map(|f| f.to_tower().into()).collect();
+
+    let (a, a_next) = match has_ring {
+        true => ring_switch_a_pair(&point_b, &r_row_b, r_mix, shifted_claims),
+        false => (Block128::ZERO, Block128::ZERO),
+    };
+
+    let a_r = F::from(a.0).to_hardware();
+
+    match shifted_claims {
+        true => {
+            let k_p_r = F::from(k_p_at(&point_b, &r_row_b).0).to_hardware();
+            let a_next_r = F::from(a_next.0).to_hardware();
+
+            (eq_at_r + eta_shift * k_p_r, a_r + eta_shift * a_next_r)
+        }
+        false => (eq_at_r, a_r),
+    }
+}
+
+/// `Ã(r')` and the `K_P` carry chain `Ã_next(r')`.
+/// Reverse iteration is safe: the per-variable
+/// operators `I + L_{P_k} + R_{r'_k}` commute pairwise.
+fn ring_switch_a_pair(
+    point: &[Block128],
+    r_final: &[Block128],
+    r_mix: &[Block128],
+    with_next: bool,
+) -> (Block128, Block128) {
+    let n = point.len();
+    let one = Block128::ONE;
+
+    let mut p_pref = vec![one; n + 1];
+    let mut q_pref = vec![one; n + 1];
+
+    for i in 0..n {
+        p_pref[i + 1] = p_pref[i] * point[i];
+        q_pref[i + 1] = q_pref[i] * (one + r_final[i]);
+    }
+
+    let mut e = [Block128::ZERO; NBITS];
+    let mut h = [Block128::ZERO; NBITS];
+
+    e[0] = one;
+
+    for k in (0..n).rev() {
+        if with_next {
+            let alpha = p_pref[k] * (one + point[k]);
+            let beta = q_pref[k] * r_final[k];
+
+            let mut m = e;
+            for cv in m.iter_mut() {
+                *cv *= alpha;
+            }
+
+            let mut m_rows = transpose128(&m);
+            for ru in m_rows.iter_mut() {
+                *ru *= beta;
+            }
+
+            for (hv, mv) in h.iter_mut().zip(transpose128(&m_rows).iter()) {
+                *hv += *mv;
+            }
+        }
+
         let mut col_scaled = e;
         for cv in col_scaled.iter_mut() {
-            *cv *= *a;
+            *cv *= point[k];
         }
 
         let mut row_scaled = transpose128(&e);
         for ru in row_scaled.iter_mut() {
-            *ru *= *b;
+            *ru *= r_final[k];
         }
 
         let row_scaled = transpose128(&row_scaled);
@@ -520,15 +580,30 @@ fn ring_switch_a_at(point: &[Block128], r_final: &[Block128], r_mix: &[Block128]
         }
     }
 
-    let e_rows = transpose128(&e);
-    let eq_mix = eq_tensor_b(r_mix);
+    if with_next {
+        let wrap_col = p_pref[n];
+        let wrap_row = q_pref[n];
 
-    let mut acc = Block128::ZERO;
-    for u in 0..NBITS {
-        acc += eq_mix[u] * e_rows[u];
+        for (v, hv) in h.iter_mut().enumerate() {
+            if (wrap_row.0 >> v) & 1 == 1 {
+                *hv += wrap_col;
+            }
+        }
     }
 
-    acc
+    let eq_mix = eq_tensor_b(r_mix);
+    let e_rows = transpose128(&e);
+    let h_rows = transpose128(&h);
+
+    let mut a = Block128::ZERO;
+    let mut a_next = Block128::ZERO;
+
+    for u in 0..NBITS {
+        a += eq_mix[u] * e_rows[u];
+        a_next += eq_mix[u] * h_rows[u];
+    }
+
+    (a, a_next)
 }
 
 /// Σ_u eq(r'',u)·ŝ_u for one ring unit, ŝ_u = Σ_v bit_u(c_v)·2^v.
@@ -554,13 +629,13 @@ fn ring_target<F>(
     claims: &[Flat<F>],
     eta_tower: F,
     r_mix: &[Block128],
-    next_row: bool,
+    shifted_claims: bool,
 ) -> Block128
 where
     F: HardwareField + Into<Block128>,
 {
-    let variants = if next_row { 2 } else { 1 };
-    let half = claims.len() / variants;
+    let claim_halves = if shifted_claims { 2 } else { 1 };
+    let half = claims.len() / claim_halves;
     let eq_mix = eq_tensor_b(r_mix);
     let eta: Block128 = eta_tower.into();
 
@@ -576,7 +651,11 @@ where
 
     let base = [(0usize, Block128::ONE)];
     let base_and_shift = [(0usize, Block128::ONE), (half, eta_shift)];
-    let offsets: &[(usize, Block128)] = if next_row { &base_and_shift } else { &base };
+    let offsets: &[(usize, Block128)] = if shifted_claims {
+        &base_and_shift
+    } else {
+        &base
+    };
 
     let mut target = Block128::ZERO;
     for &(offset, shift_mul) in offsets {
@@ -604,14 +683,12 @@ where
     target
 }
 
-/// Parses one opened grid-row:
-/// `base` per committed column, plus `shift` when `next_row`,
-/// each at its `rs_field` width (sub-B32 columns are B32-wide).
+/// Parses one opened grid-row: one symbol per committed column
+/// at its `rs_field` width (sub-B32 columns are B32-wide).
 fn parse_physical_row<F: TraceCompatibleField>(
     row_data: &[u8],
     phys_rs: &[ColumnType],
     out: &mut Vec<Flat<F>>,
-    next_row: bool,
 ) {
     let mut ptr = 0;
     for ct in phys_rs {
@@ -619,10 +696,170 @@ fn parse_physical_row<F: TraceCompatibleField>(
 
         out.push(ct.parse_from_bytes(&row_data[ptr..ptr + sz]));
         ptr += sz;
+    }
+}
 
-        if next_row {
-            out.push(ct.parse_from_bytes(&row_data[ptr..ptr + sz]));
-            ptr += sz;
+/// K̃_P(r') in O(n): the K_P carry chain
+/// `Σ_k Π_{i<k}(1+r'_i)P_i · r'_k(1+P_k) · Π_{i>k}(1+r'_i+P_i)`
+/// plus the cyclic wrap `Π_i (1+r'_i)P_i`.
+fn k_p_at(point: &[Block128], r_final: &[Block128]) -> Block128 {
+    let n = point.len();
+    let one = Block128::ONE;
+
+    let mut suffix = vec![one; n + 1];
+    for i in (0..n).rev() {
+        suffix[i] = suffix[i + 1] * (one + r_final[i] + point[i]);
+    }
+
+    let mut acc = Block128::ZERO;
+    let mut prefix = one;
+
+    for k in 0..n {
+        acc += prefix * r_final[k] * (one + point[k]) * suffix[k + 1];
+        prefix *= (one + r_final[k]) * point[k];
+    }
+
+    acc + prefix
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hekate_core::poly::PolyVariant;
+    use hekate_math::TowerField;
+
+    fn elems(seed: u128, n: usize) -> Vec<Block128> {
+        let g = Block128(0x2545F4914F6CDD1D_517CC1B727220A95);
+
+        let mut x = Block128(seed | 1);
+        let mut out = Vec::with_capacity(n);
+
+        for _ in 0..n {
+            x = x * g + Block128::ONE;
+            out.push(x);
         }
+
+        out
+    }
+
+    fn k_p_on_cube(point: &[Block128]) -> Vec<Block128> {
+        let eq_p = eq_tensor_b(point);
+        let n = eq_p.len();
+
+        (0..n).map(|i| eq_p[(i + n - 1) & (n - 1)]).collect()
+    }
+
+    fn mle_at(values: &[Block128], r: &[Block128]) -> Block128 {
+        let weights = eq_tensor_b(r);
+
+        values
+            .iter()
+            .zip(weights.iter())
+            .fold(Block128::ZERO, |acc, (&v, &w)| acc + v * w)
+    }
+
+    fn contract_bits(values: &[Block128], eq_mix: &[Block128]) -> Vec<Block128> {
+        values
+            .iter()
+            .map(|v| {
+                let mut acc = Block128::ZERO;
+                for (u, &m) in eq_mix.iter().enumerate() {
+                    if (v.0 >> u) & 1 == 1 {
+                        acc += m;
+                    }
+                }
+
+                acc
+            })
+            .collect()
+    }
+
+    /// `K_P` is only the right weight if its wrap agrees
+    /// with `PolyVariant::Shifted`, which is what the AIR
+    /// and the prover's fold read as the next row.
+    #[test]
+    fn k_p_contracts_to_the_polyvariant_next_row() {
+        for num_vars in 1..=5 {
+            let n = 1usize << num_vars;
+
+            let point = elems(1289 + num_vars as u128, num_vars);
+            let col_tower = elems(53 + num_vars as u128, n);
+            let col: Vec<Flat<Block128>> = col_tower.iter().map(|v| v.to_hardware()).collect();
+
+            let shifted = PolyVariant::Shifted(&col);
+            let eq_p = eq_tensor_b(&point);
+            let k_p = k_p_on_cube(&point);
+
+            let mut via_variant = Block128::ZERO;
+            let mut via_k_p = Block128::ZERO;
+
+            for i in 0..n {
+                via_variant += shifted.get_at(i).to_tower() * eq_p[i];
+                via_k_p += col_tower[i] * k_p[i];
+            }
+
+            assert_eq!(via_variant, via_k_p, "n={num_vars}");
+        }
+    }
+
+    #[test]
+    fn k_p_closed_form_matches_materialized() {
+        for num_vars in 1..=5 {
+            let point = elems(3 + num_vars as u128, num_vars);
+            let r_final = elems(101 + num_vars as u128, num_vars);
+
+            let direct = mle_at(&k_p_on_cube(&point), &r_final);
+
+            assert_eq!(k_p_at(&point, &r_final), direct, "n={num_vars}");
+        }
+    }
+
+    #[test]
+    fn a_closed_forms_match_materialized() {
+        let kappa = NBITS.ilog2() as usize;
+
+        for num_vars in 1..=5 {
+            let point = elems(7 + num_vars as u128, num_vars);
+            let r_final = elems(211 + num_vars as u128, num_vars);
+            let r_mix = elems(919 + num_vars as u128, kappa);
+
+            let eq_mix = eq_tensor_b(&r_mix);
+            let a_cube = contract_bits(&eq_tensor_b(&point), &eq_mix);
+            let a_next_cube = contract_bits(&k_p_on_cube(&point), &eq_mix);
+
+            let (a, a_next) = ring_switch_a_pair(&point, &r_final, &r_mix, true);
+
+            assert_eq!(a, mle_at(&a_cube, &r_final), "A n={num_vars}");
+            assert_eq!(
+                a_next,
+                mle_at(&a_next_cube, &r_final),
+                "A_next n={num_vars}"
+            );
+
+            let (a_only, skipped) = ring_switch_a_pair(&point, &r_final, &r_mix, false);
+
+            assert_eq!(a_only, a, "A without the carry chain n={num_vars}");
+            assert_eq!(skipped, Block128::ZERO, "n={num_vars}");
+        }
+    }
+
+    #[test]
+    fn transpose128_swaps_bit_indices() {
+        let mut cols = [Block128::ZERO; NBITS];
+        for (c, v) in cols.iter_mut().zip(elems(0x51, NBITS)) {
+            *c = v;
+        }
+
+        let mut expected = [Block128::ZERO; NBITS];
+        for (v, cv) in cols.iter().enumerate() {
+            for (u, ru) in expected.iter_mut().enumerate() {
+                ru.0 |= ((cv.0 >> u) & 1) << v;
+            }
+        }
+
+        let rows = transpose128(&cols);
+
+        assert_eq!(rows, expected);
+        assert_eq!(transpose128(&rows), cols);
     }
 }

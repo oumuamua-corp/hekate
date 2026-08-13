@@ -160,12 +160,11 @@ fn noise_entropy_inspection() {
     // Architecture:
     // FibAir uses [B32, B32, Bit]. The MDS RS code
     // commits each cell at its rs_field width, Bit
-    // widens to B32: (4 + 4 + 4) = 12 bytes per base
-    // row, 12 * 2 = 24 with the interleaved shift.
-    let data_bytes_per_row = (4 + 4 + 4) * 2;
+    // widens to B32: (4 + 4 + 4) = 12 bytes per row.
+    let data_bytes_per_row = 4 + 4 + 4;
 
     // ZK Sumcheck noise is always Block128 (16 bytes).
-    let noise_bytes_per_row = config.sumcheck_blinding_factor * 16 * 2;
+    let noise_bytes_per_row = config.sumcheck_blinding_factor * 16;
     let bytes_per_row = data_bytes_per_row + noise_bytes_per_row;
 
     // Calculate grid_rows based on the
@@ -176,6 +175,7 @@ fn noise_entropy_inspection() {
             config.num_queries,
             config.ldt_support_size,
             bytes_per_row,
+            1,
         );
 
         1 << (num_vars - split_vars)
@@ -687,9 +687,9 @@ fn algebraic_and_evaluation_perfect_hiding() {
     // The evaluations `trace_values` at r_final must
     // be perfectly masked by AES noise. They must
     // leak ZERO information about the underlying data.
-    let eval_no_zk = &p_no_zk.eval_proof.point_evaluations[0].1;
-    let eval_zk_a = &p_zk_a.eval_proof.point_evaluations[0].1;
-    let eval_zk_b = &p_zk_b.eval_proof.point_evaluations[0].1;
+    let eval_no_zk = &p_no_zk.eval_proof.point_evaluation.1;
+    let eval_zk_a = &p_zk_a.eval_proof.point_evaluation.1;
+    let eval_zk_b = &p_zk_b.eval_proof.point_evaluation.1;
 
     assert_ne!(eval_no_zk, eval_zk_a, "ZK failed to hide trace evaluations");
     assert_ne!(eval_zk_a, eval_zk_b, "ZK failed to hide trace evaluations");
@@ -754,8 +754,8 @@ fn algebraic_and_evaluation_perfect_hiding() {
         "K=0/ldt>0: round polys must diverge across seeds"
     );
 
-    let eval_only_ldt_a = &p_only_ldt_a.eval_proof.point_evaluations[0].1;
-    let eval_only_ldt_b = &p_only_ldt_b.eval_proof.point_evaluations[0].1;
+    let eval_only_ldt_a = &p_only_ldt_a.eval_proof.point_evaluation.1;
+    let eval_only_ldt_b = &p_only_ldt_b.eval_proof.point_evaluation.1;
 
     assert_ne!(
         eval_no_zk, eval_only_ldt_a,
@@ -1050,11 +1050,11 @@ fn noise_shift_sign_forgery() {
     // noise value. This "disconnects" the algebraic
     // claim from the physical Merkle tree data.
     let expected_trace_len = air.num_columns() + config.sumcheck_blinding_factor;
-    let base_noise = proof.eval_proof.point_evaluations[0].1[noise_col_idx];
-    let next_noise = proof.eval_proof.point_evaluations[0].1[expected_trace_len + noise_col_idx];
+    let base_noise = proof.eval_proof.point_evaluation.1[noise_col_idx];
+    let next_noise = proof.eval_proof.point_evaluation.1[expected_trace_len + noise_col_idx];
 
-    proof.eval_proof.point_evaluations[0].1[noise_col_idx] = next_noise;
-    proof.eval_proof.point_evaluations[0].1[expected_trace_len + noise_col_idx] = base_noise;
+    proof.eval_proof.point_evaluation.1[noise_col_idx] = next_noise;
+    proof.eval_proof.point_evaluation.1[expected_trace_len + noise_col_idx] = base_noise;
 
     // 2. Verify the forged proof
     let mut verifier_transcript = Transcript::<H>::new(b"ZK_NoiseShift");

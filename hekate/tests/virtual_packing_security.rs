@@ -195,7 +195,7 @@ fn zk_config() -> Config {
 // Virtual Packing Eval Forgery
 //
 // Corrupt a virtual bit column evaluation in
-// the chiplet's point_evaluations. The TensorPCS
+// the chiplet's point_evaluation. The TensorPCS
 // proximity check must catch the mismatch between
 // claimed virtual values and the physically
 // committed trace data.
@@ -225,7 +225,7 @@ fn virtual_packing_eval_forgery_rejected() {
     assert!(ok, "baseline must verify");
 
     // Corrupt virtual bit column 17
-    let evals = &mut proof.chiplet_eval_proofs[0].point_evaluations[0].1;
+    let evals = &mut proof.chiplet_eval_proofs[0].point_evaluation.1;
     assert!(evals.len() > 17);
     evals[17] += F::ONE;
 

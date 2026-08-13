@@ -18,9 +18,11 @@
 use alloc::vec;
 use alloc::vec::Vec;
 use core::iter::repeat_n;
+use hekate_core::config::Config;
 use hekate_core::errors::Error;
 use hekate_core::poly::PolyVariant;
 use hekate_core::trace::{ColumnType, Trace, TraceColumn, TraceCompatibleField};
+use hekate_core::utils::compute_split_vars;
 use hekate_math::{Bit, Block8, Block16, Block32, Block64, Flat, HardwareField};
 
 /// Serializable expansion step descriptor.
@@ -577,6 +579,7 @@ impl RingSwitchPlan {
                             ..
                         } => {
                             bounds(phy_col_start + count)?;
+
                             for j in 0..count {
                                 phys_whole[phy_col_start + j].push(units.len());
                                 units.push((false, 1));
@@ -588,13 +591,22 @@ impl RingSwitchPlan {
                             storage,
                         } => {
                             let bits = expand_bit_width(storage)?;
+
                             bounds(phy_col_start + count)?;
+
                             for j in 0..count {
                                 phys_bit[phy_col_start + j].push(units.len());
                                 units.push((true, bits));
                             }
                         }
                     }
+                }
+
+                if running != num_phys {
+                    return Err(Error::Protocol {
+                        protocol: "ring_switch_plan",
+                        message: "expansion entries do not cover the physical column layout",
+                    });
                 }
             }
             None => {
@@ -627,6 +639,24 @@ impl RingSwitchPlan {
 
     pub fn total_claims(&self) -> usize {
         self.units.iter().map(|(_, n)| n).sum()
+    }
+
+    pub fn opened_row_bytes(&self) -> usize {
+        self.phys_rs.iter().map(|ct| ct.byte_size()).sum()
+    }
+
+    pub fn num_master_vectors(&self) -> usize {
+        1 + usize::from(self.has_ring())
+    }
+
+    pub fn split_vars(&self, num_vars: usize, config: &Config) -> usize {
+        compute_split_vars(
+            num_vars,
+            config.num_queries,
+            config.ldt_support_size,
+            self.opened_row_bytes(),
+            self.num_master_vectors(),
+        )
     }
 
     /// Per committed column:
@@ -806,6 +836,23 @@ mod tests {
     use hekate_core::trace::TraceBuilder;
     use hekate_math::{Block128, TowerField};
 
+    fn keccak_expander() -> VirtualExpander {
+        VirtualExpander::new()
+            .expand_bits(25, ColumnType::B64)
+            .expand_bits(1, ColumnType::B64)
+            .reuse_pass_through(0, 25)
+            .control_bits(2)
+            .build()
+            .unwrap()
+    }
+
+    fn keccak_physical_layout() -> Vec<ColumnType> {
+        let mut layout = vec![ColumnType::B64; 26];
+        layout.extend(repeat_n(ColumnType::Bit, 2));
+
+        layout
+    }
+
     #[test]
     fn ram_layout() {
         let e = VirtualExpander::new()
@@ -821,6 +868,7 @@ mod tests {
         assert_eq!(e.physical_row_bytes(), 80);
 
         let layout = e.virtual_layout();
+
         assert_eq!(layout.len(), 82);
         assert!(layout[..64].iter().all(|&t| t == ColumnType::Bit));
         assert!(layout[64..77].iter().all(|&t| t == ColumnType::B32));
@@ -843,11 +891,46 @@ mod tests {
         assert_eq!(e.physical_row_bytes(), 210);
 
         let layout = e.virtual_layout();
+
         assert_eq!(layout.len(), 1691);
         assert!(layout[..1600].iter().all(|&t| t == ColumnType::Bit));
         assert!(layout[1600..1664].iter().all(|&t| t == ColumnType::Bit));
         assert!(layout[1664..1689].iter().all(|&t| t == ColumnType::B64));
         assert!(layout[1689..1691].iter().all(|&t| t == ColumnType::Bit));
+    }
+
+    #[test]
+    fn ring_switch_plan_rejects_uncovered_columns() {
+        let expander = keccak_expander();
+        let entries = expander.expansion_entries();
+
+        let mut layout = keccak_physical_layout();
+
+        assert_eq!(expander.num_physical_columns(), layout.len());
+        assert!(RingSwitchPlan::new(&layout, Some(&entries), 0).is_ok());
+
+        layout.push(ColumnType::B64);
+
+        assert!(RingSwitchPlan::new(&layout, Some(&entries), 0).is_err());
+    }
+
+    #[test]
+    fn ring_switch_plan_folds_every_committed_column() {
+        let entries = keccak_expander().expansion_entries();
+        let layout = keccak_physical_layout();
+
+        let plan = RingSwitchPlan::new(&layout, Some(&entries), 2).unwrap();
+
+        let zero = Flat::from_raw(Block128::ZERO);
+        let eta = Block128(0x2545F4914F6CDD1D_517CC1B727220A95).to_hardware();
+        let (coeff_bit, coeff_whole, _) = plan.column_coeffs::<Block128>(eta);
+
+        for p in 0..plan.phys_rs.len() {
+            assert!(
+                coeff_bit[p] != zero || coeff_whole[p] != zero,
+                "committed column {p} enters no master fold"
+            );
+        }
     }
 
     #[test]
@@ -863,6 +946,7 @@ mod tests {
         assert_eq!(e.physical_row_bytes(), 40);
 
         let layout = e.virtual_layout();
+
         assert_eq!(layout[320..324].len(), 4);
         assert!(layout[320..324].iter().all(|&t| t == ColumnType::B32));
     }
@@ -873,6 +957,7 @@ mod tests {
             .expand_bits(5, ColumnType::B32)
             .reuse_pass_through(3, 5)
             .build();
+
         assert!(result.is_err());
     }
 
@@ -889,6 +974,7 @@ mod tests {
         assert_eq!(e.num_virtual_columns(), 4 + 256);
 
         let layout = e.virtual_layout();
+
         assert!(layout[0..4].iter().all(|&t| t == ColumnType::B64));
         assert!(layout[4..260].iter().all(|&t| t == ColumnType::Bit));
     }
@@ -899,6 +985,7 @@ mod tests {
             .pass_through(4, ColumnType::B64)
             .reuse_expand_bits(2, 4)
             .build();
+
         assert!(result.is_err());
     }
 
@@ -908,6 +995,7 @@ mod tests {
             .pass_through(1, ColumnType::B128)
             .reuse_expand_bits(0, 1)
             .build();
+
         assert!(result.is_err());
     }
 
@@ -916,6 +1004,7 @@ mod tests {
         let result = VirtualExpander::new()
             .expand_bits(1, ColumnType::Bit)
             .build();
+
         assert!(result.is_err());
     }
 
@@ -924,6 +1013,7 @@ mod tests {
         let result = VirtualExpander::new()
             .expand_bits(1, ColumnType::B128)
             .build();
+
         assert!(result.is_err());
     }
 

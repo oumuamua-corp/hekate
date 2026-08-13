@@ -108,6 +108,8 @@ pub trait Air<F: TowerField>: Sized + Clone + Sync {
 
     /// Returns the `VirtualExpander` for chiplets
     /// with physical to virtual column expansion.
+    /// Non-reuse entries must tile `column_layout()`
+    /// exactly; an uncovered column is bound by nothing.
     fn virtual_expander(&self) -> Option<&VirtualExpander> {
         None
     }

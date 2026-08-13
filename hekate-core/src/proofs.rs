@@ -144,33 +144,33 @@ pub struct SumcheckProof<F: TowerField> {
 // EVALUATION BATCH PROOF
 // ===================================
 
-/// Multi-point evaluation argument binding
-/// trace-column evaluations at several challenge
-/// points to one Brakedown commitment.
+/// Single-point evaluation argument binding
+/// trace-column evaluations at one challenge
+/// point to one Brakedown commitment.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EvalBatchProof<F: TowerField> {
-    /// Sumcheck reducing the RLC-batched multi-point
-    /// claim to a single-point evaluation.
+    /// Sumcheck reducing the batched claim
+    /// to a single-point evaluation.
     pub sumcheck_proof: SumcheckProof<F>,
 
     /// Brakedown opening for the rows selected
     /// by the evaluation sumcheck's challenge.
     pub ldt_proof: BrakedownProof<F>,
 
-    /// `(point, claimed_column_evals)` per
-    /// batched query. Currently, always length 1:
-    /// `(r_final, AIR column evals)`.
-    pub point_evaluations: Vec<(Vec<F>, Vec<F>)>,
+    /// `(r_final, claimed_column_evals)`.
+    pub point_evaluation: (Vec<F>, Vec<F>),
 
     /// TensorPCS row-fold of the whole-column master
     /// (pass-through / control / blinding columns),
-    /// `q_whole = M_whole · r_col`, length `grid_cols`.
+    /// `q_whole = M_whole · r_col`, length
+    /// `grid_cols + support_size`.
     #[serde(default)]
     pub tensor_vec: Vec<F>,
 
     /// TensorPCS row-fold of the ring-switch
     /// master (bit-expanded physical columns),
-    /// `q_ring = M_bit · r_col`.
+    /// `q_ring = M_bit · r_col`. Empty when the
+    /// ring-switch plan carries no ring unit.
     #[serde(default)]
     pub tensor_vec_ring: Vec<F>,
 }
@@ -179,14 +179,14 @@ impl<F: TowerField> EvalBatchProof<F> {
     pub fn new(
         sumcheck_proof: SumcheckProof<F>,
         ldt_proof: BrakedownProof<F>,
-        point_evaluations: Vec<(Vec<F>, Vec<F>)>,
+        point_evaluation: (Vec<F>, Vec<F>),
         tensor_vec: Vec<F>,
         tensor_vec_ring: Vec<F>,
     ) -> Self {
         Self {
             sumcheck_proof,
             ldt_proof,
-            point_evaluations,
+            point_evaluation,
             tensor_vec,
             tensor_vec_ring,
         }

@@ -21,7 +21,6 @@ use core::marker::PhantomData;
 use hekate_core::config::Config;
 use hekate_core::errors;
 use hekate_core::proofs::{BrakedownCommitment, BrakedownProof};
-use hekate_core::utils::compute_split_vars;
 use hekate_crypto::Hasher;
 use hekate_crypto::merkle::MerkleTree;
 use hekate_crypto::transcript::Transcript;
@@ -56,18 +55,8 @@ where
         proof: &'a BrakedownProof<F>,
         transcript: &mut Transcript<H>,
         config: &Config,
-        row_bytes: usize,
+        split_vars: usize,
     ) -> errors::Result<VerifiedOpenings<'a>> {
-        let num_rows = commitment.num_rows;
-        let num_vars = num_rows.trailing_zeros() as usize;
-
-        let split_vars = compute_split_vars(
-            num_vars,
-            config.num_queries,
-            config.ldt_support_size,
-            row_bytes,
-        );
-
         let grid_cols = 1 << split_vars;
         let encoded_width = config.encoded_width(grid_cols);
         let num_queries = config.num_queries;
@@ -179,8 +168,13 @@ mod tests {
         let num_cols = 1;
         let field_size = 16; // Block128 size
 
-        let split_vars =
-            compute_split_vars(num_vars, config.num_queries, config.ldt_support_size, 128);
+        let split_vars = hekate_core::utils::compute_split_vars(
+            num_vars,
+            config.num_queries,
+            config.ldt_support_size,
+            128,
+            1,
+        );
 
         let grid_cols = 1 << split_vars;
         let grid_rows = 1 << (num_vars - split_vars);
@@ -265,7 +259,7 @@ mod tests {
             &proof,
             &mut verifier_transcript,
             &config,
-            128,
+            split_vars,
         );
 
         assert!(result.is_ok(), "Valid Brakedown proof should verify");
@@ -285,8 +279,13 @@ mod tests {
         let num_rows = 16;
         let num_vars = 4;
 
-        let split_vars =
-            compute_split_vars(num_vars, config.num_queries, config.ldt_support_size, 128);
+        let split_vars = hekate_core::utils::compute_split_vars(
+            num_vars,
+            config.num_queries,
+            config.ldt_support_size,
+            128,
+            1,
+        );
         let grid_cols = 1 << split_vars;
         let encoded_width = config.encoded_width(grid_cols);
 
@@ -326,8 +325,13 @@ mod tests {
         let proof = BrakedownProof::new(vec![vec![4u8, 5, 6]; distinct.len()], Vec::new());
 
         let mut transcript = Transcript::<H>::new(b"test");
-        let result =
-            BrakedownVerifier::<F, H>::verify(&commitment, &proof, &mut transcript, &config, 128);
+        let result = BrakedownVerifier::<F, H>::verify(
+            &commitment,
+            &proof,
+            &mut transcript,
+            &config,
+            split_vars,
+        );
 
         assert!(result.is_err(), "Tampered/Invalid proof should fail");
     }
