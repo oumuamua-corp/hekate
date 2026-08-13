@@ -31,7 +31,7 @@ use hekate_math::{
     AdditiveFft, BinaryFieldExtras, Block128, Flat, HardwareField, PackableField, TowerField,
 };
 use hekate_program::expander::RingSwitchPlan;
-use tracing::{instrument, warn};
+use tracing::{debug, instrument, warn};
 
 #[cfg(feature = "parallel")]
 const PARALLEL_PROXIMITY_THRESHOLD: usize = 1 << 18;
@@ -150,6 +150,18 @@ where
         let grid_rows = 1 << (num_vars - split_vars);
         let geom = config.table_geom(grid_cols);
         let encoded_width = geom.encoded_width;
+        let phys_row_bytes = plan.opened_row_bytes();
+
+        debug!(
+            num_vars,
+            split_vars,
+            grid_cols,
+            encoded_width,
+            support = geom.support_size,
+            row_bytes = phys_row_bytes,
+            fractional = encoded_width == grid_cols * config.inv_rate,
+            "table geometry"
+        );
 
         if grid_cols + geom.support_size > encoded_width {
             warn!("support + data message exceeds the codeword width");
@@ -203,7 +215,7 @@ where
         let tensor_col = build_tensor_table::<F>(r_col_low);
 
         let master_eval = |q: &[Flat<F>]| {
-            let mut acc = Flat::from_raw(F::ZERO);
+            let mut acc = zero;
             for (&val, &t) in q.iter().take(grid_cols).zip(&tensor_col) {
                 acc += val * t;
             }
@@ -273,12 +285,10 @@ where
         }
 
         let num_phys = plan.phys_rs.len();
-        let phys_row_bytes = plan.opened_row_bytes();
 
-        // Re-derive both folded openings from the physical columns
-        // in the opened leaf; RS commutes with a whole-column fold,
-        // this must match the RS re-encodings of the prover's
-        // committed q vectors.
+        // Re-derive both folded openings from the physical columns in the
+        // opened leaf; RS commutes with a whole-column fold, this must
+        // match the RS re-encodings of the prover's committed q vectors.
         let check_query =
             |q_idx: usize, col_idx: usize, phys_row: &mut Vec<Flat<F>>| -> errors::Result<bool> {
                 let col_bytes = &opened_columns[slot_map[q_idx]];
@@ -288,8 +298,8 @@ where
                     return Ok(false);
                 }
 
-                let mut q_whole_val = Flat::from_raw(F::ZERO);
-                let mut q_ring_val = Flat::from_raw(F::ZERO);
+                let mut q_whole_val = zero;
+                let mut q_ring_val = zero;
 
                 for r in 0..grid_rows {
                     let row_data = &col_bytes[r * phys_row_bytes..(r + 1) * phys_row_bytes];
@@ -298,8 +308,8 @@ where
 
                     parse_physical_row::<F>(row_data, &plan.phys_rs, phys_row);
 
-                    let mut fold_whole = Flat::from_raw(F::ZERO);
-                    let mut fold_bit = Flat::from_raw(F::ZERO);
+                    let mut fold_whole = zero;
+                    let mut fold_bit = zero;
 
                     for p in 0..num_phys {
                         let base = phys_row[p];
