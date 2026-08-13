@@ -251,10 +251,9 @@ fn chiplet_eval_values_forgery() {
     // Corrupt first chiplet's
     // claimed evaluation at r_final.
     let c_eval = &mut proof.chiplet_eval_proofs[0];
-    assert!(!c_eval.point_evaluations.is_empty());
-    assert!(!c_eval.point_evaluations[0].1.is_empty());
+    assert!(!c_eval.point_evaluation.1.is_empty());
 
-    c_eval.point_evaluations[0].1[0] += F::ONE;
+    c_eval.point_evaluation.1[0] += F::ONE;
 
     let mut vt = Transcript::<H>::new(b"ChipletSecurity");
     let result = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
@@ -311,9 +310,7 @@ fn chiplet_eval_values_truncated() {
     // Truncate chiplet's combined trace values
     // to 1 entry; the verifier's length check
     // rejects without panicking.
-    proof.chiplet_eval_proofs[0].point_evaluations[0]
-        .1
-        .truncate(1);
+    proof.chiplet_eval_proofs[0].point_evaluation.1.truncate(1);
 
     let mut vt = Transcript::<H>::new(b"ChipletSecurity");
     let result = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
@@ -464,29 +461,6 @@ fn chiplet_sumcheck_degree_inflation_rejected() {
     assert!(
         result.is_err() || !result.unwrap(),
         "SECURITY FAILURE: degree-inflated chiplet round poly accepted"
-    );
-}
-
-// =====================================================
-// Chiplet eval_proof must carry exactly one point
-// =====================================================
-
-#[test]
-fn chiplet_eval_proof_multiple_points_rejected() {
-    let (air, instance, witness, config) = build_test_system(6);
-    let (mut proof, ok) = prove_and_verify(&air, &instance, &witness, &config);
-
-    assert!(ok, "Baseline proof must verify");
-
-    let dup = proof.chiplet_eval_proofs[0].point_evaluations[0].clone();
-    proof.chiplet_eval_proofs[0].point_evaluations.push(dup);
-
-    let mut vt = Transcript::<H>::new(b"ChipletSecurity");
-    let result = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
-
-    assert!(
-        result.is_err(),
-        "SECURITY FAILURE: multi-point chiplet eval_proof accepted"
     );
 }
 
