@@ -15,7 +15,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/// 16 B element + 1 B bincode length prefix.
+/// Bincode varint size of one `Block128`:
+/// 1 tag byte + 16.
 const Q_VECTOR_ELEM_BYTES: usize = 17;
 
 #[cfg(feature = "std")]
@@ -36,10 +37,9 @@ impl Instant {
     }
 }
 
-/// Splitting variable `c` minimising
-/// `2^c · 17 · num_vectors + num_queries · 2^(num_vars - c) · row_bytes`
-/// at `rs_field` row widths, floored toward `2^c >= max(2, support_size)`,
-/// then capped at `num_vars`.
+/// Splitting variable `c` minimising proof bytes,
+/// tensor vectors against opened rows at `rs_field`
+/// widths. `table_geom`'s commit width is not priced.
 #[inline(always)]
 pub fn compute_split_vars(
     num_vars: usize,
@@ -138,7 +138,11 @@ mod tests {
     fn split_vars_respects_the_support_floor() {
         for (num_vars, q, s, rb, v) in cases() {
             let c = compute_split_vars(num_vars, q, s, rb, v);
-            let floor = (s - 1).ilog2() as usize + 1;
+            let floor = if s > 1 {
+                (s - 1).ilog2() as usize + 1
+            } else {
+                1
+            };
 
             assert!(
                 c >= floor.min(num_vars),
