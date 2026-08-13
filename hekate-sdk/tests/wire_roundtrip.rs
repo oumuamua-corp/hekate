@@ -1419,7 +1419,7 @@ fn eval_proof_with(tensor_vec: Vec<F>, tensor_vec_ring: Vec<F>) -> EvalBatchProo
     EvalBatchProof::new(
         empty_sumcheck(),
         BrakedownProof::new(vec![], vec![]),
-        vec![(vec![wide(1)], vec![wide(2), wide(3)])],
+        (vec![wide(1)], vec![wide(2), wide(3)]),
         tensor_vec,
         tensor_vec_ring,
     )
@@ -1528,7 +1528,7 @@ fn proof_logup_h_binding_round_trips() {
         bytes_of(&[wide(7), wide(8)]),
         "h_eval_proof payload must survive the wire",
     );
-    assert_eq!(hp.point_evaluations.len(), 1);
+    assert_eq!(hp.point_evaluation.0.len(), 1);
 }
 
 #[test]

@@ -28,7 +28,7 @@ use hekate_math::TowerField;
 
 use crate::generated::proof as fb;
 
-const WIRE_PROOF_VERSION: u32 = 3;
+const WIRE_PROOF_VERSION: u32 = 4;
 
 pub fn serialize_proof<'a, F: TowerField>(
     fbb: &mut FlatBufferBuilder<'a>,
@@ -274,25 +274,21 @@ fn serialize_eval_batch<'a, F: TowerField>(
     let sc = serialize_sumcheck(fbb, &proof.sumcheck_proof);
     let ldt = serialize_brakedown_proof(fbb, &proof.ldt_proof);
 
-    let pt_offsets: Vec<_> = proof
-        .point_evaluations
-        .iter()
-        .map(|(point, vals)| {
-            let pt: Vec<fb::Block128> = point.iter().map(|f| block128_from_field(f)).collect();
-            let pt_vec = fbb.create_vector(&pt);
-            let cv: Vec<fb::Block128> = vals.iter().map(|f| block128_from_field(f)).collect();
-            let cv_vec = fbb.create_vector(&cv);
+    let (point, vals) = &proof.point_evaluation;
 
-            fb::PointEvaluation::create(
-                fbb,
-                &fb::PointEvaluationArgs {
-                    point: Some(pt_vec),
-                    column_values: Some(cv_vec),
-                },
-            )
-        })
-        .collect();
-    let pts = fbb.create_vector(&pt_offsets);
+    let pt: Vec<fb::Block128> = point.iter().map(|f| block128_from_field(f)).collect();
+    let pt_vec = fbb.create_vector(&pt);
+
+    let cv: Vec<fb::Block128> = vals.iter().map(|f| block128_from_field(f)).collect();
+    let cv_vec = fbb.create_vector(&cv);
+
+    let pt_offset = fb::PointEvaluation::create(
+        fbb,
+        &fb::PointEvaluationArgs {
+            point: Some(pt_vec),
+            column_values: Some(cv_vec),
+        },
+    );
 
     let tv: Vec<fb::Block128> = proof
         .tensor_vec
@@ -315,7 +311,7 @@ fn serialize_eval_batch<'a, F: TowerField>(
         &fb::EvalBatchProofArgs {
             sumcheck_proof: Some(sc),
             ldt_proof: Some(ldt),
-            point_evaluations: Some(pts),
+            point_evaluation: Some(pt_offset),
             tensor_vec: Some(tensor),
             tensor_vec_ring: Some(tensor_ring),
         },
@@ -450,43 +446,35 @@ fn deserialize_eval_batch<F: TowerField>(fb: fb::EvalBatchProof<'_>) -> Result<E
         .transpose()?
         .ok_or(wire_err("missing eval ldt_proof"))?;
 
-    let point_evaluations = match fb.point_evaluations() {
-        Some(pts) => {
-            let mut evals = Vec::with_capacity(pts.len());
-            for i in 0..pts.len() {
-                let pt = pts.get(i);
+    let pt = fb
+        .point_evaluation()
+        .ok_or(wire_err("missing eval point_evaluation"))?;
 
-                let point: Vec<F> = match pt.point() {
-                    Some(v) => {
-                        let mut p = Vec::with_capacity(v.len());
-                        for j in 0..v.len() {
-                            p.push(field_from_block128::<F>(*v.get(j))?);
-                        }
-
-                        p
-                    }
-                    None => Vec::new(),
-                };
-
-                let vals: Vec<F> = match pt.column_values() {
-                    Some(v) => {
-                        let mut cv = Vec::with_capacity(v.len());
-                        for j in 0..v.len() {
-                            cv.push(field_from_block128::<F>(*v.get(j))?);
-                        }
-
-                        cv
-                    }
-                    None => Vec::new(),
-                };
-
-                evals.push((point, vals));
+    let point: Vec<F> = match pt.point() {
+        Some(v) => {
+            let mut p = Vec::with_capacity(v.len());
+            for j in 0..v.len() {
+                p.push(field_from_block128::<F>(*v.get(j))?);
             }
 
-            evals
+            p
         }
         None => Vec::new(),
     };
+
+    let vals: Vec<F> = match pt.column_values() {
+        Some(v) => {
+            let mut cv = Vec::with_capacity(v.len());
+            for j in 0..v.len() {
+                cv.push(field_from_block128::<F>(*v.get(j))?);
+            }
+
+            cv
+        }
+        None => Vec::new(),
+    };
+
+    let point_evaluation = (point, vals);
 
     let tensor_vec = match fb.tensor_vec() {
         Some(v) => {
@@ -515,7 +503,7 @@ fn deserialize_eval_batch<F: TowerField>(fb: fb::EvalBatchProof<'_>) -> Result<E
     Ok(EvalBatchProof {
         sumcheck_proof,
         ldt_proof,
-        point_evaluations,
+        point_evaluation,
         tensor_vec,
         tensor_vec_ring,
     })

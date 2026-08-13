@@ -911,7 +911,7 @@ pub mod hekate {
         impl<'a> EvalBatchProof<'a> {
             pub const VT_SUMCHECK_PROOF: ::flatbuffers::VOffsetT = 4;
             pub const VT_LDT_PROOF: ::flatbuffers::VOffsetT = 6;
-            pub const VT_POINT_EVALUATIONS: ::flatbuffers::VOffsetT = 8;
+            pub const VT_POINT_EVALUATION: ::flatbuffers::VOffsetT = 8;
             pub const VT_TENSOR_VEC: ::flatbuffers::VOffsetT = 10;
             pub const VT_TENSOR_VEC_RING: ::flatbuffers::VOffsetT = 12;
 
@@ -936,8 +936,8 @@ pub mod hekate {
                 if let Some(x) = args.tensor_vec {
                     builder.add_tensor_vec(x);
                 }
-                if let Some(x) = args.point_evaluations {
-                    builder.add_point_evaluations(x);
+                if let Some(x) = args.point_evaluation {
+                    builder.add_point_evaluation(x);
                 }
                 if let Some(x) = args.ldt_proof {
                     builder.add_ldt_proof(x);
@@ -975,18 +975,16 @@ pub mod hekate {
                 }
             }
             #[inline]
-            pub fn point_evaluations(
-                &self,
-            ) -> Option<
-                ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<PointEvaluation<'a>>>,
-            > {
+            pub fn point_evaluation(&self) -> Option<PointEvaluation<'a>> {
                 // Safety:
                 // Created from valid Table for this object
                 // which contains a valid value in this slot
                 unsafe {
-                    self._tab.get::<::flatbuffers::ForwardsUOffset<
-                        ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<PointEvaluation>>,
-                    >>(EvalBatchProof::VT_POINT_EVALUATIONS, None)
+                    self._tab
+                        .get::<::flatbuffers::ForwardsUOffset<PointEvaluation>>(
+                            EvalBatchProof::VT_POINT_EVALUATION,
+                            None,
+                        )
                 }
             }
             #[inline]
@@ -1026,7 +1024,7 @@ pub mod hekate {
                 v.visit_table(pos)?
      .visit_field::<::flatbuffers::ForwardsUOffset<SumcheckProof>>("sumcheck_proof", Self::VT_SUMCHECK_PROOF, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<BrakedownProof>>("ldt_proof", Self::VT_LDT_PROOF, false)?
-     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<PointEvaluation>>>>("point_evaluations", Self::VT_POINT_EVALUATIONS, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<PointEvaluation>>("point_evaluation", Self::VT_POINT_EVALUATION, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, Block128>>>("tensor_vec", Self::VT_TENSOR_VEC, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, Block128>>>("tensor_vec_ring", Self::VT_TENSOR_VEC_RING, false)?
      .finish();
@@ -1036,11 +1034,7 @@ pub mod hekate {
         pub struct EvalBatchProofArgs<'a> {
             pub sumcheck_proof: Option<::flatbuffers::WIPOffset<SumcheckProof<'a>>>,
             pub ldt_proof: Option<::flatbuffers::WIPOffset<BrakedownProof<'a>>>,
-            pub point_evaluations: Option<
-                ::flatbuffers::WIPOffset<
-                    ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<PointEvaluation<'a>>>,
-                >,
-            >,
+            pub point_evaluation: Option<::flatbuffers::WIPOffset<PointEvaluation<'a>>>,
             pub tensor_vec: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, Block128>>>,
             pub tensor_vec_ring:
                 Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, Block128>>>,
@@ -1051,7 +1045,7 @@ pub mod hekate {
                 EvalBatchProofArgs {
                     sumcheck_proof: None,
                     ldt_proof: None,
-                    point_evaluations: None,
+                    point_evaluation: None,
                     tensor_vec: None,
                     tensor_vec_ring: None,
                 }
@@ -1086,16 +1080,15 @@ pub mod hekate {
                     );
             }
             #[inline]
-            pub fn add_point_evaluations(
+            pub fn add_point_evaluation(
                 &mut self,
-                point_evaluations: ::flatbuffers::WIPOffset<
-                    ::flatbuffers::Vector<'b, ::flatbuffers::ForwardsUOffset<PointEvaluation<'b>>>,
-                >,
+                point_evaluation: ::flatbuffers::WIPOffset<PointEvaluation<'b>>,
             ) {
-                self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(
-                    EvalBatchProof::VT_POINT_EVALUATIONS,
-                    point_evaluations,
-                );
+                self.fbb_
+                    .push_slot_always::<::flatbuffers::WIPOffset<PointEvaluation>>(
+                        EvalBatchProof::VT_POINT_EVALUATION,
+                        point_evaluation,
+                    );
             }
             #[inline]
             pub fn add_tensor_vec(
@@ -1139,7 +1132,7 @@ pub mod hekate {
                 let mut ds = f.debug_struct("EvalBatchProof");
                 ds.field("sumcheck_proof", &self.sumcheck_proof());
                 ds.field("ldt_proof", &self.ldt_proof());
-                ds.field("point_evaluations", &self.point_evaluations());
+                ds.field("point_evaluation", &self.point_evaluation());
                 ds.field("tensor_vec", &self.tensor_vec());
                 ds.field("tensor_vec_ring", &self.tensor_vec_ring());
                 ds.finish()
