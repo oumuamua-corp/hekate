@@ -162,13 +162,15 @@ pub struct EvalBatchProof<F: TowerField> {
 
     /// TensorPCS row-fold of the whole-column master
     /// (pass-through / control / blinding columns),
-    /// `q_whole = M_whole · r_col`, length `grid_cols`.
+    /// `q_whole = M_whole · r_col`, length
+    /// `grid_cols + support_size`.
     #[serde(default)]
     pub tensor_vec: Vec<F>,
 
     /// TensorPCS row-fold of the ring-switch
     /// master (bit-expanded physical columns),
-    /// `q_ring = M_bit · r_col`.
+    /// `q_ring = M_bit · r_col`. Empty when the
+    /// ring-switch plan carries no ring unit.
     #[serde(default)]
     pub tensor_vec_ring: Vec<F>,
 }
