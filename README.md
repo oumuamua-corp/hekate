@@ -284,7 +284,7 @@ binary you can run with `cargo run --release --example <name>`.
 
 All numbers on Apple M3 Max (16 cores, 48 GB RAM), `--release`, features
 `std parallel blake3 table-math`. Measured with the example binaries in `hekate/examples/`
-on an otherwise idle machine; post-quantum and AES figures are the mean of three runs. Peak memory is
+on an otherwise idle machine; every figure is the mean of three runs. Peak memory is
 the process peak physical footprint, which equals resident set size for any run that fits in RAM.
 
 Reproduce:
@@ -301,15 +301,15 @@ just example fibonacci_raw 26 public   # num_vars
 
 |              | ML-KEM-768 | ML-DSA-44 | ML-DSA-65 | ML-DSA-87 | AES-128   | AES-256   |
 |:-------------|:-----------|:----------|:----------|:----------|:----------|:----------|
-| Proving      | 919 ms     | 1.60 s    | 1.66 s    | 2.95 s    | 2.08 s    | 2.27 s    |
-| Verification | 23.6 ms    | 29.2 ms   | 29.5 ms   | 35.1 ms   | 18.2 ms   | 18.3 ms   |
-| Proof Size   | 4,459 KiB  | 5,823 KiB | 5,851 KiB | 7,897 KiB | 7,663 KiB | 8,404 KiB |
-| Peak memory  | 556 MiB    | 603 MiB   | 566 MiB   | 1,279 MiB | 1,631 MiB | 2,058 MiB |
+| Proving      | 626 ms     | 926 ms    | 969 ms    | 1.50 s    | 1.44 s    | 1.55 s    |
+| Verification | 23.2 ms    | 30.1 ms   | 30.5 ms   | 32.0 ms   | 18.8 ms   | 18.9 ms   |
+| Proof Size   | 3,576 KiB  | 4,403 KiB | 4,436 KiB | 5,922 KiB | 5,628 KiB | 5,962 KiB |
+| Peak memory  | 459 MiB    | 459 MiB   | 478 MiB   | 869 MiB   | 1,182 MiB | 1,480 MiB |
 | Chiplets     | 6          | 7         | 7         | 7         | 2         | 2         |
 
 AES note: both AES-128 and AES-256 prove **31,250 blocks** (~500 KB plaintext) per run.
-CPU trace 2^16 rows; Round-AIR and S-box ROM chiplets at 2^19. Per-block proving cost: ~67 µs (AES-128) / ~73 µs (
-AES-256).
+CPU trace 2^16 rows; Round-AIR and S-box ROM chiplets at 2^19. Per-block proving cost:
+~46 µs (AES-128) / ~50 µs (AES-256).
 
 ### Keccak-f[1600], scaling
 
@@ -317,8 +317,8 @@ AES-256).
 
 | Scale (rows) | Permutations | Hashed  | Proving | Verify  | Proof Size | Peak memory |
 |:-------------|:-------------|:--------|:--------|:--------|:-----------|:------------|
-| 2^15         | 1,310        | ~178 KB | 323 ms  | 6.1 ms  | 1,105 KiB  | 175 MiB     |
-| 2^20         | 41,943       | ~5.4 MB | 7.58 s  | 13.1 ms | 5,446 KiB  | 3,596 MiB   |
+| 2^15         | 1,310        | ~178 KB | 203 ms  | 5.9 ms  | 793 KiB    | 143 MiB     |
+| 2^20         | 41,943       | ~5.4 MB | 4.08 s  | 13.5 ms | 4,220 KiB  | 2,486 MiB   |
 
 ### Fibonacci (32-bit integer add), scaling
 
@@ -327,9 +327,9 @@ explicit carry chain, virtual-expanded into 32 bit + 32 sum + 32 carry columns.
 
 | Scale (rows) | Proving | Verify  | Proof Size | Peak memory |
 |:-------------|:--------|:--------|:-----------|:------------|
-| 2^20         | 509 ms  | 4.5 ms  | 1,034 KiB  | 226 MiB     |
-| 2^24         | 7.99 s  | 9.7 ms  | 3,998 KiB  | 3,297 MiB   |
-| 2^26         | 36.10 s | 16.8 ms | 7,926 KiB  | 13,312 MiB  |
+| 2^20         | 391 ms  | 3.4 ms  | 756 KiB    | 156 MiB     |
+| 2^24         | 6.11 s  | 7.3 ms  | 2,901 KiB  | 2,029 MiB   |
+| 2^26         | 26.10 s | 11.8 ms | 5,757 KiB  | 7,841 MiB   |
 
 ---
 
