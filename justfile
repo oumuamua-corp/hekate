@@ -41,16 +41,22 @@ example name arg="" variant="ct":
         --no-default-features --features "$feats" \
         --example {{name}}
 
-    target/release/examples/{{name}} {{arg}} &
-    pid=$!
+    /usr/bin/time -l target/release/examples/{{name}} {{arg}} &
+    tpid=$!
+
+    pid=""
+    while [ -z "$pid" ] && kill -0 "$tpid" 2>/dev/null; do
+        pid=$(pgrep -P "$tpid" 2>/dev/null | head -1) || true
+    done
+    pid="${pid:-$tpid}"
 
     # phys_footprint_peak counts compressed pages, ru_maxrss does not.
     peak=""
     while kill -0 "$pid" 2>/dev/null; do
         s=$(footprint -p "$pid" 2>/dev/null | awk '/phys_footprint_peak:/{print $2, $3}') || true
         if [ -n "$s" ]; then peak="$s"; fi
-        sleep 0.5
+        sleep 0.05
     done
 
-    wait "$pid"
+    wait "$tpid"
     echo "Peak memory: ${peak:-unavailable}"
