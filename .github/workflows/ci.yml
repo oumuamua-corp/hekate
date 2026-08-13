@@ -8,7 +8,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  RUSTFLAGS: "-D warnings"
+  RUSTFLAGS: "-D warnings -C target-feature=+aes"
 
 jobs:
   changes:
@@ -145,6 +145,9 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all --check
+
+      - name: PMULL enabled
+        run: cargo rustc --release -p hekate-core -- --print cfg | grep -qx 'target_feature="aes"'
 
   audit:
     name: Audit + deny
