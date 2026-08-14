@@ -9,12 +9,18 @@ Post-quantum AIR chiplets for the [Hekate](https://github.com/oumuamua-labs/heka
 ML-KEM (Kyber) decapsulation and ML-DSA (Dilithium) signature verification natively in binary fields, with supporting
 NTT, basemul, high-bits, norm-check, and twiddle-ROM chiplets.
 
+> **Experimental.** This crate exists to demonstrate that Hekate can prove
+> lattice-based cryptography natively in binary fields. The circuits have no
+> external audit and the statements they prove are fully public, which is the
+> case where verifying the signature directly is cheaper. Treat it as a
+> working example, not a production dependency.
+
 ```
 Proving on Apple M3 Max:
-  ML-KEM-768  : 1.40 s,  331 MB peak, 4,244 KiB proof, 12.7 ms verify
-  ML-DSA-44   : 2.43 s,  294 MB peak, 5,151 KiB proof, 18.2 ms verify
-  ML-DSA-65   : 2.54 s,  294 MB peak, 5,169 KiB proof, 20.0 ms verify
-  ML-DSA-87   : 3.98 s,  580 MB peak, 8,645 KiB proof, 21.5 ms verify
+  ML-KEM-768  : 626 ms, 459 MiB peak, 3,576 KiB proof, 23.2 ms verify
+  ML-DSA-44   : 926 ms, 459 MiB peak, 4,403 KiB proof, 30.1 ms verify
+  ML-DSA-65   : 969 ms, 478 MiB peak, 4,436 KiB proof, 30.5 ms verify
+  ML-DSA-87   : 1.50 s, 869 MiB peak, 5,922 KiB proof, 32.0 ms verify
 ```
 
 ---

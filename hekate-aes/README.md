@@ -12,8 +12,8 @@ S-box ROM chiplet for the GF(2^8) inversion. Round-AIR trace is wired to the CPU
 
 ```
 Per-block proving cost (Apple M3 Max, 31,250 blocks per run):
-  AES-128: ~69 µs/block, 772 MB peak, 3,405 KiB proof
-  AES-256: ~73 µs/block, 1,005 MB peak, 3,706 KiB proof
+  AES-128: ~46 µs/block, 1,182 MiB peak, 5,628 KiB proof, 18.8 ms verify
+  AES-256: ~50 µs/block, 1,480 MiB peak, 5,962 KiB proof, 18.9 ms verify
 ```
 
 ## Examples
