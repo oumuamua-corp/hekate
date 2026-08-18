@@ -9,13 +9,14 @@ use flatbuffers::FlatBufferBuilder;
 use hekate_core::errors::Result;
 use hekate_core::poly::UnivariatePoly;
 use hekate_core::proofs::{
-    BrakedownCommitment, BrakedownProof, EvalBatchProof, InnerProof, LogUpAux, SumcheckProof,
+    BrakedownCommitment, BrakedownProof, EvalBatchProof, InnerProof, LogUpAux, OuterOpening,
+    OuterProof, SumcheckProof,
 };
 use hekate_math::TowerField;
 
 use crate::generated::proof as fb;
 
-const WIRE_PROOF_VERSION: u32 = 4;
+const WIRE_PROOF_VERSION: u32 = 5;
 
 pub fn serialize_proof<'a, F: TowerField>(
     fbb: &mut FlatBufferBuilder<'a>,
@@ -54,6 +55,9 @@ pub fn serialize_proof<'a, F: TowerField>(
         .collect();
     let cep = fbb.create_vector(&cep_offsets);
 
+    let pad_root = proof.pad_root.map(|r| fbb.create_vector(&r));
+    let outer = proof.outer.as_ref().map(|o| serialize_outer(fbb, o));
+
     fb::Proof::create(
         fbb,
         &fb::ProofArgs {
@@ -66,6 +70,70 @@ pub fn serialize_proof<'a, F: TowerField>(
             chiplet_zerocheck_proofs: Some(czc),
             chiplet_logup_aux: Some(cla),
             chiplet_eval_proofs: Some(cep),
+            pad_root,
+            outer,
+        },
+    )
+}
+
+fn serialize_outer_opening<'a, F: TowerField>(
+    fbb: &mut FlatBufferBuilder<'a>,
+    opening: &OuterOpening<F>,
+) -> flatbuffers::WIPOffset<fb::OuterOpening<'a>> {
+    let columns = fbb.create_vector(&opening.columns);
+
+    let values: Vec<fb::Block128> = opening
+        .values
+        .iter()
+        .map(|f| block128_from_field(f))
+        .collect();
+    let values = fbb.create_vector(&values);
+
+    let mut flat_siblings = Vec::with_capacity(opening.siblings.len() * 32);
+    for hash in &opening.siblings {
+        flat_siblings.extend_from_slice(hash);
+    }
+
+    let siblings = fbb.create_vector(&flat_siblings);
+
+    fb::OuterOpening::create(
+        fbb,
+        &fb::OuterOpeningArgs {
+            columns: Some(columns),
+            values: Some(values),
+            siblings: Some(siblings),
+        },
+    )
+}
+
+fn serialize_outer<'a, F: TowerField>(
+    fbb: &mut FlatBufferBuilder<'a>,
+    outer: &OuterProof<F>,
+) -> flatbuffers::WIPOffset<fb::OuterProof<'a>> {
+    let aux_root = fbb.create_vector(&outer.aux_root);
+
+    let field_vec = |fbb: &mut FlatBufferBuilder<'a>, values: &[F]| {
+        let blocks: Vec<fb::Block128> = values.iter().map(|f| block128_from_field(f)).collect();
+
+        fbb.create_vector(&blocks)
+    };
+
+    let interleaved = field_vec(fbb, &outer.interleaved);
+    let linear = field_vec(fbb, &outer.linear);
+    let quadratic = field_vec(fbb, &outer.quadratic);
+
+    let pad_opening = serialize_outer_opening(fbb, &outer.pad_opening);
+    let aux_opening = serialize_outer_opening(fbb, &outer.aux_opening);
+
+    fb::OuterProof::create(
+        fbb,
+        &fb::OuterProofArgs {
+            aux_root: Some(aux_root),
+            interleaved: Some(interleaved),
+            linear: Some(linear),
+            quadratic: Some(quadratic),
+            pad_opening: Some(pad_opening),
+            aux_opening: Some(aux_opening),
         },
     )
 }
@@ -153,6 +221,26 @@ pub fn deserialize_proof<F: TowerField>(bytes: &[u8]) -> Result<InnerProof<F>> {
         None => Vec::new(),
     };
 
+    let pad_root = match fb_proof.pad_root() {
+        None => None,
+        Some(bytes) => {
+            let raw = bytes.bytes();
+            if raw.len() != 32 {
+                return Err(wire_err("pad_root must be 32 bytes"));
+            }
+
+            let mut root = [0u8; 32];
+            root.copy_from_slice(raw);
+
+            Some(root)
+        }
+    };
+
+    let outer = fb_proof
+        .outer()
+        .map(|o| deserialize_outer::<F>(o))
+        .transpose()?;
+
     Ok(InnerProof {
         trace_commitment,
         zerocheck_proof,
@@ -162,6 +250,95 @@ pub fn deserialize_proof<F: TowerField>(bytes: &[u8]) -> Result<InnerProof<F>> {
         chiplet_zerocheck_proofs,
         chiplet_logup_aux,
         chiplet_eval_proofs,
+        pad_root,
+        outer,
+    })
+}
+
+fn deserialize_field_vec<F: TowerField>(
+    v: Option<flatbuffers::Vector<'_, fb::Block128>>,
+) -> Result<Vec<F>> {
+    match v {
+        Some(v) => {
+            let mut out = Vec::with_capacity(v.len());
+            for i in 0..v.len() {
+                out.push(field_from_block128::<F>(*v.get(i))?);
+            }
+
+            Ok(out)
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+fn deserialize_hashes(
+    data: Option<flatbuffers::Vector<'_, u8>>,
+    what: &'static str,
+) -> Result<Vec<[u8; 32]>> {
+    match data {
+        Some(data) => {
+            let bytes = data.bytes();
+            if !bytes.len().is_multiple_of(32) {
+                return Err(wire_err(what));
+            }
+
+            Ok(bytes
+                .chunks_exact(32)
+                .map(|c| {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(c);
+
+                    h
+                })
+                .collect())
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+fn deserialize_outer_opening<F: TowerField>(fb: fb::OuterOpening<'_>) -> Result<OuterOpening<F>> {
+    let columns = match fb.columns() {
+        Some(v) => v.iter().collect(),
+        None => Vec::new(),
+    };
+
+    Ok(OuterOpening {
+        columns,
+        values: deserialize_field_vec::<F>(fb.values())?,
+        siblings: deserialize_hashes(fb.siblings(), "outer siblings length not a multiple of 32")?,
+    })
+}
+
+fn deserialize_outer<F: TowerField>(fb: fb::OuterProof<'_>) -> Result<OuterProof<F>> {
+    let aux_root = match fb.aux_root() {
+        Some(bytes) if bytes.len() == 32 => {
+            let mut root = [0u8; 32];
+            root.copy_from_slice(bytes.bytes());
+
+            root
+        }
+        _ => return Err(wire_err("outer aux_root must be 32 bytes")),
+    };
+
+    let pad_opening = fb
+        .pad_opening()
+        .map(|o| deserialize_outer_opening::<F>(o))
+        .transpose()?
+        .ok_or(wire_err("missing outer pad_opening"))?;
+
+    let aux_opening = fb
+        .aux_opening()
+        .map(|o| deserialize_outer_opening::<F>(o))
+        .transpose()?
+        .ok_or(wire_err("missing outer aux_opening"))?;
+
+    Ok(OuterProof {
+        aux_root,
+        interleaved: deserialize_field_vec::<F>(fb.interleaved())?,
+        linear: deserialize_field_vec::<F>(fb.linear())?,
+        quadratic: deserialize_field_vec::<F>(fb.quadratic())?,
+        pad_opening,
+        aux_opening,
     })
 }
 

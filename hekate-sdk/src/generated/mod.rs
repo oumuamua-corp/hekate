@@ -3,9 +3,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 #[allow(unused_imports, clippy::all, dead_code)]
+#[rustfmt::skip]
 mod hekate_program_generated;
 
 #[allow(unused_imports, clippy::all, dead_code)]
+#[rustfmt::skip]
 mod hekate_proof_generated;
 
 pub use hekate_program_generated::hekate::wire as program;

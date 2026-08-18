@@ -3773,11 +3773,11 @@ pub mod hekate {
         }
 
         impl<'a> Config<'a> {
-            pub const VT_INV_RATE: ::flatbuffers::VOffsetT = 4;
-            pub const VT_NUM_QUERIES: ::flatbuffers::VOffsetT = 6;
-            pub const VT_SUMCHECK_BLINDING_FACTOR: ::flatbuffers::VOffsetT = 8;
-            pub const VT_LDT_SUPPORT_SIZE: ::flatbuffers::VOffsetT = 10;
-            pub const VT_MIN_SECURITY_BITS: ::flatbuffers::VOffsetT = 12;
+            pub const VT_NUM_QUERIES: ::flatbuffers::VOffsetT = 4;
+            pub const VT_LDT_SUPPORT_SIZE: ::flatbuffers::VOffsetT = 6;
+            pub const VT_MIN_SECURITY_BITS: ::flatbuffers::VOffsetT = 8;
+            pub const VT_OUTER_QUERIES: ::flatbuffers::VOffsetT = 10;
+            pub const VT_ZERO_KNOWLEDGE: ::flatbuffers::VOffsetT = 12;
 
             #[inline]
             pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -3794,21 +3794,14 @@ pub mod hekate {
                 args: &'args ConfigArgs,
             ) -> ::flatbuffers::WIPOffset<Config<'bldr>> {
                 let mut builder = ConfigBuilder::new(_fbb);
+                builder.add_outer_queries(args.outer_queries);
                 builder.add_min_security_bits(args.min_security_bits);
                 builder.add_ldt_support_size(args.ldt_support_size);
-                builder.add_sumcheck_blinding_factor(args.sumcheck_blinding_factor);
                 builder.add_num_queries(args.num_queries);
-                builder.add_inv_rate(args.inv_rate);
+                builder.add_zero_knowledge(args.zero_knowledge);
                 builder.finish()
             }
 
-            #[inline]
-            pub fn inv_rate(&self) -> u32 {
-                // Safety:
-                // Created from valid Table for this object
-                // which contains a valid value in this slot
-                unsafe { self._tab.get::<u32>(Config::VT_INV_RATE, Some(0)).unwrap() }
-            }
             #[inline]
             pub fn num_queries(&self) -> u32 {
                 // Safety:
@@ -3817,17 +3810,6 @@ pub mod hekate {
                 unsafe {
                     self._tab
                         .get::<u32>(Config::VT_NUM_QUERIES, Some(0))
-                        .unwrap()
-                }
-            }
-            #[inline]
-            pub fn sumcheck_blinding_factor(&self) -> u32 {
-                // Safety:
-                // Created from valid Table for this object
-                // which contains a valid value in this slot
-                unsafe {
-                    self._tab
-                        .get::<u32>(Config::VT_SUMCHECK_BLINDING_FACTOR, Some(0))
                         .unwrap()
                 }
             }
@@ -3853,6 +3835,28 @@ pub mod hekate {
                         .unwrap()
                 }
             }
+            #[inline]
+            pub fn outer_queries(&self) -> u32 {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<u32>(Config::VT_OUTER_QUERIES, Some(0))
+                        .unwrap()
+                }
+            }
+            #[inline]
+            pub fn zero_knowledge(&self) -> bool {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<bool>(Config::VT_ZERO_KNOWLEDGE, Some(false))
+                        .unwrap()
+                }
+            }
         }
 
         impl ::flatbuffers::Verifiable for Config<'_> {
@@ -3862,35 +3866,31 @@ pub mod hekate {
                 pos: usize,
             ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
                 v.visit_table(pos)?
-                    .visit_field::<u32>("inv_rate", Self::VT_INV_RATE, false)?
                     .visit_field::<u32>("num_queries", Self::VT_NUM_QUERIES, false)?
-                    .visit_field::<u32>(
-                        "sumcheck_blinding_factor",
-                        Self::VT_SUMCHECK_BLINDING_FACTOR,
-                        false,
-                    )?
                     .visit_field::<u32>("ldt_support_size", Self::VT_LDT_SUPPORT_SIZE, false)?
                     .visit_field::<u32>("min_security_bits", Self::VT_MIN_SECURITY_BITS, false)?
+                    .visit_field::<u32>("outer_queries", Self::VT_OUTER_QUERIES, false)?
+                    .visit_field::<bool>("zero_knowledge", Self::VT_ZERO_KNOWLEDGE, false)?
                     .finish();
                 Ok(())
             }
         }
         pub struct ConfigArgs {
-            pub inv_rate: u32,
             pub num_queries: u32,
-            pub sumcheck_blinding_factor: u32,
             pub ldt_support_size: u32,
             pub min_security_bits: u32,
+            pub outer_queries: u32,
+            pub zero_knowledge: bool,
         }
         impl<'a> Default for ConfigArgs {
             #[inline]
             fn default() -> Self {
                 ConfigArgs {
-                    inv_rate: 0,
                     num_queries: 0,
-                    sumcheck_blinding_factor: 0,
                     ldt_support_size: 0,
                     min_security_bits: 0,
+                    outer_queries: 0,
+                    zero_knowledge: false,
                 }
             }
         }
@@ -3901,21 +3901,9 @@ pub mod hekate {
         }
         impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> ConfigBuilder<'a, 'b, A> {
             #[inline]
-            pub fn add_inv_rate(&mut self, inv_rate: u32) {
-                self.fbb_.push_slot::<u32>(Config::VT_INV_RATE, inv_rate, 0);
-            }
-            #[inline]
             pub fn add_num_queries(&mut self, num_queries: u32) {
                 self.fbb_
                     .push_slot::<u32>(Config::VT_NUM_QUERIES, num_queries, 0);
-            }
-            #[inline]
-            pub fn add_sumcheck_blinding_factor(&mut self, sumcheck_blinding_factor: u32) {
-                self.fbb_.push_slot::<u32>(
-                    Config::VT_SUMCHECK_BLINDING_FACTOR,
-                    sumcheck_blinding_factor,
-                    0,
-                );
             }
             #[inline]
             pub fn add_ldt_support_size(&mut self, ldt_support_size: u32) {
@@ -3926,6 +3914,16 @@ pub mod hekate {
             pub fn add_min_security_bits(&mut self, min_security_bits: u32) {
                 self.fbb_
                     .push_slot::<u32>(Config::VT_MIN_SECURITY_BITS, min_security_bits, 0);
+            }
+            #[inline]
+            pub fn add_outer_queries(&mut self, outer_queries: u32) {
+                self.fbb_
+                    .push_slot::<u32>(Config::VT_OUTER_QUERIES, outer_queries, 0);
+            }
+            #[inline]
+            pub fn add_zero_knowledge(&mut self, zero_knowledge: bool) {
+                self.fbb_
+                    .push_slot::<bool>(Config::VT_ZERO_KNOWLEDGE, zero_knowledge, false);
             }
             #[inline]
             pub fn new(
@@ -3947,11 +3945,11 @@ pub mod hekate {
         impl ::core::fmt::Debug for Config<'_> {
             fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
                 let mut ds = f.debug_struct("Config");
-                ds.field("inv_rate", &self.inv_rate());
                 ds.field("num_queries", &self.num_queries());
-                ds.field("sumcheck_blinding_factor", &self.sumcheck_blinding_factor());
                 ds.field("ldt_support_size", &self.ldt_support_size());
                 ds.field("min_security_bits", &self.min_security_bits());
+                ds.field("outer_queries", &self.outer_queries());
+                ds.field("zero_knowledge", &self.zero_knowledge());
                 ds.finish()
             }
         }
