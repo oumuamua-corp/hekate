@@ -10,8 +10,8 @@ use alloc::vec::Vec;
 use hekate_core::config::Config;
 use hekate_core::errors;
 use hekate_core::ligero::{
-    Opening, RowEncoder, encode_weights, verify_interleaved, verify_linear, verify_opening,
-    verify_quadratic,
+    Opening, ProductMask, RowEncoder, encode_weights, verify_interleaved, verify_linear,
+    verify_opening, verify_quadratic,
 };
 use hekate_core::proofs::{InnerProof, OuterOpening};
 use hekate_core::protocol;
@@ -72,6 +72,7 @@ where
     let geom = config.outer_geom(statement.masked_scalars, statement.mul_wires, field_bits)?;
     let layout = OuterLayout::new(&geom, statement.masked_scalars, statement.mul_wires)?;
     let encoder = RowEncoder::<F>::new(&geom)?;
+    let vanisher = encoder.message_vanisher()?;
 
     transcript.append_message(b"aux_root", &outer.aux_root);
 
@@ -151,12 +152,18 @@ where
     let batch = linear_weights(&layout, &rows, &r_lin)?;
     let encoded = encode_weights(&encoder, batch.weights)?;
 
+    let linear_mask = ProductMask {
+        low: layout.linear_mask(),
+        high: layout.linear_mask_hi(),
+        vanisher: &vanisher,
+    };
+
     if !verify_linear(
         &encoder,
         &to_flat(&outer.linear),
         &encoded,
         &batch.rows,
-        layout.linear_mask(),
+        &linear_mask,
         batch.target,
         &stacked,
     ) {
@@ -164,12 +171,18 @@ where
         return Ok(false);
     }
 
+    let quadratic_mask = ProductMask {
+        low: layout.quadratic_mask(),
+        high: layout.quadratic_mask_hi(),
+        vanisher: &vanisher,
+    };
+
     if !verify_quadratic(
         &encoder,
         &to_flat(&outer.quadratic),
         &triples,
         &to_flat(&r_quad),
-        layout.quadratic_mask(),
+        &quadratic_mask,
         layout.message_len,
         &stacked,
     ) {

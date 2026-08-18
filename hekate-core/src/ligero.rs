@@ -5,6 +5,7 @@
 use crate::errors::{Error, Result};
 use crate::outer::OuterGeometry;
 use crate::proofs::OuterOpening;
+use alloc::vec;
 use alloc::vec::Vec;
 use hekate_crypto::Hasher;
 use hekate_crypto::merkle::MerkleTree;
@@ -12,6 +13,24 @@ use hekate_math::fft::vanish_eval;
 use hekate_math::{AdditiveFft, BinaryFieldExtras, Flat, HardwareField, TowerField};
 
 const MAX_LOG: u32 = 63;
+
+/// Mask of a product-code response: `low` covers
+/// degrees `< k`, `high` rides `vanisher` for the rest.
+pub struct ProductMask<'a, F> {
+    pub low: usize,
+    pub high: usize,
+    pub vanisher: &'a [Flat<F>],
+}
+
+impl<F: TowerField + HardwareField> ProductMask<'_, F> {
+    pub fn covers(&self, rows: usize) -> bool {
+        self.low < rows && self.high < rows
+    }
+
+    pub fn at(&self, col: usize, values: &[Flat<F>]) -> Flat<F> {
+        values[self.low] + self.vanisher[col] * values[self.high]
+    }
+}
 
 pub struct RowEncoder<F> {
     message: AdditiveFft<F>,
@@ -114,6 +133,29 @@ impl<F: BinaryFieldExtras + HardwareField> RowEncoder<F> {
             .all(|c| *c == Flat::from_raw(F::ZERO)))
     }
 
+    /// `Z_k` on the code domain.
+    pub fn message_vanisher(&self) -> Result<Vec<Flat<F>>> {
+        let zero = Flat::from_raw(F::ZERO);
+        let mut buf = vec![zero; self.domain_len];
+
+        buf[self.code_len] = Flat::from_raw(F::ONE);
+
+        self.code
+            .forward_coset_scalar(&mut buf, self.code_shift)
+            .map_err(|_| Error::Protocol {
+                protocol: "ligero",
+                message: "vanisher evaluation rejected its length",
+            })?;
+
+        match self.message_evaluations(&buf)? {
+            Some(evals) if evals[..self.code_len].iter().all(|v| *v == zero) => Ok(buf),
+            _ => Err(Error::Protocol {
+                protocol: "ligero",
+                message: "novel basis element k does not vanish on the message domain",
+            }),
+        }
+    }
+
     pub fn message_evaluations(&self, values: &[Flat<F>]) -> Result<Option<Vec<Flat<F>>>> {
         if values.len() != self.domain_len {
             return Err(Error::Protocol {
@@ -133,9 +175,10 @@ impl<F: BinaryFieldExtras + HardwareField> RowEncoder<F> {
 
         let product_len = 2 * self.code_len;
 
-        // A product of two degree-<k rows has degree <= 2k-2
+        // Products of two degree-<k rows and the mask
+        // term `Z_k · u` both sit in dimension 2k
         if product_len > self.domain_len
-            || coeffs[product_len - 1..]
+            || coeffs[product_len..]
                 .iter()
                 .any(|c| *c != Flat::from_raw(F::ZERO))
         {
@@ -329,11 +372,14 @@ pub fn verify_linear<F: BinaryFieldExtras + HardwareField + TowerField>(
     response: &[Flat<F>],
     encoded_weights: &[Vec<Flat<F>>],
     rows_used: &[usize],
-    mask: usize,
+    mask: &ProductMask<'_, F>,
     target: Flat<F>,
     opening: &Opening<F>,
 ) -> bool {
-    if response.len() != encoder.domain_len() || encoded_weights.len() != rows_used.len() {
+    if response.len() != encoder.domain_len()
+        || mask.vanisher.len() != encoder.domain_len()
+        || encoded_weights.len() != rows_used.len()
+    {
         return false;
     }
 
@@ -343,12 +389,11 @@ pub fn verify_linear<F: BinaryFieldExtras + HardwareField + TowerField>(
     }
 
     opening.columns.iter().all(|(col, values)| {
-        if mask >= values.len() || rows_used.iter().any(|&r| r >= values.len()) {
+        if !mask.covers(values.len()) || rows_used.iter().any(|&r| r >= values.len()) {
             return false;
         }
 
-        let mut acc = values[mask];
-
+        let mut acc = mask.at(*col, values);
         for (weights, &row) in encoded_weights.iter().zip(rows_used) {
             acc += weights[*col] * values[row];
         }
@@ -362,11 +407,14 @@ pub fn verify_quadratic<F: BinaryFieldExtras + HardwareField + TowerField>(
     response: &[Flat<F>],
     triples: &[[usize; 3]],
     r_quad: &[Flat<F>],
-    mask: usize,
+    mask: &ProductMask<'_, F>,
     message_len: usize,
     opening: &Opening<F>,
 ) -> bool {
-    if response.len() != encoder.domain_len() || r_quad.len() != triples.len() {
+    if response.len() != encoder.domain_len()
+        || mask.vanisher.len() != encoder.domain_len()
+        || r_quad.len() != triples.len()
+    {
         return false;
     }
 
@@ -375,12 +423,11 @@ pub fn verify_quadratic<F: BinaryFieldExtras + HardwareField + TowerField>(
     }
 
     opening.columns.iter().all(|(col, values)| {
-        if mask >= values.len() || triples.iter().flatten().any(|&r| r >= values.len()) {
+        if !mask.covers(values.len()) || triples.iter().flatten().any(|&r| r >= values.len()) {
             return false;
         }
 
-        let mut acc = values[mask];
-
+        let mut acc = mask.at(*col, values);
         for (t, [x, y, z]) in triples.iter().enumerate() {
             acc += r_quad[t] * (values[*x] * values[*y] - values[*z]);
         }

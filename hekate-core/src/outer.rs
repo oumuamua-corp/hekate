@@ -7,11 +7,14 @@ use crate::errors;
 use alloc::vec::Vec;
 use hekate_crypto::Hasher;
 use hekate_math::{Flat, HardwareField, TowerField};
+use zeroize::Zeroize;
+#[cfg(feature = "secure-memory")]
+use zeroize::ZeroizeOnDrop;
 
-/// One mask row per test:
-/// interleaved, zero-sum linear, zero-vector
-/// quadratic (Ligero 2017 Fig 8-11).
-pub const OUTER_MASK_ROWS: usize = 3;
+/// Interleaved, then a low/high pair per
+/// product-code test: zero-sum linear,
+/// zero-vector quadratic (Ligero 2017 Fig 8-11).
+pub const OUTER_MASK_ROWS: usize = 5;
 
 /// Wires `x`, `y`, `z` of one Hadamard row.
 pub const OUTER_WIRES_PER_MUL: usize = 3;
@@ -41,8 +44,12 @@ pub struct OuterGeometry {
     pub queries: usize,
 }
 
-pub struct Pad<F> {
+#[derive(Zeroize)]
+#[cfg_attr(feature = "secure-memory", derive(ZeroizeOnDrop))]
+pub struct Pad<F: TowerField> {
     values: Vec<Flat<F>>,
+
+    #[zeroize(skip)]
     next: usize,
 }
 
@@ -96,7 +103,7 @@ impl<F: TowerField + From<u128>> Pad<F> {
     }
 }
 
-pub enum Masking<'a, F> {
+pub enum Masking<'a, F: TowerField> {
     Off,
     On(&'a mut Pad<F>),
 }

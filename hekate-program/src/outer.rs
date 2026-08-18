@@ -194,7 +194,7 @@ impl OuterStatement {
 }
 
 /// Oracle row order: pad, then the `Lhs`, `Rhs` and
-/// `Product` wire blocks, then the three mask rows.
+/// `Product` wire blocks, then the five mask rows.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OuterLayout {
     pub message_len: usize,
@@ -251,8 +251,16 @@ impl OuterLayout {
         self.interleaved_mask() + 1
     }
 
-    pub fn quadratic_mask(&self) -> usize {
+    pub fn linear_mask_hi(&self) -> usize {
         self.interleaved_mask() + 2
+    }
+
+    pub fn quadratic_mask(&self) -> usize {
+        self.interleaved_mask() + 3
+    }
+
+    pub fn quadratic_mask_hi(&self) -> usize {
+        self.interleaved_mask() + 4
     }
 
     pub fn total_rows(&self) -> usize {
@@ -1006,10 +1014,10 @@ pub fn build_pad_rows<F: TowerField + HardwareField>(
     Ok(rows)
 }
 
-/// AUX oracle rows: the wire blocks and the three mask
+/// AUX oracle rows: the wire blocks and the five mask
 /// rows, `filler` on every message tail, then the
 /// zero-sum mask row's first `code_len - 1` cells and
-/// the interleaved mask row's message.
+/// the messages of the interleaved and both high masks.
 pub fn build_aux_rows<F: TowerField + HardwareField>(
     layout: &OuterLayout,
     wires: &[[Flat<F>; 3]],
@@ -1046,7 +1054,7 @@ pub fn build_aux_rows<F: TowerField + HardwareField>(
         row[layout.message_len..code_len].copy_from_slice(fill);
     }
 
-    let (zero_sum_fill, interleaved_fill) = rest.split_at(code_len - 1);
+    let (zero_sum_fill, rest) = rest.split_at(code_len - 1);
 
     let zero_sum = layout.linear_mask() - layout.pad_rows;
     let mut acc = Flat::from_raw(F::ZERO);
@@ -1058,8 +1066,20 @@ pub fn build_aux_rows<F: TowerField + HardwareField>(
 
     rows[zero_sum][code_len - 1] = acc;
 
-    let interleaved = layout.interleaved_mask() - layout.pad_rows;
-    rows[interleaved][..layout.message_len].copy_from_slice(interleaved_fill);
+    // The quadratic mask keeps its zero message; every
+    // other mask row is uniform over the whole message.
+    let uniform = [
+        layout.interleaved_mask(),
+        layout.linear_mask_hi(),
+        layout.quadratic_mask_hi(),
+    ];
+
+    for (row, fill) in uniform
+        .into_iter()
+        .zip(rest.chunks_exact(layout.message_len))
+    {
+        rows[row - layout.pad_rows][..layout.message_len].copy_from_slice(fill);
+    }
 
     Ok(rows)
 }
@@ -1067,7 +1087,7 @@ pub fn build_aux_rows<F: TowerField + HardwareField>(
 pub fn aux_filler_len(layout: &OuterLayout, code_len: usize) -> usize {
     let count = layout.total_rows() - layout.pad_rows;
 
-    count * (code_len - layout.message_len) + code_len - 1 + layout.message_len
+    count * (code_len - layout.message_len) + code_len - 1 + 3 * layout.message_len
 }
 
 pub fn linear_weights<F: TowerField + HardwareField>(
@@ -1539,7 +1559,7 @@ mod tests {
                 assert!(r < layout.interleaved_mask());
             }
 
-            assert_eq!(layout.total_rows(), layout.quadratic_mask() + 1);
+            assert_eq!(layout.total_rows(), layout.quadratic_mask_hi() + 1);
         }
     }
 
@@ -1562,13 +1582,18 @@ mod tests {
         let rows = build_aux_rows(&layout, &triples, geom.code_len, &filler).unwrap();
 
         let zero = Flat::from_raw(F::ZERO);
-        let interleaved = layout.interleaved_mask() - layout.pad_rows;
 
-        assert!(
-            rows[interleaved][..layout.message_len]
-                .iter()
-                .all(|v| *v != zero)
-        );
+        for mask in [
+            layout.interleaved_mask(),
+            layout.linear_mask_hi(),
+            layout.quadratic_mask_hi(),
+        ] {
+            assert!(
+                rows[mask - layout.pad_rows][..layout.message_len]
+                    .iter()
+                    .all(|v| *v != zero)
+            );
+        }
 
         let quadratic = layout.quadratic_mask() - layout.pad_rows;
         assert!(
