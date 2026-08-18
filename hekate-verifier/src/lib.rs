@@ -311,10 +311,6 @@ where
             });
         }
 
-        if let Some(root) = proof.pad_root.as_ref() {
-            transcript.append_message(b"pad_root", root);
-        }
-
         let mut pad_cursor = config.zero_knowledge.then(PadCursor::default);
         let mut records: Vec<TableRecord<F>> = Vec::new();
 
@@ -322,6 +318,12 @@ where
         // PHASE 2: COMMIT EACH CHIPLET (absorb roots)
         // =========================================================
         Self::verify_chiplet_commitments_only(&chiplet_tables, proof, transcript);
+
+        // Derived after every root,
+        // bound before any challenge.
+        if let Some(root) = proof.pad_root.as_ref() {
+            transcript.append_message(b"pad_root", root);
+        }
 
         // =========================================================
         // PHASE 3: DRAW GLOBAL γ, β, AND r_bus PER LOOKUP BUS
