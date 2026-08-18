@@ -20,7 +20,10 @@ use permutation::PermutationCheckSpec;
 pub mod chiplet;
 pub mod constraint;
 pub mod expander;
+pub mod linearized;
+pub mod outer;
 pub mod permutation;
+pub mod predicate;
 pub mod schema;
 
 // =================================================================

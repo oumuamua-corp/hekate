@@ -6,6 +6,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use hekate_core::errors;
+use hekate_math::{Flat, HardwareField, TowerField};
 
 /// Challenge label for Fiat-Shamir transcript.
 pub type ChallengeLabel = &'static [u8];
@@ -348,6 +349,44 @@ pub fn accumulate_lookup_heights(
             *entry = (*entry).max(table_rows);
         }
     }
+}
+
+/// MLE of `Source::RowIndexLeBytes` at `r_final`. Linear
+/// in `r_final` because `F::from` is XOR-additive over char-2.
+pub fn eval_row_idx_le_mle<F>(num_bytes: usize, r_final: &[Flat<F>]) -> Flat<F>
+where
+    F: TowerField + HardwareField + From<u128>,
+{
+    let total_bits = (num_bytes.min(8) * 8).min(r_final.len());
+    let mut acc = Flat::from_raw(F::ZERO);
+
+    for (i, r) in r_final.iter().enumerate().take(total_bits) {
+        acc += F::from(1u128 << i).to_hardware() * *r;
+    }
+
+    acc
+}
+
+/// MLE of `Source::RowIndexByte` at `r_final`.
+/// Same char-2 shortcut as `eval_row_idx_le_mle`,
+/// restricted to one byte.
+pub fn eval_row_idx_byte_mle<F>(byte_idx: usize, r_final: &[Flat<F>]) -> Flat<F>
+where
+    F: TowerField + HardwareField + From<u128>,
+{
+    let bit_start = byte_idx.saturating_mul(8);
+    if bit_start >= r_final.len() {
+        return Flat::from_raw(F::ZERO);
+    }
+
+    let end = (bit_start + 8).min(r_final.len());
+    let mut acc = Flat::from_raw(F::ZERO);
+
+    for (j, i) in (bit_start..end).enumerate() {
+        acc += F::from(1u128 << j).to_hardware() * r_final[i];
+    }
+
+    acc
 }
 
 #[cfg(test)]
