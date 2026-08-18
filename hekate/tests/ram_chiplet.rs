@@ -206,7 +206,7 @@ fn ram_cpu_linking() {
     let config = Config {
         num_queries: 4,
         min_security_bits: 0,
-        sumcheck_blinding_factor: 2, // Enable ZK
+        zero_knowledge: true,
         ldt_support_size: 4,
         ..Config::default()
     };
@@ -364,7 +364,7 @@ fn exploit_ram_consistency_bypass() {
     let config = Config {
         num_queries: 4,
         min_security_bits: 0,
-        sumcheck_blinding_factor: 0, // No ZK to simplify debugging
+        zero_knowledge: false, // No ZK to simplify debugging
         ldt_support_size: 4,
         ..Config::default()
     };
@@ -533,7 +533,7 @@ fn exploit_ram_uninitialised_read_via_q_last_chain() {
     let config = Config {
         num_queries: 4,
         min_security_bits: 0,
-        sumcheck_blinding_factor: 0,
+        zero_knowledge: false,
         ldt_support_size: 4,
         ..Config::default()
     };

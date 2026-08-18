@@ -194,7 +194,7 @@ fn main() {
     let num_rows = 1 << num_vars;
 
     let config = Config {
-        sumcheck_blinding_factor: 0,
+        zero_knowledge: false,
         ..Config::default()
     };
 
@@ -202,10 +202,7 @@ fn main() {
     OsRng.try_fill_bytes(&mut blinding_seed).unwrap();
 
     println!("Rows: 2^{} (~{} million)", num_vars, num_rows / 1_000_000);
-    println!(
-        "ZK Blinding: {} virtual columns",
-        config.sumcheck_blinding_factor
-    );
+    println!("Zero-knowledge: {}", config.zero_knowledge);
 
     let trace = common::phase("Trace Generation", || generate_fib_trace(num_vars).unwrap());
 

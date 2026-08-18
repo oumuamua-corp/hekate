@@ -340,7 +340,7 @@ fn main() {
     let ram_num_vars = ram_num_rows.trailing_zeros() as usize;
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::default()
     };
 

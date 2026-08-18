@@ -281,7 +281,7 @@ fn prove_and_verify(ops: &[NttOp], label: &str) -> bool {
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(vec![ntt_trace, twiddle_trace]);
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::dev()
     };
 
@@ -379,7 +379,7 @@ where
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(chiplet_traces);
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::dev()
     };
 
@@ -689,7 +689,7 @@ fn exploit_wrong_twiddle() {
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(vec![ntt_trace, twiddle_trace]);
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::dev()
     };
 

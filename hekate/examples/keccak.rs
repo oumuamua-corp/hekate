@@ -195,7 +195,7 @@ fn main() {
     let num_rows = 1 << num_vars;
 
     let config = Config {
-        sumcheck_blinding_factor: 2, // Enable ZK
+        zero_knowledge: true,
         ..Config::default()
     };
 

@@ -177,7 +177,7 @@ fn run(cpu_input: [u64; 25], cpu_output: [u64; 25], chiplet: ColumnTrace) -> boo
         ProgramWitness::new(cpu_trace(cpu_input, cpu_output)).with_chiplets(vec![chiplet]);
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::dev()
     };
 

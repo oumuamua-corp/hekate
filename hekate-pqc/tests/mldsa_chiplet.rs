@@ -193,7 +193,7 @@ fn prove_and_verify_mldsa(
     }
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::default()
     };
 
@@ -329,7 +329,7 @@ where
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(chiplet_traces);
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::default()
     };
 

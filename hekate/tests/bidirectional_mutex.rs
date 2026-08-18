@@ -200,7 +200,7 @@ fn run(
     let config = Config {
         num_queries: 4,
         min_security_bits: 0,
-        sumcheck_blinding_factor: 0,
+        zero_knowledge: false,
         ldt_support_size: 4,
         ..Config::default()
     };
@@ -442,7 +442,7 @@ fn paired_air_constraint_ast_mutated_post_prove_rejected() {
     let config = Config {
         num_queries: 4,
         min_security_bits: 0,
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ldt_support_size: 4,
         ..Config::default()
     };
@@ -606,7 +606,7 @@ fn chiplet_paired_bus_without_mutex_root_rejected_at_verify() {
     let config = Config {
         num_queries: 4,
         min_security_bits: 0,
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ldt_support_size: 4,
         ..Config::default()
     };

@@ -165,7 +165,7 @@ fn prove_and_verify<P: Program<F> + Air<F>>(
     // Phase 3:
     // Prove
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::default()
     };
 

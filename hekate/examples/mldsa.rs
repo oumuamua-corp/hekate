@@ -174,7 +174,7 @@ fn run_mldsa(label: &str, level: MlDsaLevel, pk_bytes: &[u8], sig_bytes: &[u8], 
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(chiplet_traces);
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::default()
     };
 
