@@ -6,7 +6,8 @@ use hekate::core::config::Config;
 use hekate::core::trace::{ColumnTrace, ColumnType, TraceColumn};
 use hekate::crypto::DefaultHasher;
 use hekate::crypto::transcript::Transcript;
-use hekate::math::{Block128, HardwareField, TowerField};
+use hekate::math::{Block128, Flat, HardwareField, TowerField};
+use hekate_core::poly::PolyVariant;
 use hekate_core::trace::{IntoTraceColumn, Trace, TraceBuilder};
 use hekate_core::utils::compute_split_vars;
 use hekate_math::{Bit, Block32};
@@ -99,6 +100,23 @@ fn generate_fib_trace(num_vars: usize) -> ColumnTrace {
     trace
 }
 
+fn column_mle_pair(trace: &ColumnTrace, col: usize, weights: &[Flat<F>]) -> (Flat<F>, Flat<F>) {
+    let num_rows = trace.num_rows().unwrap();
+
+    let mut base = Flat::from_raw(F::ZERO);
+    let mut next = Flat::from_raw(F::ZERO);
+
+    for (row, &weight) in weights.iter().enumerate().take(num_rows) {
+        let cur = trace.get_element::<F>(col, row).unwrap();
+        let nxt = trace.get_element::<F>(col, (row + 1) % num_rows).unwrap();
+
+        base += cur * weight;
+        next += nxt * weight;
+    }
+
+    (base, next)
+}
+
 #[test]
 fn noise_entropy_inspection() {
     // OBJECTIVE:
@@ -119,7 +137,7 @@ fn noise_entropy_inspection() {
     };
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ldt_support_size: 2,
         num_queries: 8,
         min_security_bits: 0,
@@ -151,7 +169,7 @@ fn noise_entropy_inspection() {
     let data_bytes_per_row = 4 + 4 + 4;
 
     // ZK Sumcheck noise is always Block128 (16 bytes).
-    let noise_bytes_per_row = config.sumcheck_blinding_factor * 16;
+    let noise_bytes_per_row = config.blind_units() * 16;
     let bytes_per_row = data_bytes_per_row + noise_bytes_per_row;
 
     // Calculate grid_rows based on the
@@ -246,7 +264,7 @@ fn seed_nondeterminism() {
     let instance = ProgramInstance::new(num_rows, vec![expected_pub]);
 
     let config_a = Config {
-        sumcheck_blinding_factor: 1,
+        zero_knowledge: true,
         num_queries: 8,
         min_security_bits: 0,
         ldt_support_size: 4,
@@ -257,7 +275,7 @@ fn seed_nondeterminism() {
     seed1[0] = 1;
 
     let config_b = Config {
-        sumcheck_blinding_factor: 1,
+        zero_knowledge: true,
         num_queries: 8,
         min_security_bits: 0,
         ldt_support_size: 4,
@@ -329,7 +347,7 @@ fn noise_integrity_check() {
     };
 
     let config = Config {
-        sumcheck_blinding_factor: 1,
+        zero_knowledge: true,
         ldt_support_size: 1,
         num_queries: 8,
         min_security_bits: 0,
@@ -356,7 +374,7 @@ fn noise_integrity_check() {
     // FibAir [B32, B32, Bit], each cell committed at
     // its rs_field width (Bit -> B32): 4 + 4 + 4 = 12.
     let data_bytes_per_row = (4 + 4 + 4) * 2;
-    let bytes_per_row = data_bytes_per_row + (config.sumcheck_blinding_factor * 16 * 2);
+    let bytes_per_row = data_bytes_per_row + (config.blind_units() * 16 * 2);
 
     // ATTACK:
     // maliciously corrupt the noise suffix
@@ -462,12 +480,12 @@ fn trust_me_bro_knowledge() {
     OsRng.try_fill_bytes(&mut blinding_seed).unwrap();
 
     // ==========================================
-    // ATTACK WITH ZK ENABLED (blinding_factor = 2)
+    // ATTACK WITH ZK ENABLED
     // ==========================================
     let config_zk = Config {
         num_queries: 8,
         min_security_bits: 0,
-        sumcheck_blinding_factor: 2, // ZK ACTIVATED
+        zero_knowledge: true,
         ldt_support_size: 2,
         ..Config::default()
     };
@@ -510,7 +528,7 @@ fn trust_me_bro_knowledge() {
     let config_no_zk = Config {
         num_queries: 8,
         min_security_bits: 0,
-        sumcheck_blinding_factor: 0, // ZK DISABLED
+        zero_knowledge: false,
         ldt_support_size: 1,
         ..Config::default()
     };
@@ -564,7 +582,7 @@ fn algebraic_and_evaluation_perfect_hiding() {
     };
 
     let config_no_zk = Config {
-        sumcheck_blinding_factor: 0,
+        zero_knowledge: false,
         ldt_support_size: 4,
         num_queries: 4,
         min_security_bits: 0,
@@ -572,7 +590,7 @@ fn algebraic_and_evaluation_perfect_hiding() {
     };
 
     let config_zk = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ldt_support_size: 4,
         num_queries: 4,
         min_security_bits: 0,
@@ -670,10 +688,8 @@ fn algebraic_and_evaluation_perfect_hiding() {
     );
 
     // GUARANTEE 3:
-    // Trace Evaluation Perfect Hiding
-    // The evaluations `trace_values` at r_final must
-    // be perfectly masked by AES noise. They must
-    // leak ZERO information about the underlying data.
+    // Seed dependence only:
+    // r_final differs across seeds.
     let eval_no_zk = &p_no_zk.eval_proof.point_evaluation.1;
     let eval_zk_a = &p_zk_a.eval_proof.point_evaluation.1;
     let eval_zk_b = &p_zk_b.eval_proof.point_evaluation.1;
@@ -686,7 +702,7 @@ fn algebraic_and_evaluation_perfect_hiding() {
     // produces seed-dependent round polys and
     // evaluations without any sumcheck masks.
     let config_only_ldt = Config {
-        sumcheck_blinding_factor: 0,
+        zero_knowledge: false,
         ldt_support_size: 8,
         num_queries: 4,
         min_security_bits: 0,
@@ -752,6 +768,74 @@ fn algebraic_and_evaluation_perfect_hiding() {
         eval_only_ldt_a, eval_only_ldt_b,
         "K=0/ldt>0: trace evaluations must diverge across seeds"
     );
+}
+
+/// Per column: `(claim, MLE(r_final))` for the
+/// base and next-row halves of the trace opening.
+fn point_evaluation_claims_vs_mle(zero_knowledge: bool) -> Vec<[(F, F); 2]> {
+    let num_vars = 6;
+    let num_rows = 1 << num_vars;
+    let trace = generate_fib_trace(num_vars);
+    let expected_pub = trace.get_element(1, num_rows - 1).unwrap().to_tower();
+    let instance = ProgramInstance::new(num_rows, vec![expected_pub]);
+    let witness = ProgramWitness::new(trace.clone());
+    let air = FibAir {
+        num_cols: 3,
+        num_rows,
+    };
+
+    let config = Config {
+        zero_knowledge,
+        ldt_support_size: 4,
+        num_queries: 4,
+        min_security_bits: 0,
+        ..Config::default()
+    };
+
+    let mut seed = [0u8; 32];
+    seed[0] = 7;
+
+    let proof = prove(b"ZK_Hiding", &air, &instance, &witness, &config, seed, None).unwrap();
+
+    let mut vt = Transcript::<H>::new(b"ZK_Hiding");
+    assert!(HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config).unwrap());
+
+    let (r_final, claims) = &proof.eval_proof.point_evaluation;
+    let num_cols = air.num_columns();
+    let k = config.blind_units();
+
+    assert_eq!(r_final.len(), num_vars);
+    assert_eq!(claims.len(), 2 * (num_cols + k));
+
+    let r_hw: Vec<Flat<F>> = r_final.iter().map(|x| x.to_hardware()).collect();
+    let weights = PolyVariant::<F>::expand_mle_weights(&r_hw);
+
+    (0..num_cols)
+        .map(|col| {
+            let (base, next) = column_mle_pair(&trace, col, &weights);
+
+            [
+                (claims[col], base.to_tower()),
+                (claims[num_cols + k + col], next.to_tower()),
+            ]
+        })
+        .collect()
+}
+
+#[test]
+fn point_evaluation_claims_are_not_witness_functionals() {
+    for (col, [base, next]) in point_evaluation_claims_vs_mle(false)
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(base.0, base.1, "raw base claim of column {col}");
+        assert_eq!(next.0, next.1, "raw next-row claim of column {col}");
+    }
+
+    for (col, [base, next]) in point_evaluation_claims_vs_mle(true).into_iter().enumerate() {
+        assert_ne!(base.0, base.1, "base claim of column {col}");
+        assert_ne!(next.0, next.1, "next-row claim of column {col}");
+    }
 }
 
 #[test]
@@ -824,7 +908,7 @@ fn true_zk_memory_isolation() {
     // Production blinding.
     // Magic bytes MUST be hidden.
     let config_zk = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ldt_support_size: 2,
         num_queries: 4,
         min_security_bits: 0,
@@ -866,7 +950,7 @@ fn true_zk_memory_isolation() {
     // Isolates whether ldt_support_size alone
     // hides raw bytes without sumcheck masks.
     let config_only_ldt = Config {
-        sumcheck_blinding_factor: 0,
+        zero_knowledge: false,
         ldt_support_size: 200,
         num_queries: 4,
         min_security_bits: 0,
@@ -910,7 +994,7 @@ fn truncation_overflow_injection() {
     };
 
     let config = Config {
-        sumcheck_blinding_factor: 1,
+        zero_knowledge: true,
         ldt_support_size: 1,
         num_queries: 8,
         min_security_bits: 0,
@@ -1004,7 +1088,7 @@ fn noise_shift_sign_forgery() {
     };
 
     let config = Config {
-        sumcheck_blinding_factor: 1, // Use 1 noise column (Base + Shifted)
+        zero_knowledge: true,
         ldt_support_size: 1,
         num_queries: 4,
         min_security_bits: 0,
@@ -1036,7 +1120,7 @@ fn noise_shift_sign_forgery() {
     // Swap the base noise value and the next-row
     // noise value. This "disconnects" the algebraic
     // claim from the physical Merkle tree data.
-    let expected_trace_len = air.num_columns() + config.sumcheck_blinding_factor;
+    let expected_trace_len = proof.eval_proof.point_evaluation.1.len() / 2;
     let base_noise = proof.eval_proof.point_evaluation.1[noise_col_idx];
     let next_noise = proof.eval_proof.point_evaluation.1[expected_trace_len + noise_col_idx];
 
@@ -1078,7 +1162,7 @@ fn ghost_protocol_indistinguishability() {
     };
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ldt_support_size: 2,
         num_queries: 4,
         min_security_bits: 0,
@@ -1171,7 +1255,7 @@ fn ghost_protocol_indistinguishability() {
     // "zeros" but actual ZK noise.
     let data_bytes_per_row = (4 + 4 + 1) * 2;
     let noise_start = data_bytes_per_row;
-    let noise_end = data_bytes_per_row + (config.sumcheck_blinding_factor * 16 * 2);
+    let noise_end = data_bytes_per_row + (config.blind_units() * 16 * 2);
 
     let padding_noise_short = &col_short[noise_start..noise_end];
     let padding_noise_long = &col_long[noise_start..noise_end];
@@ -1388,7 +1472,7 @@ fn chiplet_pipeline_witness_isolation() {
     let config_zk = Config {
         num_queries: 4,
         min_security_bits: 0,
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ldt_support_size: 4,
         ..Config::default()
     };

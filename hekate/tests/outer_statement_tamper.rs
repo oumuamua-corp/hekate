@@ -1,0 +1,451 @@
+// SPDX-FileCopyrightText: 2026 Andrei Kochergin <andrei@oumuamua.dev>
+// SPDX-FileCopyrightText: 2026 Oumuamua Labs <info@oumuamua.dev>
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Every verifier check that eval-claim hiding moves
+//! into the outer statement gets one mutant here:
+//! the masked value it guards is tampered and the
+//! proof must be rejected. A row that went missing
+//! would let the mutant through.
+
+use hekate::core::config::Config;
+use hekate::core::proofs::InnerProof;
+use hekate::core::trace::{ColumnTrace, ColumnType, TraceColumn};
+use hekate::crypto::DefaultHasher;
+use hekate::crypto::transcript::Transcript;
+use hekate::math::{Bit, Block32, Block128, TowerField};
+use hekate_core::trace::{IntoTraceColumn, TraceBuilder};
+use hekate_gadgets::{CpuMemColumns, CpuMemoryUnit, MemoryEvent, RamChiplet, generate_ram_trace};
+use hekate_program::chiplet::ChipletDef;
+use hekate_program::constraint::builder::ConstraintSystem;
+use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
+use hekate_program::permutation::PermutationCheckSpec;
+use hekate_program::{Air, FixedColumn, Program, ProgramInstance, ProgramWitness};
+use hekate_prover_sys::prove;
+use hekate_verifier::HekateVerifier;
+
+type F = Block128;
+type H = DefaultHasher;
+
+/// Boundary on column 0 (public input), fixed
+/// selector on column 1, one transition constraint.
+#[derive(Clone)]
+struct PinnedAir;
+
+impl Air<F> for PinnedAir {
+    fn num_columns(&self) -> usize {
+        2
+    }
+
+    fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
+        vec![BoundaryConstraint::with_public_input(0, 0, 0)]
+    }
+
+    fn column_layout(&self) -> &'static [ColumnType] {
+        &[ColumnType::B32, ColumnType::Bit]
+    }
+
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::last_row(1)]
+    }
+
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        let cs = ConstraintSystem::<F>::new();
+        let val = cs.col(0);
+        let q = cs.col(1);
+
+        cs.constrain(q * (cs.next(0) + val));
+
+        cs.build()
+    }
+}
+
+impl Program<F> for PinnedAir {
+    fn num_public_inputs(&self) -> usize {
+        1
+    }
+}
+
+#[derive(Clone)]
+struct RamAir {
+    num_rows: usize,
+}
+
+impl Air<F> for RamAir {
+    fn num_columns(&self) -> usize {
+        CpuMemColumns::NUM_COLUMNS
+    }
+
+    fn column_layout(&self) -> &[ColumnType] {
+        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
+        LAYOUT.get_or_init(CpuMemColumns::build_layout)
+    }
+
+    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
+        vec![(RamChiplet::BUS_ID.into(), CpuMemoryUnit::linking_spec())]
+    }
+
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        let cs = ConstraintSystem::<F>::new();
+        cs.assert_boolean(cs.col(CpuMemColumns::SELECTOR));
+        cs.assert_boolean(cs.col(CpuMemColumns::IS_WRITE));
+
+        cs.build()
+    }
+}
+
+impl Program<F> for RamAir {
+    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
+        Ok(vec![ChipletDef::from_air(&RamChiplet::new(self.num_rows))?])
+    }
+}
+
+fn config() -> Config {
+    Config {
+        num_queries: 4,
+        min_security_bits: 0,
+        zero_knowledge: true,
+        ldt_support_size: 4,
+        ..Config::default()
+    }
+}
+
+/// Honest witness with `public_input = 10`; `mutate` may
+/// break the value column or the fixed selector.
+fn pinned_case_with(
+    public_input: u32,
+    mutate: impl FnOnce(&mut Vec<Block32>, &mut Vec<Bit>),
+) -> (PinnedAir, ProgramInstance<F>, InnerProof<F>) {
+    let num_vars = 4;
+    let num_rows = 1 << num_vars;
+
+    let mut values = vec![Block32::from(10u32); num_rows];
+    let mut q = vec![Bit::ONE; num_rows];
+    q[num_rows - 1] = Bit::ZERO;
+
+    mutate(&mut values, &mut q);
+
+    let mut trace = ColumnTrace::new(num_vars).unwrap();
+    trace.add_column(values.into_trace_column()).unwrap();
+    trace.add_column(TraceColumn::Bit(q)).unwrap();
+
+    let instance = ProgramInstance::new(num_rows, vec![F::from(public_input)]);
+    let witness = ProgramWitness::new(trace);
+
+    let proof = prove(
+        b"Tamper_Pinned",
+        &PinnedAir,
+        &instance,
+        &witness,
+        &config(),
+        [0x51u8; 32],
+        None,
+    )
+    .unwrap();
+
+    (PinnedAir, instance, proof)
+}
+
+fn pinned_case() -> (PinnedAir, ProgramInstance<F>, InnerProof<F>) {
+    pinned_case_with(10, |_, _| {})
+}
+
+/// CPU side from `cpu_events`, RAM chiplet from `ram_events`.
+fn ram_case_with(
+    cpu_events: &[MemoryEvent],
+    ram_events: &[MemoryEvent],
+) -> (RamAir, ProgramInstance<F>, InnerProof<F>) {
+    let num_vars = 4;
+    let num_rows = 1 << num_vars;
+
+    let mut tb = TraceBuilder::new(&CpuMemColumns::build_layout(), num_vars).unwrap();
+    for (i, event) in cpu_events.iter().enumerate() {
+        let addr = event.addr_bytes();
+        let val = event.val_bytes();
+
+        for j in 0..4 {
+            tb.set_b32(CpuMemColumns::ADDR_B0 + j, i, Block32::from(addr[j] as u32))
+                .unwrap();
+            tb.set_b32(CpuMemColumns::VAL_B0 + j, i, Block32::from(val[j] as u32))
+                .unwrap();
+        }
+
+        let is_write = if event.is_write { Bit::ONE } else { Bit::ZERO };
+
+        tb.set_bit(CpuMemColumns::IS_WRITE, i, is_write).unwrap();
+        tb.set_bit(CpuMemColumns::SELECTOR, i, Bit::ONE).unwrap();
+    }
+
+    let air = RamAir { num_rows };
+    let witness = ProgramWitness::new(tb.build())
+        .with_chiplets(vec![generate_ram_trace(ram_events, num_rows).unwrap()]);
+    let instance = ProgramInstance::new(num_rows, vec![]);
+
+    let proof = prove(
+        b"Tamper_Ram",
+        &air,
+        &instance,
+        &witness,
+        &config(),
+        [0x52u8; 32],
+        None,
+    )
+    .unwrap();
+
+    (air, instance, proof)
+}
+
+fn ram_events() -> Vec<MemoryEvent> {
+    vec![
+        MemoryEvent::write(0x1000, 0, 42),
+        MemoryEvent::write(0x2000, 1, 99),
+        MemoryEvent::read(0x1000, 2, 42),
+        MemoryEvent::read(0x2000, 3, 99),
+    ]
+}
+
+fn ram_case() -> (RamAir, ProgramInstance<F>, InnerProof<F>) {
+    let events = ram_events();
+    ram_case_with(&events, &events)
+}
+
+fn accepted<P: Program<F> + Sync>(
+    label: &'static [u8],
+    program: &P,
+    instance: &ProgramInstance<F>,
+    proof: &InnerProof<F>,
+) -> bool {
+    let mut transcript = Transcript::<H>::new(label);
+    matches!(
+        HekateVerifier::<F, H>::verify(program, instance, proof, &mut transcript, &config()),
+        Ok(true)
+    )
+}
+
+fn bump(value: &mut F) {
+    *value += F::ONE;
+}
+
+#[test]
+fn honest_proofs_verify() {
+    let (air, instance, proof) = pinned_case();
+    assert!(accepted(b"Tamper_Pinned", &air, &instance, &proof));
+
+    let (air, instance, proof) = ram_case();
+    assert!(accepted(b"Tamper_Ram", &air, &instance, &proof));
+}
+
+#[test]
+fn tampered_claims_are_rejected() {
+    let (air, instance, proof) = pinned_case();
+    let claims = proof.eval_proof.point_evaluation.1.len();
+
+    for idx in 0..claims {
+        let mut mutant = proof.clone();
+        bump(&mut mutant.eval_proof.point_evaluation.1[idx]);
+
+        assert!(
+            !accepted(b"Tamper_Pinned", &air, &instance, &mutant),
+            "claim {idx}"
+        );
+    }
+}
+
+#[test]
+fn tampered_zerocheck_stream_is_rejected() {
+    let (air, instance, proof) = pinned_case();
+
+    let mut mutant = proof.clone();
+    bump(&mut mutant.zerocheck_proof.round_polys[0].evals[0]);
+
+    assert!(!accepted(b"Tamper_Pinned", &air, &instance, &mutant));
+
+    let mut mutant = proof.clone();
+    bump(&mut mutant.zerocheck_proof.claimed_evaluation);
+
+    assert!(!accepted(b"Tamper_Pinned", &air, &instance, &mutant));
+
+    let mut mutant = proof.clone();
+    bump(&mut mutant.eval_proof.sumcheck_proof.round_polys[0].evals[0]);
+
+    assert!(!accepted(b"Tamper_Pinned", &air, &instance, &mutant));
+
+    let mut mutant = proof.clone();
+    bump(&mut mutant.eval_proof.sumcheck_proof.claimed_evaluation);
+
+    assert!(!accepted(b"Tamper_Pinned", &air, &instance, &mutant));
+}
+
+#[test]
+fn tampered_bus_values_are_rejected() {
+    let (air, instance, proof) = ram_case();
+
+    let mut mutant = proof.clone();
+    bump(&mut mutant.main_logup_aux.claimed_sums[0].1);
+
+    assert!(
+        !accepted(b"Tamper_Ram", &air, &instance, &mutant),
+        "main claimed_sum"
+    );
+
+    let mut mutant = proof.clone();
+    bump(&mut mutant.chiplet_logup_aux[0].claimed_sums[0].1);
+
+    assert!(
+        !accepted(b"Tamper_Ram", &air, &instance, &mutant),
+        "chiplet claimed_sum"
+    );
+
+    // The h_eval and its h-open claim share one pad entry;
+    // moving both keeps the pin and reaches the bus rows.
+    let mut mutant = proof.clone();
+    bump(&mut mutant.main_logup_aux.h_evals[0].1);
+    bump(
+        &mut mutant
+            .main_logup_aux
+            .h_eval_proof
+            .as_mut()
+            .unwrap()
+            .point_evaluation
+            .1[0],
+    );
+
+    assert!(
+        !accepted(b"Tamper_Ram", &air, &instance, &mutant),
+        "main h_eval"
+    );
+
+    let mut mutant = proof.clone();
+    bump(&mut mutant.chiplet_logup_aux[0].h_evals[0].1);
+    bump(
+        &mut mutant.chiplet_logup_aux[0]
+            .h_eval_proof
+            .as_mut()
+            .unwrap()
+            .point_evaluation
+            .1[0],
+    );
+
+    assert!(
+        !accepted(b"Tamper_Ram", &air, &instance, &mutant),
+        "chiplet h_eval"
+    );
+
+    let mut mutant = proof.clone();
+    bump(&mut mutant.chiplet_eval_proofs[0].point_evaluation.1[0]);
+
+    assert!(
+        !accepted(b"Tamper_Ram", &air, &instance, &mutant),
+        "chiplet ring claim"
+    );
+}
+
+#[test]
+fn tampered_outer_segment_is_rejected() {
+    let (air, instance, proof) = ram_case();
+
+    let mut mutant = proof.clone();
+    bump(&mut mutant.outer.as_mut().unwrap().interleaved[0]);
+
+    assert!(
+        !accepted(b"Tamper_Ram", &air, &instance, &mutant),
+        "interleaved"
+    );
+
+    let mut mutant = proof.clone();
+    bump(&mut mutant.outer.as_mut().unwrap().linear[0]);
+
+    assert!(!accepted(b"Tamper_Ram", &air, &instance, &mutant), "linear");
+
+    let mut mutant = proof.clone();
+    bump(&mut mutant.outer.as_mut().unwrap().quadratic[0]);
+
+    assert!(
+        !accepted(b"Tamper_Ram", &air, &instance, &mutant),
+        "quadratic"
+    );
+
+    let mut mutant = proof.clone();
+    bump(&mut mutant.outer.as_mut().unwrap().pad_opening.values[0]);
+
+    assert!(
+        !accepted(b"Tamper_Ram", &air, &instance, &mutant),
+        "pad opening"
+    );
+
+    let mut mutant = proof.clone();
+    bump(&mut mutant.outer.as_mut().unwrap().aux_opening.values[0]);
+
+    assert!(
+        !accepted(b"Tamper_Ram", &air, &instance, &mutant),
+        "aux opening"
+    );
+
+    let mut mutant = proof.clone();
+    mutant.outer.as_mut().unwrap().aux_root[0] ^= 1;
+
+    assert!(
+        !accepted(b"Tamper_Ram", &air, &instance, &mutant),
+        "aux root"
+    );
+
+    let mut mutant = proof.clone();
+    mutant.pad_root.as_mut().unwrap()[0] ^= 1;
+
+    assert!(
+        !accepted(b"Tamper_Ram", &air, &instance, &mutant),
+        "pad root"
+    );
+
+    let mut mutant = proof.clone();
+    mutant.outer = None;
+
+    assert!(
+        !accepted(b"Tamper_Ram", &air, &instance, &mutant),
+        "missing outer"
+    );
+}
+
+/// Under hiding only the outer rows can
+/// reject an honest run on a violating witness.
+#[test]
+fn violating_witnesses_are_rejected() {
+    let (air, instance, proof) = pinned_case_with(10, |values, _| {
+        values[5] = Block32::from(11u32);
+    });
+
+    assert!(
+        !accepted(b"Tamper_Pinned", &air, &instance, &proof),
+        "broken transition"
+    );
+
+    let (air, instance, proof) = pinned_case_with(11, |_, _| {});
+
+    assert!(
+        !accepted(b"Tamper_Pinned", &air, &instance, &proof),
+        "wrong boundary value"
+    );
+
+    let (air, instance, proof) = pinned_case_with(10, |_, q| {
+        let last = q.len() - 1;
+        q[last] = Bit::ONE;
+    });
+
+    assert!(
+        !accepted(b"Tamper_Pinned", &air, &instance, &proof),
+        "fixed selector violated"
+    );
+
+    let cpu = ram_events();
+
+    let mut ram = cpu.clone();
+    ram[2] = MemoryEvent::read(0x1000, 2, 43);
+    ram[0] = MemoryEvent::write(0x1000, 0, 43);
+
+    let (air, instance, proof) = ram_case_with(&cpu, &ram);
+
+    assert!(
+        !accepted(b"Tamper_Ram", &air, &instance, &proof),
+        "bus multisets diverge"
+    );
+}
