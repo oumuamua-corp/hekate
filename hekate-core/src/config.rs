@@ -88,19 +88,13 @@ impl fmt::Display for Error {
 /// Security metrics snapshot for a given `Config`.
 #[derive(Clone, Copy, Debug)]
 pub struct SecurityMetrics {
-    /// Estimated relative distance
-    /// δ of the linear code.
+    /// Estimated relative distance δ of the linear code.
     pub relative_distance: f64,
 
     /// LDT spot-check count.
     pub num_queries: usize,
 
-    /// Soundness error:
-    /// `(1 - δ)^q`.
-    pub soundness_error: f64,
-
-    /// LDT proximity bound:
-    /// `-log₂(soundness_error)`.
+    /// LDT proximity bound: `-log₂((1 - δ)^q)`.
     pub ldt_bits: usize,
 
     /// `min(ldt_bits, field_bits)`. Schwartz-Zippel
@@ -220,13 +214,11 @@ impl Config {
     /// `field_bits`: `size_of::<F>() * 8`.
     pub fn security_metrics(&self, field_bits: usize, grid_cols: usize) -> SecurityMetrics {
         let g = self.table_geom(grid_cols);
-        let delta = self.estimate_relative_distance(grid_cols);
         let bits = self.ldt_bits(g.support_size + grid_cols, g.encoded_width);
 
         SecurityMetrics {
-            relative_distance: delta,
+            relative_distance: self.estimate_relative_distance(grid_cols),
             num_queries: self.num_queries,
-            soundness_error: (1.0 - delta).powf(self.num_queries as f64),
             ldt_bits: bits,
             security_bits: bits.min(field_bits),
         }
