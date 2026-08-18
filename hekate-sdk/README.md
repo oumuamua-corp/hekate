@@ -1,5 +1,12 @@
 # hekate-sdk
 
+[![Crates.io](https://img.shields.io/crates/v/hekate-sdk.svg)](https://crates.io/crates/hekate-sdk)
+[![Docs.rs](https://docs.rs/hekate-sdk/badge.svg)](https://docs.rs/hekate-sdk)
+[![CI](https://github.com/oumuamua-labs/hekate/actions/workflows/ci.yml/badge.svg)](https://github.com/oumuamua-labs/hekate/actions/workflows/ci.yml)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](./LICENSE)
+
+*Copyright (c) 2026 Andrei Kochergin and Oumuamua Labs.*
+
 Bundling, wire-format, and preflight diagnostics for the Hekate ZK proving system.
 
 Proving is driven through `hekate-prover-sys` (which links the signed cdylib).

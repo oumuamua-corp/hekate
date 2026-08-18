@@ -5,6 +5,8 @@
 [![CI](https://github.com/oumuamua-labs/hekate/actions/workflows/ci.yml/badge.svg)](https://github.com/oumuamua-labs/hekate/actions/workflows/ci.yml)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](./LICENSE)
 
+*Copyright (c) 2026 Andrei Kochergin and Oumuamua Labs.*
+
 Trace mutation fuzzer for [Hekate](https://github.com/oumuamua-labs/hekate) ZK programs and chiplets.
 
 Tampers your valid trace, runs preflight checks,

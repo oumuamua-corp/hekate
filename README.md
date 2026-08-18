@@ -3,6 +3,8 @@
 [![CI](https://github.com/oumuamua-labs/hekate/actions/workflows/ci.yml/badge.svg)](https://github.com/oumuamua-labs/hekate/actions/workflows/ci.yml)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](./LICENSE)
 
+*Copyright (c) 2026 Andrei Kochergin and Oumuamua Labs.*
+
 Zero-knowledge proof system over binary tower fields. Streaming architecture. Bounded memory. Edge-native.
 Hekate proves computations in GF(2^128) using Sumcheck + Brakedown PCS with O(N) prover time and O(N) memory.
 

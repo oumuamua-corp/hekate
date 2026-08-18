@@ -5,6 +5,8 @@
 [![CI](https://github.com/oumuamua-labs/hekate/actions/workflows/ci.yml/badge.svg)](https://github.com/oumuamua-labs/hekate/actions/workflows/ci.yml)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](LICENSE)
 
+*Copyright (c) 2026 Andrei Kochergin and Oumuamua Labs.*
+
 Keccak-f[1600] AIR chiplet for the [Hekate](https://github.com/oumuamua-labs/hekate) ZK proving system. Includes
 SHA-3-256, SHA-3-512, SHAKE128, and SHAKE256 sponge constructions.
 

@@ -1,5 +1,12 @@
 # hekate-gadgets
 
+[![Crates.io](https://img.shields.io/crates/v/hekate-gadgets.svg)](https://crates.io/crates/hekate-gadgets)
+[![Docs.rs](https://docs.rs/hekate-gadgets/badge.svg)](https://docs.rs/hekate-gadgets)
+[![CI](https://github.com/oumuamua-labs/hekate/actions/workflows/ci.yml/badge.svg)](https://github.com/oumuamua-labs/hekate/actions/workflows/ci.yml)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](./LICENSE)
+
+*Copyright (c) 2026 Andrei Kochergin and Oumuamua Labs.*
+
 Base AIR chiplets and atoms for the Hekate ZK proving system.
 
 ## License
