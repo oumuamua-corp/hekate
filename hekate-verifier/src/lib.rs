@@ -8,6 +8,7 @@ extern crate alloc;
 
 mod brakedown;
 mod evaluator;
+mod outer;
 mod sumcheck;
 
 pub mod logup;
@@ -15,6 +16,7 @@ pub mod logup;
 pub use sumcheck::verify;
 
 use crate::evaluator::{EvalVerifyContext, EvaluatorVerifier};
+use crate::outer::PadCursor;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
@@ -22,17 +24,78 @@ use alloc::vec::Vec;
 use core::marker::PhantomData;
 use hekate_core::config::Config;
 use hekate_core::errors;
-use hekate_core::proofs::InnerProof;
+use hekate_core::proofs::{
+    BrakedownCommitment, EvalBatchProof, InnerProof, LogUpAux, SumcheckProof,
+};
 use hekate_core::protocol;
 use hekate_core::tensor::TensorProduct;
 use hekate_core::trace::{ColumnType, TraceCompatibleField};
 use hekate_crypto::Hasher;
 use hekate_crypto::transcript::Transcript;
 use hekate_math::{BinaryFieldExtras, Block128, Flat, HardwareField, PackableField, TowerField};
+use hekate_program::chiplet::ChipletDef;
+use hekate_program::constraint::ConstraintAst;
 use hekate_program::expander::RingSwitchPlan;
-use hekate_program::permutation::{self, BusKind};
+use hekate_program::outer::{
+    EvalInputs, EvalRecord, OuterStatement, TableInputs, TablePads, TableRecord, TableShape,
+    eval_record, table_record,
+};
+use hekate_program::permutation::{self, BusKind, eval_row_idx_byte_mle, eval_row_idx_le_mle};
 use hekate_program::{Air, FixedColumn, Program, ProgramInstance, chiplet, validate_fixed_columns};
 use tracing::{debug, info, instrument, warn};
+
+struct ZerocheckMasked<F: HardwareField> {
+    claimed_sums_first: u32,
+    zerocheck_first: u32,
+    h_evals_first: u32,
+    alpha: Flat<F>,
+    r_zerocheck: Vec<Flat<F>>,
+    val_final: Flat<F>,
+    h_eval: Option<EvalRecord<F>>,
+}
+
+struct ZerocheckOutcome<F: HardwareField> {
+    r_final: Vec<Flat<F>>,
+    masked: Option<ZerocheckMasked<F>>,
+}
+
+/// One chiplet's static data, built once
+/// before the replay and read by every phase.
+struct ChipletTable<'a, F: TowerField> {
+    def: &'a ChipletDef<F>,
+    ast: ConstraintAst<F>,
+    shape: TableShape,
+    plan: RingSwitchPlan,
+}
+
+/// One table's static shape shared by its
+/// ZeroCheck, eval opening and outer record.
+#[derive(Clone, Copy)]
+struct TableView<'a, F: TowerField, A> {
+    air: &'a A,
+    instance: &'a ProgramInstance<F>,
+    plan: &'a RingSwitchPlan,
+    ast: &'a ConstraintAst<F>,
+    shape: &'a TableShape,
+}
+
+/// One table's proof parts.
+#[derive(Clone, Copy)]
+struct TableProof<'a, F: TowerField> {
+    commitment: &'a BrakedownCommitment,
+    sc_proof: &'a SumcheckProof<F>,
+    eval_proof: &'a EvalBatchProof<F>,
+    logup_aux: &'a LogUpAux<F>,
+}
+
+/// Phase-3 LogUp challenges that
+/// flow into every table's ZeroCheck.
+#[derive(Clone, Copy)]
+struct LogUpContext<'a, F: HardwareField> {
+    gamma: Flat<F>,
+    beta: Flat<F>,
+    lookup_bus_points: &'a BTreeMap<String, Vec<Flat<F>>>,
+}
 
 /// The main Hekate Verifier for AIR circuits.
 pub struct HekateVerifier<F, H> {
@@ -70,8 +133,6 @@ where
     ) -> errors::Result<bool> {
         let num_rows = instance.num_rows();
         let num_vars = num_rows.trailing_zeros() as usize;
-        let num_cols = program.num_columns();
-        let trace_width = num_cols;
 
         // =========================================================
         // 1. CRITICAL SECURITY VALIDATIONS
@@ -102,7 +163,7 @@ where
         let main_plan = RingSwitchPlan::new(
             program.column_layout(),
             main_entries.as_deref(),
-            config.sumcheck_blinding_factor,
+            config.blind_units(),
         )?;
 
         let main_grid_cols = 1 << main_plan.split_vars(num_vars, config);
@@ -117,7 +178,7 @@ where
 
         config.check_security(field_bits, main_grid_cols)?;
 
-        let expected_trace_len = trace_width + config.sumcheck_blinding_factor;
+        let expected_trace_len = main_plan.total_claims();
         let combined_vals = &proof.eval_proof.point_evaluation.1;
 
         if combined_vals.len() != expected_trace_len * 2 {
@@ -132,13 +193,22 @@ where
         let trace_values_next = &combined_hw[expected_trace_len..];
 
         let main_perm = program.permutation_checks();
-        let chiplet_defs_for_check = program.chiplet_defs()?;
+        let chiplet_defs = program.chiplet_defs()?;
+
+        if proof.chiplet_commitments.len() != chiplet_defs.len() {
+            return Err(errors::Error::Protocol {
+                protocol: "verifier",
+                message: "chiplet commitment count mismatch",
+            });
+        }
 
         for (bus_id, spec) in &main_perm {
             spec.validate_clock_stitching(bus_id)?;
         }
 
-        for def in &chiplet_defs_for_check {
+        let mut chiplet_asts = Vec::with_capacity(chiplet_defs.len());
+
+        for def in &chiplet_defs {
             for (bus_id, spec) in &def.permutation_checks {
                 spec.validate_clock_stitching(bus_id)?;
             }
@@ -158,6 +228,8 @@ where
                     "chiplet bus Bit selector lacks a boolean-assertion root"
                 );
             }
+
+            chiplet_asts.push(def_ast);
         }
 
         let main_ast = program.constraint_ast();
@@ -176,7 +248,7 @@ where
         }
 
         let all_endpoints = main_perm.iter().map(|(id, s)| (id.as_str(), s)).chain(
-            chiplet_defs_for_check
+            chiplet_defs
                 .iter()
                 .flat_map(|d| d.permutation_checks.iter().map(|(id, s)| (id.as_str(), s))),
         );
@@ -189,15 +261,11 @@ where
             Some(num_vars),
         )?;
 
-        for (c_idx, def) in chiplet_defs_for_check.iter().enumerate() {
-            let c_num_rows = proof
-                .chiplet_commitments
-                .get(c_idx)
-                .ok_or(errors::Error::Protocol {
-                    protocol: "verifier",
-                    message: "chiplet commitment count mismatch",
-                })?
-                .num_rows;
+        let main_shape = TableShape::from_air(program, num_vars, &main_ast)?;
+        let mut chiplet_tables = Vec::with_capacity(chiplet_defs.len());
+
+        for (def, ast) in chiplet_defs.iter().zip(chiplet_asts) {
+            let c_num_rows = proof.chiplet_commitments[chiplet_tables.len()].num_rows;
 
             if c_num_rows == 0 || !c_num_rows.is_power_of_two() {
                 return Err(errors::Error::Protocol {
@@ -213,6 +281,20 @@ where
                 Air::<F>::virtual_column_layout(def),
                 Some(c_num_vars),
             )?;
+
+            let c_entries = Air::<F>::virtual_expander(def).map(|e| e.expansion_entries());
+            let plan = RingSwitchPlan::new(
+                Air::<F>::column_layout(def),
+                c_entries.as_deref(),
+                config.blind_units(),
+            )?;
+
+            chiplet_tables.push(ChipletTable {
+                def,
+                shape: TableShape::from_air(def, c_num_vars, &ast)?,
+                ast,
+                plan,
+            });
         }
 
         // =========================================================
@@ -220,11 +302,26 @@ where
         // =========================================================
         Self::verify_trace_commitment(program, instance, proof, transcript, config, &main_plan)?;
 
+        if config.zero_knowledge != proof.pad_root.is_some()
+            || config.zero_knowledge != proof.outer.is_some()
+        {
+            return Err(errors::Error::Protocol {
+                protocol: "verifier",
+                message: "pad_root and outer presence must match zero_knowledge",
+            });
+        }
+
+        if let Some(root) = proof.pad_root.as_ref() {
+            transcript.append_message(b"pad_root", root);
+        }
+
+        let mut pad_cursor = config.zero_knowledge.then(PadCursor::default);
+        let mut records: Vec<TableRecord<F>> = Vec::new();
+
         // =========================================================
         // PHASE 2: COMMIT EACH CHIPLET (absorb roots)
         // =========================================================
-        let chiplet_plans =
-            Self::verify_chiplet_commitments_only(program, proof, transcript, config)?;
+        Self::verify_chiplet_commitments_only(&chiplet_tables, proof, transcript);
 
         // =========================================================
         // PHASE 3: DRAW GLOBAL γ, β, AND r_bus PER LOOKUP BUS
@@ -232,67 +329,73 @@ where
         let gamma = transcript.challenge_field::<F>(b"bus_gamma")?.to_hardware();
         let beta = transcript.challenge_field::<F>(b"bus_beta")?.to_hardware();
 
-        let lookup_bus_points = Self::draw_lookup_bus_points(program, proof, transcript)?;
+        let lookup_bus_points =
+            Self::draw_lookup_bus_points(program, &chiplet_defs, proof, transcript)?;
+
+        let logup = LogUpContext {
+            gamma,
+            beta,
+            lookup_bus_points: &lookup_bus_points,
+        };
 
         // =========================================================
         // PHASE 4: PER-CHIPLET FUSED (ZC + LogUp + eval)
         // =========================================================
         Self::verify_chiplet_fused(
-            program,
+            &chiplet_tables,
             proof,
             transcript,
             config,
-            gamma,
-            beta,
-            &lookup_bus_points,
-            &chiplet_plans,
+            &logup,
+            pad_cursor.as_mut(),
+            &mut records,
         )?;
 
         // =========================================================
         // PHASE 5: MAIN AIR ZEROCHECK + LogUp
         // =========================================================
-        let main_bus_specs = program.permutation_checks();
-        let r_final = match Self::verify_zerocheck(
-            program,
+        let main_view = TableView {
+            air: program,
             instance,
-            &proof.zerocheck_proof,
-            transcript,
-            config,
-            trace_width,
-            trace_values,
-            trace_values_next,
-            &main_bus_specs,
-            &proof.main_logup_aux,
-            gamma,
-            beta,
-            &lookup_bus_points,
-        )? {
-            Some(r) => r,
-            None => return Ok(false),
+            plan: &main_plan,
+            ast: &main_ast,
+            shape: &main_shape,
         };
 
-        // The eval_proof's stored r_final must match
-        // the Sumcheck-derived r_final exactly.
-        let stored_pt = canonical_slice_to_flat(&proof.eval_proof.point_evaluation.0);
-        if stored_pt != r_final {
-            return Err(errors::Error::Protocol {
-                protocol: "verifier",
-                message: "eval_proof point 0 mismatch with r_final",
-            });
-        }
+        let main_proof = TableProof {
+            commitment: &proof.trace_commitment,
+            sc_proof: &proof.zerocheck_proof,
+            eval_proof: &proof.eval_proof,
+            logup_aux: &proof.main_logup_aux,
+        };
+
+        let zerocheck = match Self::verify_zerocheck(
+            &main_view,
+            &main_proof,
+            transcript,
+            config,
+            trace_values,
+            trace_values_next,
+            &logup,
+            pad_cursor.as_mut(),
+        )? {
+            Some(outcome) => outcome,
+            None => return Ok(false),
+        };
 
         // =========================================================
         // PHASE 6: MAIN EVAL AT r_final (single point)
         // =========================================================
-        if !Self::verify_eval_at_r_final(
-            &main_plan,
-            &proof.trace_commitment,
-            &proof.eval_proof,
+        if !Self::verify_table_eval(
+            &main_view,
+            &main_proof,
             transcript,
             config,
-            num_vars,
-            &r_final,
             &combined_hw,
+            zerocheck,
+            &logup,
+            pad_cursor.as_mut(),
+            &mut records,
         )? {
             warn!("Main trace evaluation verification failed");
             return Ok(false);
@@ -301,6 +404,16 @@ where
         // =========================================================
         // PHASE 7: CROSS-BUS MATCHING (Σ claimed_sum = 0 per bus_id)
         // =========================================================
+        if let Some(cursor) = pad_cursor {
+            let mut shapes = Vec::with_capacity(1 + chiplet_tables.len());
+            shapes.push(main_shape);
+            shapes.extend(chiplet_tables.iter().map(|t| t.shape));
+
+            let statement = OuterStatement::new(&shapes, config.blind_units());
+
+            return outer::verify_outer(proof, transcript, config, statement, records, cursor);
+        }
+
         let mut endpoints: Vec<(String, F)> = Vec::new();
         for (bus_id, claim) in &proof.main_logup_aux.claimed_sums {
             endpoints.push((bus_id.clone(), *claim));
@@ -322,52 +435,28 @@ where
     /// root into the transcript (no ZeroCheck).
     /// Mirrors prover's commit_chiplets_only.
     #[instrument(skip_all, name = "verify_chiplet_commitments_only")]
-    fn verify_chiplet_commitments_only<P: Program<F>>(
-        program: &P,
+    fn verify_chiplet_commitments_only(
+        chiplet_tables: &[ChipletTable<'_, F>],
         proof: &InnerProof<F>,
         transcript: &mut Transcript<H>,
-        config: &Config,
-    ) -> errors::Result<Vec<RingSwitchPlan>> {
-        let chiplet_defs = program.chiplet_defs()?;
-
-        if proof.chiplet_commitments.len() != chiplet_defs.len() {
-            return Err(errors::Error::Protocol {
-                protocol: "verifier",
-                message: "chiplet commitment count mismatch",
-            });
-        }
-
-        let mut plans = Vec::with_capacity(chiplet_defs.len());
-
-        for (c_idx, def) in chiplet_defs.iter().enumerate() {
-            let c_comm = &proof.chiplet_commitments[c_idx];
-            let c_num_rows = c_comm.num_rows;
-
-            let c_entries = Air::<F>::virtual_expander(def).map(|e| e.expansion_entries());
-            let c_plan = RingSwitchPlan::new(
-                Air::<F>::column_layout(def),
-                c_entries.as_deref(),
-                config.sumcheck_blinding_factor,
-            )?;
+    ) {
+        for (table, c_comm) in chiplet_tables.iter().zip(&proof.chiplet_commitments) {
+            let def = table.def;
 
             protocol::absorb_chiplet_header(
                 transcript,
                 &def.name(),
-                c_num_rows,
+                c_comm.num_rows,
                 def.num_columns(),
-                c_plan.opened_row_bytes(),
-                c_plan.num_master_vectors(),
+                table.plan.opened_row_bytes(),
+                table.plan.num_master_vectors(),
                 &c_comm.root,
             );
 
             for bc in &Air::<F>::boundary_constraints(def) {
                 bc.absorb_into(transcript);
             }
-
-            plans.push(c_plan);
         }
-
-        Ok(plans)
     }
 
     /// PHASE 4:
@@ -375,56 +464,46 @@ where
     /// Mirrors prover's fused_chiplet_loop.
     #[instrument(skip_all, name = "verify_chiplet_fused")]
     #[allow(clippy::too_many_arguments)]
-    fn verify_chiplet_fused<P: Program<F>>(
-        program: &P,
+    fn verify_chiplet_fused(
+        chiplet_tables: &[ChipletTable<'_, F>],
         proof: &InnerProof<F>,
         transcript: &mut Transcript<H>,
         config: &Config,
-        gamma: Flat<F>,
-        beta: Flat<F>,
-        lookup_bus_points: &BTreeMap<String, Vec<Flat<F>>>,
-        chiplet_plans: &[RingSwitchPlan],
+        logup: &LogUpContext<'_, F>,
+        mut cursor: Option<&mut PadCursor>,
+        records: &mut Vec<TableRecord<F>>,
     ) -> errors::Result<()> {
-        let chiplet_defs = program.chiplet_defs()?;
-
-        if chiplet_plans.len() != chiplet_defs.len() {
-            return Err(errors::Error::Protocol {
-                protocol: "verifier",
-                message: "chiplet ring-switch plan count mismatch",
-            });
-        }
-
-        if proof.chiplet_zerocheck_proofs.len() != chiplet_defs.len() {
+        if proof.chiplet_zerocheck_proofs.len() != chiplet_tables.len() {
             return Err(errors::Error::Protocol {
                 protocol: "verifier",
                 message: "chiplet zerocheck proof count mismatch",
             });
         }
 
-        if proof.chiplet_logup_aux.len() != chiplet_defs.len() {
+        if proof.chiplet_logup_aux.len() != chiplet_tables.len() {
             return Err(errors::Error::Protocol {
                 protocol: "verifier",
                 message: "chiplet logup_aux count mismatch",
             });
         }
 
-        if proof.chiplet_eval_proofs.len() != chiplet_defs.len() {
+        if proof.chiplet_eval_proofs.len() != chiplet_tables.len() {
             return Err(errors::Error::Protocol {
                 protocol: "verifier",
                 message: "chiplet eval_proofs count mismatch",
             });
         }
 
-        for (c_idx, def) in chiplet_defs.iter().enumerate() {
+        for (c_idx, table) in chiplet_tables.iter().enumerate() {
+            let def = table.def;
+
             let c_comm = &proof.chiplet_commitments[c_idx];
             let c_sc_proof = &proof.chiplet_zerocheck_proofs[c_idx];
             let c_eval_proof = &proof.chiplet_eval_proofs[c_idx];
             let c_logup_aux = &proof.chiplet_logup_aux[c_idx];
 
             let c_num_rows = c_comm.num_rows;
-            let c_num_vars = c_num_rows.trailing_zeros() as usize;
-            let c_num_cols = def.num_columns();
-            let c_trace_width = c_num_cols + config.sumcheck_blinding_factor;
+            let c_trace_width = table.plan.total_claims();
 
             let c_combined = &c_eval_proof.point_evaluation.1;
             if c_combined.len() != c_trace_width * 2 {
@@ -439,24 +518,33 @@ where
             let c_trace_values_next = &c_combined_hw[c_trace_width..];
 
             let c_instance = ProgramInstance::new(c_num_rows, vec![]);
-            let c_bus_specs = def.permutation_checks.clone();
 
-            let r_final = match Self::verify_zerocheck(
-                def,
-                &c_instance,
-                c_sc_proof,
+            let view = TableView {
+                air: def,
+                instance: &c_instance,
+                plan: &table.plan,
+                ast: &table.ast,
+                shape: &table.shape,
+            };
+
+            let table_proof = TableProof {
+                commitment: c_comm,
+                sc_proof: c_sc_proof,
+                eval_proof: c_eval_proof,
+                logup_aux: c_logup_aux,
+            };
+
+            let zerocheck = match Self::verify_zerocheck(
+                &view,
+                &table_proof,
                 transcript,
                 config,
-                c_num_cols,
                 c_trace_values,
                 c_trace_values_next,
-                &c_bus_specs,
-                c_logup_aux,
-                gamma,
-                beta,
-                lookup_bus_points,
+                logup,
+                cursor.as_deref_mut(),
             )? {
-                Some(r) => r,
+                Some(outcome) => outcome,
                 None => {
                     warn!(chiplet_idx = c_idx, "Chiplet ZeroCheck failed");
                     return Err(errors::Error::Protocol {
@@ -466,23 +554,16 @@ where
                 }
             };
 
-            let stored_pt = canonical_slice_to_flat(&c_eval_proof.point_evaluation.0);
-            if stored_pt != r_final {
-                return Err(errors::Error::Protocol {
-                    protocol: "verifier",
-                    message: "chiplet eval_proof point mismatch with r_final",
-                });
-            }
-
-            if !Self::verify_eval_at_r_final(
-                &chiplet_plans[c_idx],
-                c_comm,
-                c_eval_proof,
+            if !Self::verify_table_eval(
+                &view,
+                &table_proof,
                 transcript,
                 config,
-                c_num_vars,
-                &r_final,
                 &c_combined_hw,
+                zerocheck,
+                logup,
+                cursor.as_deref_mut(),
+                records,
             )? {
                 warn!(
                     chiplet_idx = c_idx,
@@ -504,29 +585,118 @@ where
         Ok(())
     }
 
-    /// PHASE 6 helper:
-    /// single-point eval verify. Mirrors prover's prove_eval_at_r_final.
-    #[instrument(skip_all, name = "verify_eval_at_r_final")]
+    /// A table's eval at `r_final` after its ZeroCheck.
+    /// Mirrors the prover's `prove_eval_at_r_final`; with
+    /// a pad cursor it also completes the table's record.
+    #[instrument(skip_all, name = "verify_table_eval")]
     #[allow(clippy::too_many_arguments)]
-    fn verify_eval_at_r_final(
-        ring_plan: &RingSwitchPlan,
-        commitment: &hekate_core::proofs::BrakedownCommitment,
-        eval_proof: &hekate_core::proofs::EvalBatchProof<F>,
+    fn verify_table_eval<A: Air<F>>(
+        view: &TableView<'_, F, A>,
+        proof: &TableProof<'_, F>,
         transcript: &mut Transcript<H>,
         config: &Config,
-        num_vars: usize,
-        r_final: &[Flat<F>],
         claimed_values: &[Flat<F>],
+        zerocheck: ZerocheckOutcome<F>,
+        logup: &LogUpContext<'_, F>,
+        mut cursor: Option<&mut PadCursor>,
+        records: &mut Vec<TableRecord<F>>,
     ) -> errors::Result<bool> {
+        let TableView {
+            air,
+            instance,
+            plan: ring_plan,
+            ast,
+            shape,
+        } = *view;
+        let TableProof {
+            commitment,
+            eval_proof,
+            logup_aux,
+            ..
+        } = *proof;
+
+        let num_vars = instance.num_rows().trailing_zeros() as usize;
+        let r_final = zerocheck.r_final;
+
+        if canonical_slice_to_flat(&eval_proof.point_evaluation.0) != r_final {
+            return Err(errors::Error::Protocol {
+                protocol: "verifier",
+                message: "eval_proof point mismatch with r_final",
+            });
+        }
+
+        let claims_first = cursor.as_deref_mut().map(|c| c.take(claimed_values.len()));
+
         let ctx = EvalVerifyContext {
-            point: r_final,
+            point: &r_final,
             claimed_values,
             num_vars,
             ring_plan,
             shifted_claims: true,
+            masked: cursor.is_some(),
         };
 
-        EvaluatorVerifier::<F, H>::verify(commitment, eval_proof, transcript, ctx, config)
+        let outcome = match EvaluatorVerifier::<F, H>::verify(
+            commitment, eval_proof, transcript, ctx, config,
+        )? {
+            Some(outcome) => outcome,
+            None => return Ok(false),
+        };
+
+        let (Some(cursor), Some(claims_first), Some(masked)) =
+            (cursor, claims_first, zerocheck.masked)
+        else {
+            return Ok(true);
+        };
+
+        let eval_rounds_first = cursor.take(2 * num_vars);
+
+        let claim_pads: Vec<u32> = (0..claimed_values.len() as u32)
+            .map(|c| claims_first + c)
+            .collect();
+
+        let eval = eval_record(&EvalInputs {
+            plan: ring_plan,
+            eta: outcome.eta,
+            r_mix: &outcome.r_mix,
+            shifted_claims: true,
+            challenges: &outcome.challenges,
+            claim_masked: outcome.claim_masked,
+            fin: outcome.fin,
+            claim_pads: &claim_pads,
+            round_first: eval_rounds_first,
+            first_wire: (shape.mul_nodes + shape.num_buses) as u32,
+        })?;
+
+        records.push(table_record(TableInputs {
+            air,
+            ast,
+            instance,
+            num_vars,
+            trace_width: air.num_columns(),
+            blinding_columns: config.blind_units(),
+            alpha: masked.alpha,
+            gamma: logup.gamma,
+            beta: logup.beta,
+            r_zerocheck: &masked.r_zerocheck,
+            r_final: &r_final,
+            lookup_bus_points: logup.lookup_bus_points,
+            claimed_sums_masked: &logup_aux.claimed_sums,
+            h_evals_masked: &logup_aux.h_evals,
+            val_final_masked: masked.val_final,
+            claims_masked: claimed_values.to_vec(),
+            pads: TablePads {
+                claimed_sums: masked.claimed_sums_first,
+                zerocheck: masked.zerocheck_first,
+                h_evals: masked.h_evals_first,
+                claims: claims_first,
+            },
+            trace_eval: eval.record,
+            h_eval: masked.h_eval,
+            gadget: eval.gadget,
+        })?);
+
+        Ok(true)
     }
 
     /// Mirrors `commit_main_trace` on the verifier side:
@@ -547,14 +717,9 @@ where
         transcript.append_u64(b"num_columns", num_cols as u64);
         transcript.append_u64(b"num_rows", num_rows as u64);
         transcript.append_u64(b"ldt_support_size", config.ldt_support_size as u64);
-        transcript.append_u64(
-            b"sumcheck_blinding_factor",
-            config.sumcheck_blinding_factor as u64,
-        );
+        transcript.append_u64(b"zero_knowledge", u64::from(config.zero_knowledge));
         transcript.append_u64(b"num_queries", config.num_queries as u64);
-
-        // Bind the MDS row-code rate
-        transcript.append_u64(b"inv_rate", config.inv_rate as u64);
+        transcript.append_u64(b"outer_queries", config.outer_queries as u64);
         transcript.append_u64(b"main_row_bytes", main_plan.opened_row_bytes() as u64);
         transcript.append_u64(
             b"main_master_vectors",
@@ -578,26 +743,47 @@ where
     ///
     /// The initial sumcheck claim is `Σ_k α^k · claimed_sum_k` (LogUp bus-sum total),
     /// not zero. The consistency check at `r_final` covers AIR, boundary,
-    /// ZK blinding, and LogUp contributions.
+    /// ZK blinding, and LogUp contributions; with a pad cursor the
+    /// values are masked and the check becomes the table's record.
     #[instrument(skip_all, name = "verify_zerocheck")]
     #[allow(clippy::too_many_arguments)]
     fn verify_zerocheck<A: Air<F>>(
-        air: &A,
-        instance: &ProgramInstance<F>,
-        sc_proof: &hekate_core::proofs::SumcheckProof<F>,
+        view: &TableView<'_, F, A>,
+        proof: &TableProof<'_, F>,
         transcript: &mut Transcript<H>,
         config: &Config,
-        trace_width: usize,
         trace_values: &[Flat<F>],
         trace_values_next: &[Flat<F>],
-        bus_specs: &[(String, permutation::PermutationCheckSpec)],
-        logup_aux: &hekate_core::proofs::LogUpAux<F>,
-        gamma: Flat<F>,
-        beta: Flat<F>,
-        lookup_bus_points: &BTreeMap<String, Vec<Flat<F>>>,
-    ) -> errors::Result<Option<Vec<Flat<F>>>> {
+        logup: &LogUpContext<'_, F>,
+        mut cursor: Option<&mut PadCursor>,
+    ) -> errors::Result<Option<ZerocheckOutcome<F>>> {
+        let TableView {
+            air,
+            instance,
+            ast,
+            shape,
+            ..
+        } = *view;
+        let TableProof {
+            sc_proof,
+            logup_aux,
+            ..
+        } = *proof;
+        let LogUpContext {
+            gamma,
+            beta,
+            lookup_bus_points,
+        } = *logup;
+
+        let bus_specs = air.permutation_checks();
+        let bus_specs = bus_specs.as_slice();
+        let trace_width = air.num_columns();
+
         let num_rows = instance.num_rows();
         let num_vars = num_rows.trailing_zeros() as usize;
+        let num_buses = bus_specs.len();
+
+        let claimed_sums_first = cursor.as_deref_mut().map(|c| c.take(num_buses));
 
         // =========================================================
         // Constraint System Setup
@@ -679,23 +865,13 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let ast = air.constraint_ast();
         let boundary_constraints = air.boundary_constraints();
-
-        let mut sumcheck_degree = ast.max_degree() + 1;
-        if !boundary_constraints.is_empty() {
-            sumcheck_degree = sumcheck_degree.max(2);
-        }
-
-        // LogUp consistency `h · key · Eq` is degree 3
-        if !bus_specs.is_empty() {
-            sumcheck_degree = sumcheck_degree.max(3);
-        }
+        let sumcheck_degree = shape.sumcheck_degree;
 
         // LogUp α_pow offset must match the prover's
         // continuation past AIR + boundary + blinding.
         let logup_alpha_offset =
-            ast.roots.len() + boundary_constraints.len() + config.sumcheck_blinding_factor;
+            ast.roots.len() + boundary_constraints.len() + config.blind_units();
 
         let mut alpha_logup_start = Flat::from_raw(F::ONE);
         for _ in 0..logup_alpha_offset {
@@ -711,6 +887,10 @@ where
             }
         }
 
+        let zc_first = cursor
+            .as_deref_mut()
+            .map(|c| c.take(num_vars * sumcheck_degree));
+
         let sc_res = verify(
             num_vars,
             sumcheck_degree,
@@ -718,6 +898,8 @@ where
             sc_proof,
             transcript,
         )?;
+
+        let h_first = cursor.as_deref_mut().map(|c| c.take(num_buses));
 
         protocol::absorb_logup_h_evals(transcript, &logup_aux.h_evals);
 
@@ -731,12 +913,12 @@ where
 
         // Open `h` at r_final and pin every
         // reported h_eval to the committed h.
+        let mut h_eval_record = None;
+
         if let (Some(h_comm), Some(h_proof)) = (
             logup_aux.h_commitment.as_ref(),
             logup_aux.h_eval_proof.as_ref(),
         ) {
-            let num_buses = bus_specs.len();
-
             let (h_point, h_opened_canon) = &h_proof.point_evaluation;
 
             if canonical_slice_to_flat(h_point) != r_final {
@@ -746,20 +928,15 @@ where
                 });
             }
 
-            if h_opened_canon.len() != num_buses {
+            if h_opened_canon.len() != num_buses + config.blind_units() {
                 return Err(errors::Error::Protocol {
                     protocol: "verifier",
                     message: "logup h_eval_proof opened value count mismatch",
                 });
             }
 
-            let h_config = Config {
-                sumcheck_blinding_factor: 0,
-                ..*config
-            };
-
             let h_layout = vec![ColumnType::B128; num_buses];
-            let h_ring_plan = RingSwitchPlan::new(&h_layout, None, 0)?;
+            let h_ring_plan = RingSwitchPlan::new(&h_layout, None, config.blind_units())?;
             let h_opened = canonical_slice_to_flat(h_opened_canon);
 
             let ctx = EvalVerifyContext {
@@ -768,12 +945,18 @@ where
                 num_vars,
                 ring_plan: &h_ring_plan,
                 shifted_claims: false,
+                masked: cursor.is_some(),
             };
 
-            if !EvaluatorVerifier::<F, H>::verify(h_comm, h_proof, transcript, ctx, &h_config)? {
-                warn!("LogUp h opening verification failed");
-                return Ok(None);
-            }
+            let outcome = match EvaluatorVerifier::<F, H>::verify(
+                h_comm, h_proof, transcript, ctx, config,
+            )? {
+                Some(outcome) => outcome,
+                None => {
+                    warn!("LogUp h opening verification failed");
+                    return Ok(None);
+                }
+            };
 
             // Bind reported h_evals to the opened base values
             for (spec_idx, (_, h_eval)) in logup_aux.h_evals.iter().enumerate() {
@@ -782,6 +965,29 @@ where
                     return Ok(None);
                 }
             }
+
+            if let (Some(cursor), Some(h_first)) = (cursor, h_first) {
+                let h_blind_first = cursor.take(config.blind_units());
+                let h_round_first = cursor.take(2 * num_vars);
+
+                let mut h_pads: Vec<u32> = (0..num_buses as u32).map(|k| h_first + k).collect();
+                h_pads.extend((0..config.blind_units() as u32).map(|k| h_blind_first + k));
+
+                let output = eval_record(&EvalInputs {
+                    plan: &h_ring_plan,
+                    eta: outcome.eta,
+                    r_mix: &outcome.r_mix,
+                    shifted_claims: false,
+                    challenges: &outcome.challenges,
+                    claim_masked: outcome.claim_masked,
+                    fin: outcome.fin,
+                    claim_pads: &h_pads,
+                    round_first: h_round_first,
+                    first_wire: 0,
+                })?;
+
+                h_eval_record = Some(output.record);
+            }
         }
 
         // =========================================================
@@ -789,6 +995,23 @@ where
         // =========================================================
 
         debug!("Verifying AIR constraint consistency at r_final");
+
+        if let (Some(claimed_sums_first), Some(zerocheck_first), Some(h_evals_first)) =
+            (claimed_sums_first, zc_first, h_first)
+        {
+            return Ok(Some(ZerocheckOutcome {
+                r_final,
+                masked: Some(ZerocheckMasked {
+                    claimed_sums_first,
+                    zerocheck_first,
+                    h_evals_first,
+                    alpha,
+                    r_zerocheck,
+                    val_final,
+                    h_eval: h_eval_record,
+                }),
+            }));
+        }
 
         let eq_zc_eval = TensorProduct::evaluate_eq_slice(&r_zerocheck, &r_final);
 
@@ -869,17 +1092,15 @@ where
         }
 
         // D. Blinding Polynomial (Telescopic Sum)
-        if config.sumcheck_blinding_factor > 0 {
-            for k in 0..config.sumcheck_blinding_factor {
-                // Extract blinding values directly
-                // from the verified proof.
-                let b_k = trace_values[trace_width + k];
-                let b_k_next = trace_values_next[trace_width + k];
+        for k in 0..config.blind_units() {
+            // Extract blinding values directly
+            // from the verified proof.
+            let b_k = trace_values[trace_width + k];
+            let b_k_next = trace_values_next[trace_width + k];
 
-                // b_k * alpha - b_k_next * alpha = (b_k - b_k_next) * alpha
-                expected_val += (b_k - b_k_next) * alpha_pow;
-                alpha_pow *= alpha;
-            }
+            // b_k * alpha - b_k_next * alpha = (b_k - b_k_next) * alpha
+            expected_val += (b_k - b_k_next) * alpha_pow;
+            alpha_pow *= alpha;
         }
 
         // E. LogUp consistency + bus-sum at r_final
@@ -985,13 +1206,17 @@ where
             return Ok(None);
         }
 
-        Ok(Some(r_final))
+        Ok(Some(ZerocheckOutcome {
+            r_final,
+            masked: None,
+        }))
     }
 
     /// Aggregates lookup-bus heights from main + chiplet commitments
     /// and draws one `r_bus` per bus_id in sorted order.
     fn draw_lookup_bus_points<P: Program<F>>(
         program: &P,
+        chiplet_defs: &[ChipletDef<F>],
         proof: &InnerProof<F>,
         transcript: &mut Transcript<H>,
     ) -> errors::Result<BTreeMap<String, Vec<Flat<F>>>> {
@@ -1002,8 +1227,7 @@ where
             &mut heights,
         );
 
-        let defs = program.chiplet_defs()?;
-        for (def, c_comm) in defs.iter().zip(proof.chiplet_commitments.iter()) {
+        for (def, c_comm) in chiplet_defs.iter().zip(proof.chiplet_commitments.iter()) {
             permutation::accumulate_lookup_heights(
                 &def.permutation_checks,
                 c_comm.num_rows as u64,
@@ -1020,44 +1244,6 @@ where
             .map(|(id, v)| (id, v.into_iter().map(|x| x.to_hardware()).collect()))
             .collect())
     }
-}
-
-/// MLE of `Source::RowIndexLeBytes` at `r_final`. Linear
-/// in `r_final` because `F::from` is XOR-additive over char-2.
-pub fn eval_row_idx_le_mle<F>(num_bytes: usize, r_final: &[Flat<F>]) -> Flat<F>
-where
-    F: TowerField + HardwareField + From<u128>,
-{
-    let total_bits = (num_bytes.min(8) * 8).min(r_final.len());
-
-    let mut acc = Flat::from_raw(F::ZERO);
-    for (i, r) in r_final.iter().enumerate().take(total_bits) {
-        acc += F::from(1u128 << i).to_hardware() * *r;
-    }
-
-    acc
-}
-
-/// MLE of `Source::RowIndexByte` at `r_final`.
-/// Same char-2 shortcut as `eval_row_idx_le_mle`,
-/// restricted to one byte.
-pub fn eval_row_idx_byte_mle<F>(byte_idx: usize, r_final: &[Flat<F>]) -> Flat<F>
-where
-    F: TowerField + HardwareField + From<u128>,
-{
-    let bit_start = byte_idx.saturating_mul(8);
-    if bit_start >= r_final.len() {
-        return Flat::from_raw(F::ZERO);
-    }
-
-    let end = (bit_start + 8).min(r_final.len());
-
-    let mut acc = Flat::from_raw(F::ZERO);
-    for (j, i) in (bit_start..end).enumerate() {
-        acc += F::from(1u128 << j).to_hardware() * r_final[i];
-    }
-
-    acc
 }
 
 fn canonical_slice_to_flat<F: HardwareField>(values: &[F]) -> Vec<Flat<F>> {
