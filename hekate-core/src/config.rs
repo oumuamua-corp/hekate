@@ -10,10 +10,21 @@ use core::fmt;
 /// at the field size, 128 is the strongest attainable.
 pub const MIN_PRODUCTION_BITS: usize = 128;
 
+/// Brakedown row-code rate `1/INV_RATE`;
+/// small grids fall back to `1/(2·INV_RATE)`.
+pub const INV_RATE: usize = 2;
+
+/// Outer row-code rate `1/2^OUTER_RATE_LOG2`.
+/// Below 2 the quadratic test has no soundness.
+pub const OUTER_RATE_LOG2: u32 = 4;
+
+/// Target row count of the outer AUX oracle.
+pub const OUTER_ROWS: usize = 32;
+
 /// Precision of `log2_ratio_fixed`:
 /// 32 holds the truncation error below
 /// `num_queries · 2⁻³²`, under one bit.
-const LOG2_FRAC_BITS: u32 = 32;
+pub(crate) const LOG2_FRAC_BITS: u32 = 32;
 
 /// Failures produced by `Config::check_security`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,10 +43,17 @@ pub enum Error {
         num_queries: usize,
     },
 
-    /// `inv_rate` is not a power of two >= 2. The RS row
-    /// code takes its width from `code_width.trailing_zeros()`,
-    /// which collapses to rate-1 for a non-power-of-two rate.
-    InvalidInvRate { inv_rate: usize },
+    /// No scalar to mask;
+    /// a pad of length zero hides nothing.
+    EmptyOuterStatement,
+
+    /// No column opening;
+    /// an unopened oracle proves nothing.
+    ZeroOuterQueries,
+
+    /// The outer code outgrew the largest
+    /// additive-FFT domain we encode.
+    OuterDomainTooLarge { code_len: usize, max_log2: u32 },
 }
 
 impl fmt::Display for Error {
@@ -55,9 +73,14 @@ impl fmt::Display for Error {
                 f,
                 "ldt_support_size ({ldt_support_size}) must be >= num_queries ({num_queries})",
             ),
-            Self::InvalidInvRate { inv_rate } => {
-                write!(f, "inv_rate ({inv_rate}) must be a power of two >= 2",)
+            Self::EmptyOuterStatement => {
+                write!(f, "outer statement masks no scalars")
             }
+            Self::ZeroOuterQueries => write!(f, "outer_queries cannot be zero"),
+            Self::OuterDomainTooLarge { code_len, max_log2 } => write!(
+                f,
+                "outer code length {code_len} needs a domain above the 2^{max_log2} cap",
+            ),
         }
     }
 }
@@ -97,16 +120,8 @@ pub struct TableGeom {
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Brakedown row-code rate is `1/inv_rate`;
-    /// must be a power of two.
-    pub inv_rate: usize,
-
     /// Number of LDT spot-check queries.
     pub num_queries: usize,
-
-    /// Blinding columns for algebraic ZK
-    /// (Sumcheck), extends the 1D trace.
-    pub sumcheck_blinding_factor: usize,
 
     /// Random low-coord support that masks the LDT
     /// column openings (data ZK). Lives inside the
@@ -116,6 +131,13 @@ pub struct Config {
     /// `check_security` rejects configs
     /// whose estimated bits fall below this.
     pub min_security_bits: usize,
+
+    /// Column openings of the outer argument.
+    pub outer_queries: usize,
+
+    /// Blind units, one-time pad and outer
+    /// argument on; `false` proves in the clear.
+    pub zero_knowledge: bool,
 }
 
 impl Default for Config {
@@ -125,16 +147,16 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Production parameters: ≈128-bit soundness
-    /// with the `MIN_PRODUCTION_BITS` acceptance
+    /// Production parameters: ≈128-bit soundness with
+    /// the `MIN_PRODUCTION_BITS` acceptance
     /// threshold. The `Default`.
     pub fn prod() -> Self {
         Self {
-            inv_rate: 2,
             num_queries: 176,
-            min_security_bits: MIN_PRODUCTION_BITS,
-            sumcheck_blinding_factor: 2,
             ldt_support_size: 200,
+            min_security_bits: MIN_PRODUCTION_BITS,
+            outer_queries: 240,
+            zero_knowledge: true,
         }
     }
 
@@ -145,8 +167,15 @@ impl Config {
         Self {
             num_queries: 4,
             min_security_bits: 0,
+            outer_queries: 4,
+            zero_knowledge: false,
             ..Self::prod()
         }
+    }
+
+    /// Blind columns committed with the whole eval master.
+    pub fn blind_units(&self) -> usize {
+        usize::from(self.zero_knowledge)
     }
 
     /// Committed row-code width for the chosen per-table mode.
@@ -160,7 +189,7 @@ impl Config {
     pub fn table_geom(&self, grid_cols: usize) -> TableGeom {
         let frac = TableGeom {
             support_size: self.ldt_support_size,
-            encoded_width: grid_cols * self.inv_rate,
+            encoded_width: grid_cols * INV_RATE,
         };
 
         let frac_msg = frac.support_size + grid_cols;
@@ -173,7 +202,7 @@ impl Config {
 
         TableGeom {
             support_size: grid_cols,
-            encoded_width: grid_cols * self.inv_rate * 2,
+            encoded_width: grid_cols * INV_RATE * 2,
         }
     }
 
@@ -206,13 +235,6 @@ impl Config {
     /// Rejects configs whose estimated soundness at
     /// `grid_cols` falls below `min_security_bits`.
     pub fn check_security(&self, field_bits: usize, grid_cols: usize) -> errors::Result<()> {
-        if self.inv_rate < 2 || !self.inv_rate.is_power_of_two() {
-            return Err(Error::InvalidInvRate {
-                inv_rate: self.inv_rate,
-            }
-            .into());
-        }
-
         // dev (min_security_bits == 0) waives the ZK floor
         let support = self.table_geom(grid_cols).support_size;
         if self.min_security_bits > 0 && support < self.num_queries {
@@ -260,7 +282,7 @@ impl Config {
 
 /// `floor(log₂(n / m) · 2^LOG2_FRAC_BITS)` for `n > m >= 1`.
 /// The Q60 mantissa keeps the squaring `y² < 2¹²²`, inside `u128`.
-fn log2_ratio_fixed(n: u128, m: u128) -> u128 {
+pub(crate) fn log2_ratio_fixed(n: u128, m: u128) -> u128 {
     const S: u32 = 60;
 
     let mut scaled_m = m;
@@ -337,23 +359,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_inv_rate() {
-        for bad in [0usize, 1, 3, 6] {
-            let cfg = Config {
-                inv_rate: bad,
-                ..Config::prod()
-            };
-
-            assert!(
-                cfg.check_security(128, GRID_COLS).is_err(),
-                "inv_rate {bad} must be rejected",
-            );
-        }
-
-        assert!(Config::prod().check_security(128, GRID_COLS).is_ok());
-    }
-
-    #[test]
     fn ldt_bits_matches_float_within_one_bit() {
         let cfg = Config::prod();
 
@@ -383,10 +388,10 @@ mod tests {
 
         let big = prod.table_geom(1 << 12);
         assert_eq!(big.support_size, prod.ldt_support_size);
-        assert_eq!(big.encoded_width, prod.inv_rate << 12);
+        assert_eq!(big.encoded_width, INV_RATE << 12);
 
         let small = prod.table_geom(512);
         assert_eq!(small.support_size, 512);
-        assert_eq!(small.encoded_width, prod.inv_rate * 512 * 2);
+        assert_eq!(small.encoded_width, INV_RATE * 512 * 2);
     }
 }

@@ -42,6 +42,12 @@ pub struct InnerProof<F: TowerField> {
     pub chiplet_zerocheck_proofs: Vec<SumcheckProof<F>>,
     pub chiplet_logup_aux: Vec<LogUpAux<F>>,
     pub chiplet_eval_proofs: Vec<EvalBatchProof<F>>,
+
+    /// Absorbed before the first challenge.
+    pub pad_root: Option<[u8; 32]>,
+
+    /// Present iff `pad_root` is.
+    pub outer: Option<OuterProof<F>>,
 }
 
 impl<F: TowerField> InnerProof<F> {
@@ -55,6 +61,8 @@ impl<F: TowerField> InnerProof<F> {
         chiplet_zerocheck_proofs: Vec<SumcheckProof<F>>,
         chiplet_logup_aux: Vec<LogUpAux<F>>,
         chiplet_eval_proofs: Vec<EvalBatchProof<F>>,
+        pad_root: Option<[u8; 32]>,
+        outer: Option<OuterProof<F>>,
     ) -> Self {
         Self {
             trace_commitment,
@@ -65,8 +73,37 @@ impl<F: TowerField> InnerProof<F> {
             chiplet_zerocheck_proofs,
             chiplet_logup_aux,
             chiplet_eval_proofs,
+            pad_root,
+            outer,
         }
     }
+}
+
+// ===================================
+// OUTER ARGUMENT
+// ===================================
+
+/// One oracle's opened columns: `values` holds
+/// every column's rows back to back, in `columns`
+/// order; its length is `columns.len() * rows`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OuterOpening<F: TowerField> {
+    pub columns: Vec<u32>,
+    pub values: Vec<F>,
+    pub siblings: Vec<[u8; 32]>,
+}
+
+/// The zk-Ligero segment after the base protocol:
+/// AUX root, the three test responses, and both
+/// oracles opened at the same query columns.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OuterProof<F: TowerField> {
+    pub aux_root: [u8; 32],
+    pub interleaved: Vec<F>,
+    pub linear: Vec<F>,
+    pub quadratic: Vec<F>,
+    pub pad_opening: OuterOpening<F>,
+    pub aux_opening: OuterOpening<F>,
 }
 
 // ===================================
