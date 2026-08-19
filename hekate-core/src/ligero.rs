@@ -552,6 +552,88 @@ mod tests {
         row
     }
 
+    /// Hull-Dobell: `37x + 11` has full
+    /// period on a power-of-two modulus.
+    fn spread_columns(geom: &OuterGeometry) -> Vec<usize> {
+        let mut columns = Vec::with_capacity(geom.queries);
+        let mut c = 0usize;
+
+        while columns.len() < geom.queries {
+            c = (c * 37 + 11) % geom.domain_len;
+
+            if !columns.contains(&c) {
+                columns.push(c);
+            }
+        }
+
+        columns
+    }
+
+    fn rank(mut rows: Vec<Vec<Flat<F>>>) -> usize {
+        let zero = Flat::from_raw(F::ZERO);
+        let cols = rows.first().map_or(0, Vec::len);
+
+        let mut rank = 0;
+        for col in 0..cols {
+            let Some(pivot) = (rank..rows.len()).find(|&r| rows[r][col] != zero) else {
+                continue;
+            };
+
+            rows.swap(rank, pivot);
+
+            let inv = rows[rank][col].to_tower().invert().to_hardware();
+            for v in rows[rank][col..].iter_mut() {
+                *v *= inv;
+            }
+
+            let pivot_row = rows[rank].clone();
+
+            for (r, row) in rows.iter_mut().enumerate() {
+                if r == rank || row[col] == zero {
+                    continue;
+                }
+
+                let factor = row[col];
+                for (v, p) in row[col..].iter_mut().zip(&pivot_row[col..]) {
+                    *v += *p * factor;
+                }
+            }
+
+            rank += 1;
+        }
+
+        rank
+    }
+
+    /// `Z` vanishes on the message subspace:
+    /// `low` is the response there.
+    fn split_product_code(
+        encoder: &RowEncoder<F>,
+        geom: &OuterGeometry,
+        vanisher: &[Flat<F>],
+        response: &[Flat<F>],
+    ) -> (Vec<Flat<F>>, Vec<Flat<F>>) {
+        let evals = encoder.message_evaluations(response).unwrap().unwrap();
+
+        let mut low = vec![Flat::from_raw(F::ZERO); geom.domain_len];
+        low[..geom.code_len].copy_from_slice(&evals[..geom.code_len]);
+
+        encoder.encode(&mut low).unwrap();
+
+        let quotient: Vec<Flat<F>> = (0..geom.domain_len)
+            .map(|c| (response[c] + low[c]) * vanisher[c].to_tower().invert().to_hardware())
+            .collect();
+
+        let high_evals = encoder.message_evaluations(&quotient).unwrap().unwrap();
+
+        let mut high = vec![Flat::from_raw(F::ZERO); geom.domain_len];
+        high[..geom.code_len].copy_from_slice(&high_evals[..geom.code_len]);
+
+        encoder.encode(&mut high).unwrap();
+
+        (low, high)
+    }
+
     fn interleaved_response(
         rows: &[Vec<Flat<F>>],
         coeffs: &[Flat<F>],
@@ -873,5 +955,63 @@ mod tests {
             geom.message_len,
             &opening_at(&rows, &OPENED),
         ));
+    }
+
+    /// Row privacy: an opening is independent of
+    /// the row's message (Ligero 2017 Lemma 4.15).
+    #[test]
+    fn filler_reaches_every_opening_pattern() {
+        let geom = geometry();
+        let encoder = RowEncoder::<F>::new(&geom).unwrap();
+
+        let units: Vec<Vec<Flat<F>>> = (geom.message_len..geom.code_len)
+            .map(|i| {
+                let mut row = vec![Flat::from_raw(F::ZERO); geom.domain_len];
+                row[i] = Flat::from_raw(F::ONE);
+
+                encoder.encode(&mut row).unwrap();
+
+                row
+            })
+            .collect();
+
+        assert_eq!(units.len(), geom.queries + 1);
+
+        for columns in [spread_columns(&geom), (0..geom.queries).collect()] {
+            let map: Vec<Vec<Flat<F>>> = units
+                .iter()
+                .map(|row| columns.iter().map(|&c| row[c]).collect())
+                .collect();
+
+            assert_eq!(rank(map), geom.queries);
+        }
+    }
+
+    /// Injective on `RS[n,k]^2`, hence onto all the
+    /// product code: the mask reaches the high half.
+    #[test]
+    fn product_code_split_is_unique() {
+        let geom = geometry();
+        let encoder = RowEncoder::<F>::new(&geom).unwrap();
+        let vanisher = encoder.message_vanisher().unwrap();
+
+        assert!(vanisher.iter().all(|v| *v != Flat::from_raw(F::ZERO)));
+
+        let zero = vec![Flat::from_raw(F::ZERO); geom.domain_len];
+        let low = encoded(&encoder, &geom, 4_201);
+        let high = encoded(&encoder, &geom, 9_907);
+
+        for (a, b) in [(&low, &high), (&low, &zero), (&zero, &high)] {
+            let response: Vec<Flat<F>> = (0..geom.domain_len)
+                .map(|c| a[c] + vanisher[c] * b[c])
+                .collect();
+
+            assert!(encoder.message_evaluations(&response).unwrap().is_some());
+
+            let (split_low, split_high) = split_product_code(&encoder, &geom, &vanisher, &response);
+
+            assert_eq!(&split_low, a);
+            assert_eq!(&split_high, b);
+        }
     }
 }
