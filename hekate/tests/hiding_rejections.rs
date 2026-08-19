@@ -2,11 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Oumuamua Labs <info@oumuamua.dev>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Every verifier check that eval-claim hiding moves
-//! into the outer statement gets one mutant here:
-//! the masked value it guards is tampered and the
-//! proof must be rejected. A row that went missing
-//! would let the mutant through.
+//! The `bound` tests mutate one proof field: transcript
+//! or Merkle binding rejects them, no outer row is reached.
+//! `violating_witnesses_are_rejected` runs an honest prover
+//! on a broken witness, which only an outer row can reject.
 
 use hekate::core::config::Config;
 use hekate::core::proofs::InnerProof;
@@ -236,7 +235,7 @@ fn honest_proofs_verify() {
 }
 
 #[test]
-fn tampered_claims_are_rejected() {
+fn absorbed_claims_are_transcript_bound() {
     let (air, instance, proof) = pinned_case();
     let claims = proof.eval_proof.point_evaluation.1.len();
 
@@ -252,7 +251,7 @@ fn tampered_claims_are_rejected() {
 }
 
 #[test]
-fn tampered_zerocheck_stream_is_rejected() {
+fn absorbed_sumcheck_stream_is_transcript_bound() {
     let (air, instance, proof) = pinned_case();
 
     let mut mutant = proof.clone();
@@ -277,7 +276,7 @@ fn tampered_zerocheck_stream_is_rejected() {
 }
 
 #[test]
-fn tampered_bus_values_are_rejected() {
+fn absorbed_bus_values_are_transcript_bound() {
     let (air, instance, proof) = ram_case();
 
     let mut mutant = proof.clone();
@@ -297,7 +296,7 @@ fn tampered_bus_values_are_rejected() {
     );
 
     // The h_eval and its h-open claim share one pad entry;
-    // moving both keeps the pin and reaches the bus rows.
+    // moving both keeps the pin, and the h opening rejects.
     let mut mutant = proof.clone();
     bump(&mut mutant.main_logup_aux.h_evals[0].1);
     bump(
@@ -341,7 +340,7 @@ fn tampered_bus_values_are_rejected() {
 }
 
 #[test]
-fn tampered_outer_segment_is_rejected() {
+fn outer_segment_fields_are_bound() {
     let (air, instance, proof) = ram_case();
 
     let mut mutant = proof.clone();
