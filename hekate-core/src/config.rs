@@ -144,9 +144,8 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Production parameters: ≈128-bit soundness with
-    /// the `MIN_PRODUCTION_BITS` acceptance
-    /// threshold. The `Default`.
+    /// Production parameters: ≈128-bit soundness with the
+    /// `MIN_PRODUCTION_BITS` acceptance threshold. The `Default`.
     pub fn prod() -> Self {
         Self {
             num_queries: 176,
@@ -157,9 +156,8 @@ impl Config {
         }
     }
 
-    /// Fast, low-soundness parameters for tests
-    /// and experiments; `min_security_bits = 0`
-    /// accepts weak grids. Never deploy.
+    /// Fast, low-soundness parameters for tests and experiments;
+    /// `min_security_bits = 0` accepts weak grids. Never deploy.
     pub fn dev() -> Self {
         Self {
             num_queries: 4,
