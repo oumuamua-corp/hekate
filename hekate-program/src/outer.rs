@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use core::mem;
 use hekate_core::errors;
 use hekate_core::outer::{OUTER_MASK_ROWS, OuterGeometry};
-use hekate_core::poly::univariate::UnivariatePoly;
+use hekate_core::poly::univariate::{MAX_POINTS, UnivariatePoly};
 use hekate_core::tensor::TensorProduct;
 use hekate_math::{Block128, Flat, HardwareField, TowerField};
 
@@ -92,6 +92,20 @@ impl TableShape {
 
         if num_buses > 0 {
             sumcheck_degree = sumcheck_degree.max(3);
+        }
+
+        if sumcheck_degree + 1 > MAX_POINTS {
+            return Err(errors::Error::Protocol {
+                protocol: "air",
+                message: "sumcheck degree exceeds the interpolation stack bound",
+            });
+        }
+
+        if air.num_columns() != air.virtual_column_layout().len() {
+            return Err(errors::Error::Protocol {
+                protocol: "air",
+                message: "num_columns does not match the virtual column layout",
+            });
         }
 
         let entries = air.virtual_expander().map(|e| e.expansion_entries());
@@ -1534,6 +1548,54 @@ mod tests {
 
         assert_eq!(mentions(&[lhs], bus.h_wire, WireRole::Lhs), 1);
         assert_eq!(mentions(&[rhs], bus.h_wire, WireRole::Rhs), 1);
+    }
+
+    #[test]
+    fn bus_operand_rows_reject_free_operand() {
+        let plain: Vec<Flat<F>> = (0..4).map(|i| mix(200 + i)).collect();
+        let pad: Vec<Flat<F>> = (0..32).map(|i| mix(300 + i)).collect();
+        let claims_masked: Vec<Flat<F>> = plain
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| c + pad[BUS_PAD_FIRST as usize + i])
+            .collect();
+
+        let beta = mix(9);
+        let h = mix(400);
+        let h_masked = h + pad[BUS_H_PAD as usize];
+        let key = plain[0] + beta * mix(BUS_PUBLIC);
+
+        let record = bus_record(claims_masked.clone(), h_masked, beta);
+        let bus = &record.consistency.buses[0];
+        let [lhs, _] = bus_operand_rows(bus, BUS_PAD_FIRST, beta);
+
+        let one = Flat::from_raw(F::ONE);
+        let forged = |role: WireRole| match role {
+            WireRole::Lhs => one,
+            WireRole::Rhs | WireRole::Product => h * key,
+        };
+
+        assert_eq!(
+            forged(WireRole::Lhs) * forged(WireRole::Rhs),
+            forged(WireRole::Product)
+        );
+
+        let mut left = Flat::from_raw(F::ZERO);
+        for &(u, coeff) in &lhs.unknowns {
+            let value = match u {
+                Unknown::Pad(i) => pad[i as usize],
+                Unknown::Wire { role, .. } => forged(role),
+            };
+
+            left += coeff * value;
+        }
+
+        let mut right = lhs.constant;
+        for &(idx, coeff) in &lhs.claims {
+            right += coeff * claims_masked[idx as usize];
+        }
+
+        assert_ne!(left, right);
     }
 
     #[test]
