@@ -490,6 +490,11 @@ mod tests {
     use alloc::vec::Vec;
     use hekate_math::{Block128, TowerField};
 
+    const OPENED: [usize; 4] = [1, 9, 40, 77];
+
+    /// A domain index outside [`OPENED`].
+    const UNOPENED: usize = 5;
+
     type F = Block128;
 
     fn geometry() -> OuterGeometry {
@@ -512,6 +517,57 @@ mod tests {
         }
 
         row
+    }
+
+    fn opening_at(rows: &[Vec<Flat<F>>], columns: &[usize]) -> Opening<F> {
+        Opening {
+            columns: columns
+                .iter()
+                .map(|&c| (c, rows.iter().map(|r| r[c]).collect()))
+                .collect(),
+            siblings: Vec::new(),
+        }
+    }
+
+    fn encoded(encoder: &RowEncoder<F>, geom: &OuterGeometry, salt: u128) -> Vec<Flat<F>> {
+        let mut row = message(geom, salt);
+        encoder.encode(&mut row).unwrap();
+
+        row
+    }
+
+    /// Uniform message summing to zero over the code domain.
+    fn zero_sum_row(encoder: &RowEncoder<F>, geom: &OuterGeometry, salt: u128) -> Vec<Flat<F>> {
+        let mut row = vec![Flat::from_raw(F::ZERO); geom.domain_len];
+        let mut acc = Flat::from_raw(F::ZERO);
+
+        for (i, slot) in row[..geom.code_len - 1].iter_mut().enumerate() {
+            *slot = mix(i as u128 + salt);
+            acc += *slot;
+        }
+
+        row[geom.code_len - 1] = acc;
+        encoder.encode(&mut row).unwrap();
+
+        row
+    }
+
+    fn interleaved_response(
+        rows: &[Vec<Flat<F>>],
+        coeffs: &[Flat<F>],
+        mask: usize,
+        domain_len: usize,
+    ) -> Vec<Flat<F>> {
+        (0..domain_len)
+            .map(|c| {
+                let mut acc = rows[mask][c];
+                for (r, k) in coeffs.iter().enumerate() {
+                    acc += *k * rows[r][c];
+                }
+
+                acc
+            })
+            .collect()
     }
 
     #[test]
@@ -601,5 +657,221 @@ mod tests {
         let mut row = vec![Flat::from_raw(F::ZERO); geom.domain_len - 1];
 
         assert!(encoder.encode(&mut row).is_err());
+    }
+
+    #[test]
+    fn interleaved_test_rejects_row_off_code() {
+        let geom = geometry();
+        let encoder = RowEncoder::<F>::new(&geom).unwrap();
+
+        let mut rows: Vec<Vec<Flat<F>>> = (0..4)
+            .map(|i| encoded(&encoder, &geom, 100 * i + 1))
+            .collect();
+
+        let coeffs: Vec<Flat<F>> = (0..3).map(|i| mix(i as u128 + 7_000)).collect();
+        let mask = 3;
+
+        let honest = interleaved_response(&rows, &coeffs, mask, geom.domain_len);
+
+        assert!(verify_interleaved(
+            &encoder,
+            &honest,
+            &coeffs,
+            mask,
+            &opening_at(&rows, &OPENED),
+        ));
+
+        rows[0][UNOPENED] += Flat::from_raw(F::ONE);
+
+        let off_code = interleaved_response(&rows, &coeffs, mask, geom.domain_len);
+
+        assert!(!verify_interleaved(
+            &encoder,
+            &off_code,
+            &coeffs,
+            mask,
+            &opening_at(&rows, &OPENED),
+        ));
+    }
+
+    #[test]
+    fn interleaved_test_rejects_column_that_misses_response() {
+        let geom = geometry();
+        let encoder = RowEncoder::<F>::new(&geom).unwrap();
+
+        let rows: Vec<Vec<Flat<F>>> = (0..4)
+            .map(|i| encoded(&encoder, &geom, 200 * i + 3))
+            .collect();
+
+        let coeffs: Vec<Flat<F>> = (0..3).map(|i| mix(i as u128 + 8_000)).collect();
+        let mask = 3;
+
+        let response = interleaved_response(&rows, &coeffs, mask, geom.domain_len);
+        let mut opening = opening_at(&rows, &OPENED);
+
+        opening.columns[0].1[0] += Flat::from_raw(F::ONE);
+
+        assert!(!verify_interleaved(
+            &encoder, &response, &coeffs, mask, &opening,
+        ));
+    }
+
+    #[test]
+    fn linear_test_rejects_wrong_target() {
+        let geom = geometry();
+        let encoder = RowEncoder::<F>::new(&geom).unwrap();
+        let vanisher = encoder.message_vanisher().unwrap();
+
+        let data_msgs: Vec<Vec<Flat<F>>> = (0..2).map(|i| message(&geom, 300 * i + 11)).collect();
+        let weight_msgs: Vec<Vec<Flat<F>>> = (0..2)
+            .map(|i| {
+                let mut w = vec![Flat::from_raw(F::ZERO); geom.domain_len];
+                for (c, slot) in w[..geom.message_len].iter_mut().enumerate() {
+                    *slot = mix(c as u128 + 400 * i + 17);
+                }
+
+                w
+            })
+            .collect();
+
+        let mut target = Flat::from_raw(F::ZERO);
+        for (w, u) in weight_msgs.iter().zip(&data_msgs) {
+            for c in 0..geom.message_len {
+                target += w[c] * u[c];
+            }
+        }
+
+        let mut rows: Vec<Vec<Flat<F>>> = data_msgs
+            .iter()
+            .map(|m| {
+                let mut row = m.clone();
+                encoder.encode(&mut row).unwrap();
+
+                row
+            })
+            .collect();
+
+        rows.push(zero_sum_row(&encoder, &geom, 991));
+        rows.push(encoded(&encoder, &geom, 1_313));
+
+        let weights = encode_weights(&encoder, weight_msgs).unwrap();
+        let mask = ProductMask {
+            low: 2,
+            high: 3,
+            vanisher: &vanisher,
+        };
+
+        let response: Vec<Flat<F>> = (0..geom.domain_len)
+            .map(|c| {
+                let mut acc = rows[2][c] + vanisher[c] * rows[3][c];
+                for (w, u) in weights.iter().zip(&rows) {
+                    acc += w[c] * u[c];
+                }
+
+                acc
+            })
+            .collect();
+
+        let rows_used = [0usize, 1];
+        let opening = opening_at(&rows, &OPENED);
+
+        assert!(verify_linear(
+            &encoder, &response, &weights, &rows_used, &mask, target, &opening,
+        ));
+
+        assert!(!verify_linear(
+            &encoder,
+            &response,
+            &weights,
+            &rows_used,
+            &mask,
+            target + Flat::from_raw(F::ONE),
+            &opening,
+        ));
+    }
+
+    #[test]
+    fn quadratic_test_rejects_broken_triple() {
+        let geom = geometry();
+        let encoder = RowEncoder::<F>::new(&geom).unwrap();
+        let vanisher = encoder.message_vanisher().unwrap();
+
+        let build = |break_triple: bool| -> (Vec<Vec<Flat<F>>>, Vec<Flat<F>>) {
+            let x = message(&geom, 501);
+            let y = message(&geom, 607);
+
+            let mut z = message(&geom, 709);
+            for c in 0..geom.message_len {
+                z[c] = x[c] * y[c];
+            }
+
+            if break_triple {
+                z[0] += Flat::from_raw(F::ONE);
+            }
+
+            let mut rows: Vec<Vec<Flat<F>>> = [x, y, z]
+                .into_iter()
+                .map(|mut m| {
+                    encoder.encode(&mut m).unwrap();
+
+                    m
+                })
+                .collect();
+
+            let mut low = vec![Flat::from_raw(F::ZERO); geom.domain_len];
+            for (c, slot) in low[geom.message_len..geom.code_len].iter_mut().enumerate() {
+                *slot = mix(c as u128 + 811);
+            }
+
+            encoder.encode(&mut low).unwrap();
+
+            rows.push(low);
+            rows.push(encoded(&encoder, &geom, 907));
+
+            let r_quad = [mix(1_009)];
+            let response: Vec<Flat<F>> = (0..geom.domain_len)
+                .map(|c| {
+                    let mut acc = rows[3][c] + vanisher[c] * rows[4][c];
+                    acc += r_quad[0] * (rows[0][c] * rows[1][c] - rows[2][c]);
+
+                    acc
+                })
+                .collect();
+
+            (rows, response)
+        };
+
+        let mask = ProductMask {
+            low: 3,
+            high: 4,
+            vanisher: &vanisher,
+        };
+
+        let triples = [[0usize, 1, 2]];
+        let r_quad = [mix(1_009)];
+
+        let (rows, response) = build(false);
+
+        assert!(verify_quadratic(
+            &encoder,
+            &response,
+            &triples,
+            &r_quad,
+            &mask,
+            geom.message_len,
+            &opening_at(&rows, &OPENED),
+        ));
+
+        let (rows, response) = build(true);
+
+        assert!(!verify_quadratic(
+            &encoder,
+            &response,
+            &triples,
+            &r_quad,
+            &mask,
+            geom.message_len,
+            &opening_at(&rows, &OPENED),
+        ));
     }
 }

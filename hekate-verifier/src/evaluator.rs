@@ -638,6 +638,8 @@ mod tests {
     use hekate_core::poly::PolyVariant;
     use hekate_math::TowerField;
 
+    const GRID_COLS: usize = 1024;
+
     fn elems(seed: u128, n: usize) -> Vec<Block128> {
         let g = Block128(0x2545F4914F6CDD1D_517CC1B727220A95);
 
@@ -650,6 +652,10 @@ mod tests {
         }
 
         out
+    }
+
+    fn rs_row(seed: u128, len: usize) -> Vec<Flat<Block128>> {
+        elems(seed, len).iter().map(|v| v.to_hardware()).collect()
     }
 
     fn k_p_on_cube(point: &[Block128]) -> Vec<Block128> {
@@ -771,5 +777,41 @@ mod tests {
 
         assert_eq!(rows, expected);
         assert_eq!(transpose128(&rows), cols);
+    }
+
+    /// The proximity fold commutes with the encode
+    /// only while `rs_encode_row` stays linear
+    /// over its own support / data split.
+    #[test]
+    fn rs_encode_row_is_linear() {
+        let config = Config::prod();
+        let len = GRID_COLS + config.table_geom(GRID_COLS).support_size;
+
+        let a = rs_row(0x11, len);
+        let b = rs_row(0x22, len);
+        let sum: Vec<Flat<Block128>> = a.iter().zip(&b).map(|(x, y)| *x + *y).collect();
+
+        let ea = rs_encode_row::<Block128>(&a, GRID_COLS, &config).unwrap();
+        let eb = rs_encode_row::<Block128>(&b, GRID_COLS, &config).unwrap();
+        let es = rs_encode_row::<Block128>(&sum, GRID_COLS, &config).unwrap();
+
+        for ((x, y), s) in ea.iter().zip(&eb).zip(&es) {
+            assert_eq!(*x + *y, *s);
+        }
+    }
+
+    #[test]
+    fn rs_encode_row_meets_singleton_bound() {
+        let config = Config::prod();
+        let len = GRID_COLS + config.table_geom(GRID_COLS).support_size;
+
+        let code = rs_encode_row::<Block128>(&rs_row(0x33, len), GRID_COLS, &config).unwrap();
+
+        let zeros = code
+            .iter()
+            .filter(|v| **v == Flat::from_raw(Block128::ZERO))
+            .count();
+
+        assert!(zeros < len);
     }
 }
