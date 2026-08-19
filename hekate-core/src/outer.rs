@@ -256,11 +256,11 @@ mod tests {
     const FIELD_BITS: usize = 128;
 
     #[test]
-    fn prod_geometry_meets_production_floor() {
+    fn prod_geometry_saturates_field_width() {
         let cfg = Config::prod();
         let geom = cfg.outer_geom(12_000, 20_000, FIELD_BITS).unwrap();
 
-        assert!(cfg.outer_security_bits(FIELD_BITS, &geom) >= 128);
+        assert!(cfg.outer_security_bits(FIELD_BITS, &geom) >= FIELD_BITS);
     }
 
     #[test]
