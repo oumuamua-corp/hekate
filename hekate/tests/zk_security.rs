@@ -1048,7 +1048,10 @@ fn truncation_overflow_injection() {
     // into the dynamic offset.
     // A `Bit` must strictly be
     // evaluated as 0x00 or 0x01.
-    col_data[target_offset] = 0xFE;
+    col_data[target_offset] = match col_data[target_offset] {
+        0xFE => 0xFD,
+        _ => 0xFE,
+    };
 
     // 2. Verify the corrupted proof
     let mut verifier_transcript = Transcript::<H>::new(b"ZK_Truncation");
