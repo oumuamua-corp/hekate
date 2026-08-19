@@ -197,10 +197,10 @@ impl Config {
         Ok(geom)
     }
 
+    /// Query term only; pair with [`Config::outer_field_term_bits`].
     /// Unique-decoding regime: proximity `e <= (n - k) / 3`,
-    /// interleaved test base `(2n + k) / 3n`, linear and
-    /// quadratic test base `(n + 5k) / 3n`, each raised to
-    /// `t` (Ligero 2017 Fig 8-11). The worse of the two governs.
+    /// interleaved test base `(2n + k) / 3n`, linear and quadratic test
+    /// base `(n + 5k) / 3n`, each raised to `t` (Ligero 2017 Fig 8-11).
     pub fn outer_security_bits(&self, field_bits: usize, geom: &OuterGeometry) -> usize {
         let n = geom.domain_len as u128;
         let k = geom.code_len as u128;
@@ -214,6 +214,16 @@ impl Config {
         bits.min(field_bits)
     }
 
+    /// Ligero 2017 Lemma 4.2's additive
+    /// term `(e + 1) / |F|`, in bits.
+    pub fn outer_field_term_bits(&self, field_bits: usize, geom: &OuterGeometry) -> usize {
+        let n = geom.domain_len as u128;
+        let k = geom.code_len as u128;
+        let e = (n.saturating_sub(k)) / 3;
+
+        field_bits.saturating_sub((e + 1).next_power_of_two().ilog2() as usize)
+    }
+
     pub fn check_outer_security(
         &self,
         field_bits: usize,
@@ -223,7 +233,9 @@ impl Config {
             return Ok(());
         }
 
-        let estimated_bits = self.outer_security_bits(field_bits, geom);
+        let estimated_bits = self
+            .outer_security_bits(field_bits, geom)
+            .min(self.outer_field_term_bits(field_bits, geom));
 
         if estimated_bits < self.min_security_bits {
             return Err(Error::SecurityTooLow {

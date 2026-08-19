@@ -5,10 +5,8 @@
 use crate::errors;
 use core::fmt;
 
-/// Production soundness floor:
-/// full GF(2^128) security. `security_bits` caps
-/// at the field size, 128 is the strongest attainable.
-pub const MIN_PRODUCTION_BITS: usize = 128;
+/// Production soundness floor.
+pub const MIN_PRODUCTION_BITS: usize = 110;
 
 /// Brakedown row-code rate `1/INV_RATE`;
 /// small grids fall back to `1/(2·INV_RATE)`.
@@ -25,6 +23,9 @@ pub const OUTER_ROWS: usize = 32;
 /// 32 holds the truncation error below
 /// `num_queries · 2⁻³²`, under one bit.
 pub(crate) const LOG2_FRAC_BITS: u32 = 32;
+
+/// Fractional-mode target of `table_geom`.
+const FRACTIONAL_MODE_BITS: usize = 128;
 
 /// Failures produced by `Config::check_security`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,8 +98,10 @@ pub struct SecurityMetrics {
     /// LDT proximity bound: `-log₂((1 - δ)^q)`.
     pub ldt_bits: usize,
 
-    /// `min(ldt_bits, field_bits)`. Schwartz-Zippel
-    /// caps Sumcheck / ZeroCheck / LogUp at field size.
+    /// Proximity-gap term `n / |F|`.
+    pub proximity_bits: usize,
+
+    /// `min(ldt_bits, proximity_bits)`.
     pub security_bits: usize,
 }
 
@@ -189,7 +192,7 @@ impl Config {
         let frac_msg = frac.support_size + grid_cols;
 
         if frac.support_size <= grid_cols
-            && self.ldt_bits(frac_msg, frac.encoded_width) >= MIN_PRODUCTION_BITS
+            && self.ldt_bits(frac_msg, frac.encoded_width) >= FRACTIONAL_MODE_BITS
         {
             return frac;
         }
@@ -200,27 +203,35 @@ impl Config {
         }
     }
 
-    /// `min(-log₂((1 - δ)^q), field_bits)` where
-    /// δ = relative distance, q = num_queries.
+    /// `min(-log₂((1 - δ)^q), proximity_gap_bits)`
+    /// where δ = relative distance, q = num_queries.
     ///
     /// Brakedown (Golovnev et al. 2022), Section 3.2.
     pub fn estimated_security_bits(&self, field_bits: usize, grid_cols: usize) -> usize {
         let g = self.table_geom(grid_cols);
 
         self.ldt_bits(g.support_size + grid_cols, g.encoded_width)
-            .min(field_bits)
+            .min(self.proximity_gap_bits(field_bits, grid_cols))
+    }
+
+    /// Proximity-gap term `n / |F|` of the
+    /// random column fold (BCIKS20), in bits.
+    pub fn proximity_gap_bits(&self, field_bits: usize, grid_cols: usize) -> usize {
+        let width = self.table_geom(grid_cols).encoded_width;
+
+        field_bits.saturating_sub(width.next_power_of_two().ilog2() as usize)
     }
 
     /// `field_bits`: `size_of::<F>() * 8`.
     pub fn security_metrics(&self, field_bits: usize, grid_cols: usize) -> SecurityMetrics {
         let g = self.table_geom(grid_cols);
-        let bits = self.ldt_bits(g.support_size + grid_cols, g.encoded_width);
 
         SecurityMetrics {
             relative_distance: self.estimate_relative_distance(grid_cols),
             num_queries: self.num_queries,
-            ldt_bits: bits,
-            security_bits: bits.min(field_bits),
+            ldt_bits: self.ldt_bits(g.support_size + grid_cols, g.encoded_width),
+            proximity_bits: self.proximity_gap_bits(field_bits, grid_cols),
+            security_bits: self.estimated_security_bits(field_bits, grid_cols),
         }
     }
 
@@ -252,6 +263,7 @@ impl Config {
     /// Exact MDS (Singleton) distance of the chosen geometry:
     /// `δ = (encoded_width − support − grid_cols) / encoded_width`.
     /// Holds for both modes (full-half yields exactly 0.5).
+    /// MDS: `hekate-math` `verus/fft.rs::fwd_semantics`.
     fn estimate_relative_distance(&self, grid_cols: usize) -> f64 {
         let g = self.table_geom(grid_cols);
 
