@@ -172,8 +172,12 @@ where
         let metrics = config.security_metrics(field_bits, main_grid_cols);
 
         info!(
-            "System Security: ~{} bits (LDT: {}, Field: {}, Distance: {:.4})",
-            metrics.security_bits, metrics.ldt_bits, field_bits, metrics.relative_distance,
+            "System Security: ~{} bits (LDT: {}, Proximity: {}, Field: {}, Distance: {:.4})",
+            metrics.security_bits,
+            metrics.ldt_bits,
+            metrics.proximity_bits,
+            field_bits,
+            metrics.relative_distance,
         );
 
         config.check_security(field_bits, main_grid_cols)?;
