@@ -259,7 +259,7 @@ fn main() {
     let num_rows = 1 << num_vars;
 
     let config = Config {
-        zero_knowledge: true,
+        zero_knowledge: std::env::var("HEKATE_ZK").as_deref() != Ok("0"),
         ..Config::default()
     };
 
