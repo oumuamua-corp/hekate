@@ -186,15 +186,11 @@ fn generate_fib_trace(num_vars: usize) -> errors::Result<ColumnTrace> {
 fn main() {
     common::init("Fibonacci (integer, 32-bit)");
 
-    let num_vars: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(24);
-
+    let num_vars = common::num_vars(24);
     let num_rows = 1 << num_vars;
 
     let config = Config {
-        zero_knowledge: false,
+        zero_knowledge: common::zero_knowledge(),
         ..Config::default()
     };
 

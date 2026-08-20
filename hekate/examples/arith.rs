@@ -134,7 +134,7 @@ fn main() {
     let num_ops: usize = num_rows;
 
     let config = Config {
-        zero_knowledge: true,
+        zero_knowledge: common::zero_knowledge(),
         ..Config::default()
     };
 

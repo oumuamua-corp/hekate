@@ -146,9 +146,8 @@ fn main() {
     let num_vars = 20;
     let num_rows = 1 << num_vars;
 
-    // ZK mode shows the maximum memory pressure
     let config = Config {
-        zero_knowledge: true,
+        zero_knowledge: common::zero_knowledge(),
         ..Config::default()
     };
 

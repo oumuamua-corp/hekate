@@ -187,15 +187,11 @@ fn main() {
     common::init("Keccak-f[1600]");
 
     // Setup parameters
-    let num_vars: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(15);
-
+    let num_vars = common::num_vars(15);
     let num_rows = 1 << num_vars;
 
     let config = Config {
-        zero_knowledge: true,
+        zero_knowledge: common::zero_knowledge(),
         ..Config::default()
     };
 

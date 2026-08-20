@@ -340,7 +340,7 @@ fn main() {
     let ram_num_vars = ram_num_rows.trailing_zeros() as usize;
 
     let config = Config {
-        zero_knowledge: true,
+        zero_knowledge: common::zero_knowledge(),
         ..Config::default()
     };
 

@@ -176,7 +176,7 @@ fn main() {
     let num_rows: usize = 1 << num_vars;
 
     let config = Config {
-        zero_knowledge: true,
+        zero_knowledge: common::zero_knowledge(),
         ..Config::default()
     };
 

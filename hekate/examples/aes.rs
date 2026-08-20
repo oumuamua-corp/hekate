@@ -165,7 +165,7 @@ fn prove_and_verify<P: Program<F> + Air<F>>(
     // Phase 3:
     // Prove
     let config = Config {
-        zero_knowledge: true,
+        zero_knowledge: common::zero_knowledge(),
         ..Config::default()
     };
 
@@ -462,7 +462,7 @@ fn build_cpu256_trace(
 // =================================================================
 
 fn main() {
-    let level = std::env::args().nth(1).unwrap_or_else(|| "128".to_string());
+    let level = common::level("128");
 
     match level.as_str() {
         "128" => {
@@ -474,7 +474,7 @@ fn main() {
             run_aes256();
         }
         other => {
-            eprintln!("Usage: aes_chiplet [128|256] (got {:?})", other);
+            eprintln!("Usage: HEKATE_LEVEL=[128|256] aes (got {:?})", other);
             std::process::exit(1);
         }
     }

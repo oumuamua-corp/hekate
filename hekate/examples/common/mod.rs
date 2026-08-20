@@ -253,6 +253,25 @@ pub fn result(is_valid: bool) {
     }
 }
 
+/// `HEKATE_ZK=0` proves in the clear,
+/// anything else in zero knowledge.
+pub fn zero_knowledge() -> bool {
+    std::env::var("HEKATE_ZK").as_deref() != Ok("0")
+}
+
+#[allow(dead_code)]
+pub fn num_vars(default: usize) -> usize {
+    std::env::var("HEKATE_NUM_VARS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+#[allow(dead_code)]
+pub fn level(default: &str) -> String {
+    std::env::var("HEKATE_LEVEL").unwrap_or_else(|_| default.to_string())
+}
+
 fn enc_size<T: serde::Serialize>(val: &T, cfg: bincode::config::Configuration) -> usize {
     bincode::serde::encode_to_vec(val, cfg).unwrap().len()
 }
