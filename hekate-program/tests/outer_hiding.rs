@@ -7,8 +7,8 @@
 
 use hekate_core::config::Config;
 use hekate_core::ligero::{
-    Opening, ProductMask, RowEncoder, column_leaf, encode_weights, verify_interleaved,
-    verify_linear, verify_opening, verify_quadratic,
+    Opening, ProductMask, RowEncoder, column_leaf, verify_interleaved, verify_linear,
+    verify_opening, verify_quadratic, weights_at_columns,
 };
 use hekate_core::outer::OuterGeometry;
 use hekate_core::proofs::OuterOpening;
@@ -178,6 +178,28 @@ fn inv(v: Flat<K>) -> Flat<K> {
     v.to_tower().invert().to_hardware()
 }
 
+fn wire_form(outer: &Outer, response: &[Flat<K>], len: usize) -> Vec<Flat<K>> {
+    outer.encoder.coefficients(response).unwrap()[..len].to_vec()
+}
+
+fn is_codeword(outer: &Outer, values: &[Flat<K>]) -> bool {
+    outer.encoder.coefficients(values).unwrap()[outer.geom.code_len..]
+        .iter()
+        .all(|c| *c == zero())
+}
+
+fn sum_on_message(outer: &Outer, values: &[Flat<K>]) -> Flat<K> {
+    outer.encoder.message_evaluations(values).unwrap().unwrap()[..outer.geom.code_len]
+        .iter()
+        .fold(zero(), |a, b| a + *b)
+}
+
+fn vanishes_on_message(outer: &Outer, values: &[Flat<K>]) -> bool {
+    outer.encoder.message_evaluations(values).unwrap().unwrap()[..outer.geom.message_len]
+        .iter()
+        .all(|v| *v == zero())
+}
+
 fn coins(outer: &Outer, state: &mut u128) -> Coins {
     let Outer { geom, layout, .. } = outer;
 
@@ -202,15 +224,7 @@ fn coins(outer: &Outer, state: &mut u128) -> Coins {
         .map(|_| (0..geom.message_len).map(|_| rnd(state)).collect())
         .collect();
 
-    let weights: Vec<Vec<Flat<K>>> = messages
-        .iter()
-        .map(|message| {
-            let mut row = vec![zero(); geom.domain_len];
-            row[..geom.message_len].copy_from_slice(message);
-
-            row
-        })
-        .collect();
+    let weights: Vec<Vec<Flat<K>>> = messages.iter().map(|m| codeword(outer, m)).collect();
 
     let triples = layout.hadamard_triples();
     let interleaved: Vec<Flat<K>> = (0..layout.total_rows() - 1).map(|_| rnd(state)).collect();
@@ -223,7 +237,7 @@ fn coins(outer: &Outer, state: &mut u128) -> Coins {
         columns,
         interleaved,
         messages,
-        weights: encode_weights(&outer.encoder, weights).unwrap(),
+        weights,
         rows_used,
         target,
         triples,
@@ -362,9 +376,9 @@ fn simulate(outer: &Outer, coins: &Coins, state: &mut u128) -> View {
         aux_root,
         pad,
         aux,
-        interleaved,
-        linear,
-        quadratic,
+        interleaved: wire_form(outer, &interleaved, outer.geom.code_len),
+        linear: wire_form(outer, &linear, 2 * outer.geom.code_len),
+        quadratic: wire_form(outer, &quadratic, 2 * outer.geom.code_len),
     }
 }
 
@@ -390,6 +404,9 @@ fn accepts(outer: &Outer, coins: &Coins, view: &View) -> bool {
     let aux = Opening::from_wire(&view.aux, aux_rows).unwrap();
     let stacked = Opening::stack(&[&pad, &aux]).unwrap();
 
+    let opened_weights =
+        weights_at_columns(encoder, coins.messages.clone(), &coins.columns).unwrap();
+
     let linear_mask = ProductMask {
         low: layout.linear_mask(),
         high: layout.linear_mask_hi(),
@@ -411,7 +428,7 @@ fn accepts(outer: &Outer, coins: &Coins, view: &View) -> bool {
     ) && verify_linear(
         encoder,
         &view.linear,
-        &coins.weights,
+        &opened_weights,
         &coins.rows_used,
         &linear_mask,
         coins.target,
@@ -533,9 +550,9 @@ fn honest_view(outer: &Outer, coins: &Coins, rows: &[Vec<Flat<K>>]) -> View {
         aux_root,
         pad,
         aux,
-        interleaved,
-        linear,
-        quadratic,
+        interleaved: wire_form(outer, &interleaved, geom.code_len),
+        linear: wire_form(outer, &linear, 2 * geom.code_len),
+        quadratic: wire_form(outer, &quadratic, 2 * geom.code_len),
     }
 }
 
@@ -561,7 +578,7 @@ fn interleaved_mask_spans_row_code() {
         let images = mask_images(&outer, |rows, c| rows[row][c]);
 
         for image in &images {
-            assert!(outer.encoder.is_codeword(image).unwrap(), "{wires} wires");
+            assert!(is_codeword(&outer, image), "{wires} wires");
         }
 
         assert_eq!(rank(images), outer.geom.code_len, "{wires} wires");
@@ -582,16 +599,12 @@ fn linear_mask_spans_zero_sum_product_code() {
         });
 
         for image in &images {
-            assert_eq!(
-                outer.encoder.sum_on_message(image).unwrap(),
-                Some(zero()),
-                "{wires} wires"
-            );
+            assert_eq!(sum_on_message(&outer, image), zero(), "{wires} wires");
         }
 
         let sums: Vec<Vec<Flat<K>>> = product_code_basis(&outer)
             .iter()
-            .map(|v| vec![outer.encoder.sum_on_message(v).unwrap().unwrap()])
+            .map(|v| vec![sum_on_message(&outer, v)])
             .collect();
 
         let constrained = 2 * outer.geom.code_len - rank(sums);
@@ -617,13 +630,7 @@ fn quadratic_mask_spans_vanishing_product_code() {
         });
 
         for image in &images {
-            assert!(
-                outer
-                    .encoder
-                    .vanishes_on_message(image, outer.geom.message_len)
-                    .unwrap(),
-                "{wires} wires"
-            );
+            assert!(vanishes_on_message(&outer, image), "{wires} wires");
         }
 
         let evals: Vec<Vec<Flat<K>>> = product_code_basis(&outer)

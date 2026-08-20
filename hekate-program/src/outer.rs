@@ -1125,7 +1125,7 @@ pub fn linear_weights<F: TowerField + HardwareField>(
 
     let scales: Vec<Flat<F>> = batch.iter().map(|r| r.to_hardware()).collect();
 
-    let mut weights = vec![vec![Flat::from_raw(F::ZERO); layout.domain_len]; layout.total_rows()];
+    let mut weights = vec![vec![Flat::from_raw(F::ZERO); layout.message_len]; layout.total_rows()];
     let mut target = Flat::from_raw(F::ZERO);
 
     for (row, &scale) in rows.affine.iter().zip(&scales) {
@@ -1148,11 +1148,7 @@ pub fn linear_weights<F: TowerField + HardwareField>(
     }
 
     let used: Vec<usize> = (0..layout.total_rows())
-        .filter(|&r| {
-            weights[r][..layout.message_len]
-                .iter()
-                .any(|v| *v != Flat::from_raw(F::ZERO))
-        })
+        .filter(|&r| weights[r].iter().any(|v| *v != Flat::from_raw(F::ZERO)))
         .collect();
 
     let selected = used.iter().map(|&r| mem::take(&mut weights[r])).collect();

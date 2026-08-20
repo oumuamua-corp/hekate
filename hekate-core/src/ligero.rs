@@ -11,6 +11,8 @@ use hekate_crypto::Hasher;
 use hekate_crypto::merkle::MerkleTree;
 use hekate_math::fft::vanish_eval;
 use hekate_math::{AdditiveFft, BinaryFieldExtras, Flat, HardwareField, TowerField};
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 const MAX_LOG: u32 = 63;
 
@@ -35,6 +37,7 @@ impl<F: TowerField + HardwareField> ProductMask<'_, F> {
 pub struct RowEncoder<F> {
     message: AdditiveFft<F>,
     code: AdditiveFft<F>,
+    product: AdditiveFft<F>,
     code_shift: Flat<F>,
     code_len: usize,
     domain_len: usize,
@@ -78,6 +81,7 @@ impl<F: BinaryFieldExtras + HardwareField> RowEncoder<F> {
         Ok(Self {
             message: AdditiveFft::new(log_k),
             code: AdditiveFft::new(log_n),
+            product: AdditiveFft::new(log_k + 1),
             code_shift: beta.to_hardware(),
             code_len: geom.code_len,
             domain_len: geom.domain_len,
@@ -111,11 +115,36 @@ impl<F: BinaryFieldExtras + HardwareField> RowEncoder<F> {
         Ok(())
     }
 
-    pub fn is_codeword(&self, values: &[Flat<F>]) -> Result<bool> {
+    /// Coset-domain values of a novel-basis
+    /// coefficient vector, zero-extended.
+    pub fn evaluate(&self, coeffs: &[Flat<F>]) -> Result<Vec<Flat<F>>> {
+        if coeffs.len() > self.domain_len {
+            return Err(Error::Protocol {
+                protocol: "ligero",
+                message: "coefficient vector exceeds the code domain",
+            });
+        }
+
+        let mut buf = vec![Flat::from_raw(F::ZERO); self.domain_len];
+        buf[..coeffs.len()].copy_from_slice(coeffs);
+
+        self.code
+            .forward_coset_scalar(&mut buf, self.code_shift)
+            .map_err(|_| Error::Protocol {
+                protocol: "ligero",
+                message: "coefficient evaluation rejected its length",
+            })?;
+
+        Ok(buf)
+    }
+
+    /// Novel-basis coefficients
+    /// of a coset-domain vector.
+    pub fn coefficients(&self, values: &[Flat<F>]) -> Result<Vec<Flat<F>>> {
         if values.len() != self.domain_len {
             return Err(Error::Protocol {
                 protocol: "ligero",
-                message: "codeword check needs a domain_len buffer",
+                message: "coefficient extraction needs a domain_len buffer",
             });
         }
 
@@ -125,12 +154,35 @@ impl<F: BinaryFieldExtras + HardwareField> RowEncoder<F> {
             .inverse_coset_scalar(&mut buf, self.code_shift)
             .map_err(|_| Error::Protocol {
                 protocol: "ligero",
-                message: "codeword interpolation rejected its length",
+                message: "coset interpolation rejected its length",
             })?;
 
-        Ok(buf[self.code_len..]
-            .iter()
-            .all(|c| *c == Flat::from_raw(F::ZERO)))
+        Ok(buf)
+    }
+
+    /// Evaluations on `W_{log 2k}` of a
+    /// coefficient vector of degree `< 2k`.
+    fn product_evaluations(&self, coeffs: &[Flat<F>]) -> Result<Vec<Flat<F>>> {
+        let product_len = 2 * self.code_len;
+
+        if coeffs.len() > product_len {
+            return Err(Error::Protocol {
+                protocol: "ligero",
+                message: "product coefficients exceed dimension 2k",
+            });
+        }
+
+        let mut evals = vec![Flat::from_raw(F::ZERO); product_len];
+        evals[..coeffs.len()].copy_from_slice(coeffs);
+
+        self.product
+            .forward_scalar(&mut evals)
+            .map_err(|_| Error::Protocol {
+                protocol: "ligero",
+                message: "product evaluation rejected its length",
+            })?;
+
+        Ok(evals)
     }
 
     /// `Z_k` on the code domain.
@@ -177,41 +229,14 @@ impl<F: BinaryFieldExtras + HardwareField> RowEncoder<F> {
 
         // Products of two degree-<k rows and the mask
         // term `Z_k · u` both sit in dimension 2k
-        if product_len > self.domain_len
-            || coeffs[product_len..]
-                .iter()
-                .any(|c| *c != Flat::from_raw(F::ZERO))
+        if coeffs[product_len..]
+            .iter()
+            .any(|c| *c != Flat::from_raw(F::ZERO))
         {
             return Ok(None);
         }
 
-        let mut evals = coeffs[..product_len].to_vec();
-
-        AdditiveFft::<F>::new(product_len.ilog2())
-            .forward_scalar(&mut evals)
-            .map_err(|_| Error::Protocol {
-                protocol: "ligero",
-                message: "response evaluation rejected its length",
-            })?;
-
-        Ok(Some(evals))
-    }
-
-    pub fn vanishes_on_message(&self, values: &[Flat<F>], message_len: usize) -> Result<bool> {
-        Ok(match self.message_evaluations(values)? {
-            None => false,
-            Some(evals) => evals[..message_len]
-                .iter()
-                .all(|v| *v == Flat::from_raw(F::ZERO)),
-        })
-    }
-
-    pub fn sum_on_message(&self, values: &[Flat<F>]) -> Result<Option<Flat<F>>> {
-        Ok(self.message_evaluations(values)?.map(|evals| {
-            evals[..self.code_len]
-                .iter()
-                .fold(Flat::from_raw(F::ZERO), |a, b| a + *b)
-        }))
+        self.product_evaluations(&coeffs[..product_len]).map(Some)
     }
 
     pub fn code_len(&self) -> usize {
@@ -315,20 +340,42 @@ impl<F: TowerField> Opening<F> {
     }
 }
 
+/// Rows are indexed by opening position, not by column.
+pub struct OpenedWeights<F> {
+    columns: Vec<usize>,
+    rows: Vec<Vec<Flat<F>>>,
+}
+
+impl<F> OpenedWeights<F> {
+    fn covers(&self, opening: &Opening<F>) -> bool {
+        self.columns.len() == opening.columns.len()
+            && self
+                .columns
+                .iter()
+                .zip(&opening.columns)
+                .all(|(&want, (col, _))| want == *col)
+            && self.rows.iter().all(|r| r.len() == self.columns.len())
+    }
+}
+
+/// The response's degree bound is `coeffs.len()`.
 pub fn verify_interleaved<F: BinaryFieldExtras + HardwareField + TowerField>(
     encoder: &RowEncoder<F>,
-    response: &[Flat<F>],
     coeffs: &[Flat<F>],
+    r_int: &[Flat<F>],
     mask: usize,
     opening: &Opening<F>,
 ) -> bool {
-    if response.len() != encoder.domain_len() || !matches!(encoder.is_codeword(response), Ok(true))
-    {
+    if coeffs.len() != encoder.code_len() {
         return false;
     }
 
+    let Ok(response) = encoder.evaluate(coeffs) else {
+        return false;
+    };
+
     opening.columns.iter().all(|(col, values)| {
-        if mask >= values.len() || coeffs.len() != values.len() - 1 {
+        if mask >= values.len() || r_int.len() != values.len() - 1 {
             return false;
         }
 
@@ -340,7 +387,7 @@ pub fn verify_interleaved<F: BinaryFieldExtras + HardwareField + TowerField>(
                 continue;
             }
 
-            acc += coeffs[next] * *v;
+            acc += r_int[next] * *v;
             next += 1;
         }
 
@@ -348,79 +395,87 @@ pub fn verify_interleaved<F: BinaryFieldExtras + HardwareField + TowerField>(
     })
 }
 
-/// Encodes each weight row in place.
-pub fn encode_weights<F: BinaryFieldExtras + HardwareField + TowerField>(
-    encoder: &RowEncoder<F>,
-    mut weights: Vec<Vec<Flat<F>>>,
-) -> Result<Vec<Vec<Flat<F>>>> {
-    for row in weights.iter_mut() {
-        if row.len() != encoder.domain_len() {
-            return Err(Error::Protocol {
-                protocol: "ligero",
-                message: "weight row must be a domain_len buffer",
-            });
-        }
-
-        encoder.encode(row)?;
-    }
-
-    Ok(weights)
-}
-
 pub fn verify_linear<F: BinaryFieldExtras + HardwareField + TowerField>(
     encoder: &RowEncoder<F>,
-    response: &[Flat<F>],
-    encoded_weights: &[Vec<Flat<F>>],
+    coeffs: &[Flat<F>],
+    weights: &OpenedWeights<F>,
     rows_used: &[usize],
     mask: &ProductMask<'_, F>,
     target: Flat<F>,
     opening: &Opening<F>,
 ) -> bool {
-    if response.len() != encoder.domain_len()
+    if coeffs.len() != 2 * encoder.code_len()
         || mask.vanisher.len() != encoder.domain_len()
-        || encoded_weights.len() != rows_used.len()
+        || weights.rows.len() != rows_used.len()
+        || !weights.covers(opening)
     {
         return false;
     }
 
-    match encoder.sum_on_message(response) {
-        Ok(Some(sum)) if sum == target => {}
-        _ => return false,
+    let Ok(evals) = encoder.product_evaluations(coeffs) else {
+        return false;
+    };
+
+    let sum = evals[..encoder.code_len()]
+        .iter()
+        .fold(Flat::from_raw(F::ZERO), |a, b| a + *b);
+
+    if sum != target {
+        return false;
     }
 
-    opening.columns.iter().all(|(col, values)| {
-        if !mask.covers(values.len()) || rows_used.iter().any(|&r| r >= values.len()) {
-            return false;
-        }
+    let Ok(response) = encoder.evaluate(coeffs) else {
+        return false;
+    };
 
-        let mut acc = mask.at(*col, values);
-        for (weights, &row) in encoded_weights.iter().zip(rows_used) {
-            acc += weights[*col] * values[row];
-        }
+    opening
+        .columns
+        .iter()
+        .enumerate()
+        .all(|(i, (col, values))| {
+            if !mask.covers(values.len()) || rows_used.iter().any(|&r| r >= values.len()) {
+                return false;
+            }
 
-        acc == response[*col]
-    })
+            let mut acc = mask.at(*col, values);
+            for (weight_row, &row) in weights.rows.iter().zip(rows_used) {
+                acc += weight_row[i] * values[row];
+            }
+
+            acc == response[*col]
+        })
 }
 
 pub fn verify_quadratic<F: BinaryFieldExtras + HardwareField + TowerField>(
     encoder: &RowEncoder<F>,
-    response: &[Flat<F>],
+    coeffs: &[Flat<F>],
     triples: &[[usize; 3]],
     r_quad: &[Flat<F>],
     mask: &ProductMask<'_, F>,
     message_len: usize,
     opening: &Opening<F>,
 ) -> bool {
-    if response.len() != encoder.domain_len()
+    if coeffs.len() != 2 * encoder.code_len()
         || mask.vanisher.len() != encoder.domain_len()
         || r_quad.len() != triples.len()
     {
         return false;
     }
 
-    if !matches!(encoder.vanishes_on_message(response, message_len), Ok(true)) {
+    let Ok(evals) = encoder.product_evaluations(coeffs) else {
+        return false;
+    };
+
+    if evals[..message_len]
+        .iter()
+        .any(|v| *v != Flat::from_raw(F::ZERO))
+    {
         return false;
     }
+
+    let Ok(response) = encoder.evaluate(coeffs) else {
+        return false;
+    };
 
     opening.columns.iter().all(|(col, values)| {
         if !mask.covers(values.len()) || triples.iter().flatten().any(|&r| r >= values.len()) {
@@ -468,6 +523,47 @@ pub fn verify_opening<F: TowerField + HardwareField, H: Hasher>(
     MerkleTree::<F, H>::verify_batch(root, domain_len, &leaves, &opening.siblings)
 }
 
+pub fn weights_at_columns<F: BinaryFieldExtras + HardwareField + TowerField>(
+    encoder: &RowEncoder<F>,
+    messages: Vec<Vec<Flat<F>>>,
+    columns: &[usize],
+) -> Result<OpenedWeights<F>> {
+    if columns.iter().any(|&c| c >= encoder.domain_len()) {
+        return Err(Error::Protocol {
+            protocol: "ligero",
+            message: "weight column out of range",
+        });
+    }
+
+    #[cfg(feature = "parallel")]
+    let iter = messages.into_par_iter();
+    #[cfg(not(feature = "parallel"))]
+    let iter = messages.into_iter();
+
+    let rows = iter
+        .map(|message| {
+            if message.len() > encoder.code_len() {
+                return Err(Error::Protocol {
+                    protocol: "ligero",
+                    message: "weight message exceeds the code length",
+                });
+            }
+
+            let mut row = vec![Flat::from_raw(F::ZERO); encoder.domain_len()];
+            row[..message.len()].copy_from_slice(&message);
+
+            encoder.encode(&mut row)?;
+
+            Ok(columns.iter().map(|&c| row[c]).collect())
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(OpenedWeights {
+        columns: columns.to_vec(),
+        rows,
+    })
+}
+
 /// Leaf of one column, its rows top to bottom.
 pub fn column_leaf<F: TowerField + HardwareField, H: Hasher>(
     column: impl Iterator<Item = Flat<F>>,
@@ -492,9 +588,6 @@ mod tests {
 
     const OPENED: [usize; 4] = [1, 9, 40, 77];
 
-    /// A domain index outside [`OPENED`].
-    const UNOPENED: usize = 5;
-
     type F = Block128;
 
     fn geometry() -> OuterGeometry {
@@ -511,7 +604,6 @@ mod tests {
 
     fn message(geom: &OuterGeometry, salt: u128) -> Vec<Flat<F>> {
         let mut row = vec![Flat::from_raw(F::ZERO); geom.domain_len];
-
         for (i, slot) in row[..geom.code_len].iter_mut().enumerate() {
             *slot = mix(i as u128 + salt);
         }
@@ -634,6 +726,10 @@ mod tests {
         (low, high)
     }
 
+    fn wire_form(encoder: &RowEncoder<F>, response: &[Flat<F>], len: usize) -> Vec<Flat<F>> {
+        encoder.coefficients(response).unwrap()[..len].to_vec()
+    }
+
     fn interleaved_response(
         rows: &[Vec<Flat<F>>],
         coeffs: &[Flat<F>],
@@ -716,6 +812,27 @@ mod tests {
         assert_eq!(evals, direct);
     }
 
+    /// The bijection behind the length gate:
+    /// it accepts what `is_codeword` used to accept.
+    #[test]
+    fn coefficients_invert_evaluate_at_both_degree_bounds() {
+        let geom = geometry();
+        let encoder = RowEncoder::<F>::new(&geom).unwrap();
+
+        for len in [geom.code_len, 2 * geom.code_len] {
+            let coeffs: Vec<Flat<F>> = (0..len).map(|i| mix((i + len) as u128 + 5)).collect();
+            let codeword = encoder.evaluate(&coeffs).unwrap();
+            let back = encoder.coefficients(&codeword).unwrap();
+
+            assert_eq!(codeword.len(), geom.domain_len, "{len}");
+            assert_eq!(back[..len], coeffs[..], "{len}");
+            assert!(
+                back[len..].iter().all(|c| *c == Flat::from_raw(F::ZERO)),
+                "{len}"
+            );
+        }
+    }
+
     #[test]
     fn nonzero_message_is_far_from_zero() {
         let geom = geometry();
@@ -741,12 +858,14 @@ mod tests {
         assert!(encoder.encode(&mut row).is_err());
     }
 
+    /// `coeffs.len()` is the only degree gate;
+    /// a codeword is all the wire can express.
     #[test]
-    fn interleaved_test_rejects_row_off_code() {
+    fn interleaved_test_rejects_wrong_degree_bound() {
         let geom = geometry();
         let encoder = RowEncoder::<F>::new(&geom).unwrap();
 
-        let mut rows: Vec<Vec<Flat<F>>> = (0..4)
+        let rows: Vec<Vec<Flat<F>>> = (0..4)
             .map(|i| encoded(&encoder, &geom, 100 * i + 1))
             .collect();
 
@@ -754,25 +873,24 @@ mod tests {
         let mask = 3;
 
         let honest = interleaved_response(&rows, &coeffs, mask, geom.domain_len);
+        let wire = wire_form(&encoder, &honest, geom.code_len);
+        let opening = opening_at(&rows, &OPENED);
 
-        assert!(verify_interleaved(
-            &encoder,
-            &honest,
-            &coeffs,
-            mask,
-            &opening_at(&rows, &OPENED),
+        assert!(verify_interleaved(&encoder, &wire, &coeffs, mask, &opening));
+
+        let mut long = wire.clone();
+        long.push(Flat::from_raw(F::ONE));
+
+        assert!(!verify_interleaved(
+            &encoder, &long, &coeffs, mask, &opening
         ));
-
-        rows[0][UNOPENED] += Flat::from_raw(F::ONE);
-
-        let off_code = interleaved_response(&rows, &coeffs, mask, geom.domain_len);
 
         assert!(!verify_interleaved(
             &encoder,
-            &off_code,
+            &wire[..wire.len() - 1],
             &coeffs,
             mask,
-            &opening_at(&rows, &OPENED),
+            &opening
         ));
     }
 
@@ -794,7 +912,11 @@ mod tests {
         opening.columns[0].1[0] += Flat::from_raw(F::ONE);
 
         assert!(!verify_interleaved(
-            &encoder, &response, &coeffs, mask, &opening,
+            &encoder,
+            &wire_form(&encoder, &response, geom.code_len),
+            &coeffs,
+            mask,
+            &opening,
         ));
     }
 
@@ -807,12 +929,9 @@ mod tests {
         let data_msgs: Vec<Vec<Flat<F>>> = (0..2).map(|i| message(&geom, 300 * i + 11)).collect();
         let weight_msgs: Vec<Vec<Flat<F>>> = (0..2)
             .map(|i| {
-                let mut w = vec![Flat::from_raw(F::ZERO); geom.domain_len];
-                for (c, slot) in w[..geom.message_len].iter_mut().enumerate() {
-                    *slot = mix(c as u128 + 400 * i + 17);
-                }
-
-                w
+                (0..geom.message_len)
+                    .map(|c| mix(c as u128 + 400 * i + 17))
+                    .collect()
             })
             .collect();
 
@@ -836,7 +955,19 @@ mod tests {
         rows.push(zero_sum_row(&encoder, &geom, 991));
         rows.push(encoded(&encoder, &geom, 1_313));
 
-        let weights = encode_weights(&encoder, weight_msgs).unwrap();
+        let weights: Vec<Vec<Flat<F>>> = weight_msgs
+            .iter()
+            .map(|m| {
+                let mut row = vec![Flat::from_raw(F::ZERO); geom.domain_len];
+                row[..m.len()].copy_from_slice(m);
+
+                encoder.encode(&mut row).unwrap();
+
+                row
+            })
+            .collect();
+
+        let opened_weights = weights_at_columns(&encoder, weight_msgs, &OPENED).unwrap();
         let mask = ProductMask {
             low: 2,
             high: 3,
@@ -856,15 +987,22 @@ mod tests {
 
         let rows_used = [0usize, 1];
         let opening = opening_at(&rows, &OPENED);
+        let wire = wire_form(&encoder, &response, 2 * geom.code_len);
 
         assert!(verify_linear(
-            &encoder, &response, &weights, &rows_used, &mask, target, &opening,
+            &encoder,
+            &wire,
+            &opened_weights,
+            &rows_used,
+            &mask,
+            target,
+            &opening,
         ));
 
         assert!(!verify_linear(
             &encoder,
-            &response,
-            &weights,
+            &wire,
+            &opened_weights,
             &rows_used,
             &mask,
             target + Flat::from_raw(F::ONE),
@@ -936,7 +1074,7 @@ mod tests {
 
         assert!(verify_quadratic(
             &encoder,
-            &response,
+            &wire_form(&encoder, &response, 2 * geom.code_len),
             &triples,
             &r_quad,
             &mask,
@@ -948,7 +1086,7 @@ mod tests {
 
         assert!(!verify_quadratic(
             &encoder,
-            &response,
+            &wire_form(&encoder, &response, 2 * geom.code_len),
             &triples,
             &r_quad,
             &mask,

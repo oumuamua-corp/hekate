@@ -10,8 +10,8 @@ use alloc::vec::Vec;
 use hekate_core::config::Config;
 use hekate_core::errors;
 use hekate_core::ligero::{
-    Opening, ProductMask, RowEncoder, encode_weights, verify_interleaved, verify_linear,
-    verify_opening, verify_quadratic,
+    Opening, ProductMask, RowEncoder, verify_interleaved, verify_linear, verify_opening,
+    verify_quadratic, weights_at_columns,
 };
 use hekate_core::proofs::{InnerProof, OuterOpening};
 use hekate_core::protocol;
@@ -19,7 +19,7 @@ use hekate_crypto::Hasher;
 use hekate_crypto::transcript::Transcript;
 use hekate_math::{BinaryFieldExtras, Flat, HardwareField, TowerField};
 use hekate_program::outer::{OuterLayout, OuterStatement, TableRecord, assemble, linear_weights};
-use tracing::warn;
+use tracing::{debug_span, instrument, warn};
 
 /// Next unconsumed pad index;
 /// advanced in the prover's masking order.
@@ -39,6 +39,7 @@ impl PadCursor {
 /// FS challenges after `aux_root`, both oracles opened
 /// at the same columns, and the three Ligero tests
 /// over the assembled rows.
+#[instrument(skip_all, name = "verify_outer")]
 pub fn verify_outer<F, H>(
     proof: &InnerProof<F>,
     transcript: &mut Transcript<H>,
@@ -71,6 +72,7 @@ where
     let field_bits = size_of::<F>() * 8;
     let geom = config.outer_geom(statement.masked_scalars, statement.mul_wires, field_bits)?;
     let layout = OuterLayout::new(&geom, statement.masked_scalars, statement.mul_wires)?;
+
     let encoder = RowEncoder::<F>::new(&geom)?;
     let vanisher = encoder.message_vanisher()?;
 
@@ -86,9 +88,11 @@ where
 
     let rows = assemble(records, &statement)?;
 
-    let r_lin: Vec<F> = (0..rows.affine.len())
-        .map(|_| transcript.challenge_field::<F>(b"outer_r_lin"))
-        .collect::<Result<_, _>>()?;
+    let r_lin: Vec<F> = debug_span!("r_lin", rows = rows.affine.len()).in_scope(|| {
+        (0..rows.affine.len())
+            .map(|_| transcript.challenge_field::<F>(b"outer_r_lin"))
+            .collect::<Result<_, _>>()
+    })?;
 
     transcript.append_field_list(b"outer_q", &outer.linear);
 
@@ -118,17 +122,21 @@ where
         return Ok(false);
     }
 
-    if !verify_opening::<F, H>(
-        pad_root,
-        geom.domain_len,
-        layout.pad_rows,
-        &outer.pad_opening,
-    ) || !verify_opening::<F, H>(
-        &outer.aux_root,
-        geom.domain_len,
-        aux_rows,
-        &outer.aux_opening,
-    ) {
+    let openings_hold = debug_span!("openings").in_scope(|| {
+        verify_opening::<F, H>(
+            pad_root,
+            geom.domain_len,
+            layout.pad_rows,
+            &outer.pad_opening,
+        ) && verify_opening::<F, H>(
+            &outer.aux_root,
+            geom.domain_len,
+            aux_rows,
+            &outer.aux_opening,
+        )
+    });
+
+    if !openings_hold {
         warn!("outer opening rejected");
         return Ok(false);
     }
@@ -138,19 +146,25 @@ where
 
     let stacked = Opening::stack(&[&pad_opening, &aux_opening])?;
 
-    if !verify_interleaved(
-        &encoder,
-        &to_flat(&outer.interleaved),
-        &to_flat(&r_int),
-        layout.interleaved_mask(),
-        &stacked,
-    ) {
+    let interleaved_holds = debug_span!("interleaved").in_scope(|| {
+        verify_interleaved(
+            &encoder,
+            &to_flat(&outer.interleaved),
+            &to_flat(&r_int),
+            layout.interleaved_mask(),
+            &stacked,
+        )
+    });
+
+    if !interleaved_holds {
         warn!("outer interleaved test failed");
         return Ok(false);
     }
 
-    let batch = linear_weights(&layout, &rows, &r_lin)?;
-    let encoded = encode_weights(&encoder, batch.weights)?;
+    let batch =
+        debug_span!("linear_weights").in_scope(|| linear_weights(&layout, &rows, &r_lin))?;
+    let encoded = debug_span!("encode_weights", rows = batch.rows.len())
+        .in_scope(|| weights_at_columns(&encoder, batch.weights, &columns))?;
 
     let linear_mask = ProductMask {
         low: layout.linear_mask(),
@@ -158,15 +172,19 @@ where
         vanisher: &vanisher,
     };
 
-    if !verify_linear(
-        &encoder,
-        &to_flat(&outer.linear),
-        &encoded,
-        &batch.rows,
-        &linear_mask,
-        batch.target,
-        &stacked,
-    ) {
+    let linear_holds = debug_span!("linear").in_scope(|| {
+        verify_linear(
+            &encoder,
+            &to_flat(&outer.linear),
+            &encoded,
+            &batch.rows,
+            &linear_mask,
+            batch.target,
+            &stacked,
+        )
+    });
+
+    if !linear_holds {
         warn!("outer linear test failed");
         return Ok(false);
     }
@@ -177,15 +195,19 @@ where
         vanisher: &vanisher,
     };
 
-    if !verify_quadratic(
-        &encoder,
-        &to_flat(&outer.quadratic),
-        &triples,
-        &to_flat(&r_quad),
-        &quadratic_mask,
-        layout.message_len,
-        &stacked,
-    ) {
+    let quadratic_holds = debug_span!("quadratic").in_scope(|| {
+        verify_quadratic(
+            &encoder,
+            &to_flat(&outer.quadratic),
+            &triples,
+            &to_flat(&r_quad),
+            &quadratic_mask,
+            layout.message_len,
+            &stacked,
+        )
+    });
+
+    if !quadratic_holds {
         warn!("outer quadratic test failed");
         return Ok(false);
     }

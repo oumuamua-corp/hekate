@@ -729,6 +729,7 @@ dependencies = [
  "hekate-crypto",
  "hekate-math",
  "rand 0.10.2",
+ "rayon",
  "serde",
  "tracing",
  "zeroize",
