@@ -6,6 +6,15 @@
 Zero-knowledge proof system over binary tower fields. Streaming architecture. Bounded memory. Edge-native.
 Hekate proves computations in GF(2^128) using Sumcheck + Brakedown PCS with O(N) prover time and O(N) memory.
 
+> [!CAUTION]
+> **Prover binaries withdrawn**
+>
+> The cdylib prover binaries are no longer available from the Oumuamua CDN.
+> Existing installations are unaffected. A substantial update is in preparation.
+>
+> From the next release Hekate is AGPL-3.0. Published versions stay Apache-2.0.
+> Commercial licensing: [info@oumuamua.dev](mailto:info@oumuamua.dev)
+
 > [!WARNING]  
 > This workspace is under aggressive development. APIs, ABIs, and cryptographic signatures will break
 > without notice. Do not deploy to mainnet.
@@ -14,11 +23,6 @@ Hekate proves computations in GF(2^128) using Sumcheck + Brakedown PCS with O(N)
 > The verifier, core SDK, and cryptographic chiplets are open-source. The prover and
 > compression engine stay proprietary, shipped as free, unrestricted binaries for macOS (Apple Silicon),
 > Linux (ARM64, glibc), and Android (ARM64).
-
-> [!IMPORTANT]  
-> [`hekate-mobile`](https://github.com/oumuamua-labs/hekate-mobile) compiles a Rust prover into a signed
-> iOS `.xcframework` and Android `.aar` behind a typed Swift / Kotlin API, one `await` per proof, zero ZK
-> terminology across the boundary. Shipping ZK to edge devices? Start there.
 
 ---
 
