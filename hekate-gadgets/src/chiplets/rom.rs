@@ -47,11 +47,11 @@ use alloc::vec::Vec;
 use hekate_core::errors::Error;
 use hekate_core::trace::{ColumnTrace, ColumnType, TraceBuilder};
 use hekate_math::{Block32, TowerField};
-use hekate_program::Air;
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
 use hekate_program::define_columns;
-use hekate_program::permutation::{PermutationCheckSpec, Source};
+use hekate_program::permutation::{BusKind, PermutationCheckSpec, Service, ServiceSlot};
+use hekate_program::{Air, FixedColumn};
 
 define_columns! {
     pub RomColumns {
@@ -86,8 +86,9 @@ define_columns! {
 /// - `s_rom`: Selector (1 = valid instruction, 0 = padding)
 #[derive(Clone, Debug)]
 pub struct RomChiplet {
-    /// Number of instructions (power of 2)
+    /// Number of rows (power of 2)
     pub num_rows: usize,
+    pub num_instructions: usize,
 }
 
 impl RomChiplet {
@@ -95,32 +96,77 @@ impl RomChiplet {
     /// CPU-side and chiplet-side specs.
     pub const BUS_ID: &'static str = "rom_link";
 
-    /// Creates a new ROM chiplet
-    /// with the given number of rows.
-    ///
-    /// # Arguments
-    /// - `num_rows`: Number of instruction rows (must be power of 2)
-    pub fn new(num_rows: usize) -> Self {
+    pub fn new(num_rows: usize, num_instructions: usize) -> Self {
         assert!(num_rows.is_power_of_two(), "ROM size must be power of 2");
-        Self { num_rows }
+        assert!(
+            num_instructions <= num_rows,
+            "instruction count exceeds ROM rows"
+        );
+
+        Self {
+            num_rows,
+            num_instructions,
+        }
+    }
+
+    /// Both endpoints derive from this schema:
+    /// the address bytes, the opcode, the three arguments.
+    pub fn service() -> Service {
+        Service {
+            bus_id: Self::BUS_ID,
+            kind: BusKind::Lookup,
+            slots: vec![
+                ServiceSlot::Value(b"kappa_pc_b0"),
+                ServiceSlot::Value(b"kappa_pc_b1"),
+                ServiceSlot::Value(b"kappa_pc_b2"),
+                ServiceSlot::Value(b"kappa_pc_b3"),
+                ServiceSlot::Value(b"kappa_opcode"),
+                ServiceSlot::Value(b"kappa_arg0"),
+                ServiceSlot::Value(b"kappa_arg1"),
+                ServiceSlot::Value(b"kappa_arg2"),
+            ],
+            clock_waiver: None,
+        }
     }
 
     /// Returns the `Lookup`-kind permutation
     /// check spec for ROM-CPU linking.
     pub fn linking_spec() -> PermutationCheckSpec {
-        PermutationCheckSpec::new_lookup(
-            vec![
-                (Source::Column(RomColumns::PC_B0), b"kappa_pc_b0" as &[u8]),
-                (Source::Column(RomColumns::PC_B1), b"kappa_pc_b1" as &[u8]),
-                (Source::Column(RomColumns::PC_B2), b"kappa_pc_b2" as &[u8]),
-                (Source::Column(RomColumns::PC_B3), b"kappa_pc_b3" as &[u8]),
-                (Source::Column(RomColumns::OPCODE), b"kappa_opcode" as &[u8]),
-                (Source::Column(RomColumns::ARG0), b"kappa_arg0" as &[u8]),
-                (Source::Column(RomColumns::ARG1), b"kappa_arg1" as &[u8]),
-                (Source::Column(RomColumns::ARG2), b"kappa_arg2" as &[u8]),
-            ],
-            Some(RomColumns::SELECTOR),
-        )
+        Self::service()
+            .respond(
+                &[
+                    RomColumns::PC_B0,
+                    RomColumns::PC_B1,
+                    RomColumns::PC_B2,
+                    RomColumns::PC_B3,
+                    RomColumns::OPCODE,
+                    RomColumns::ARG0,
+                    RomColumns::ARG1,
+                    RomColumns::ARG2,
+                ],
+                &[],
+                RomColumns::SELECTOR,
+            )
+            .expect("service slots match the responder columns")
+    }
+
+    /// Requester endpoint over `CpuFetchColumns`.
+    pub fn cpu_linking_spec() -> PermutationCheckSpec {
+        Self::service()
+            .request(
+                &[
+                    CpuFetchColumns::PC_B0,
+                    CpuFetchColumns::PC_B1,
+                    CpuFetchColumns::PC_B2,
+                    CpuFetchColumns::PC_B3,
+                    CpuFetchColumns::OPCODE,
+                    CpuFetchColumns::ARG0,
+                    CpuFetchColumns::ARG1,
+                    CpuFetchColumns::ARG2,
+                ],
+                CpuFetchColumns::SELECTOR,
+            )
+            .expect("service slots match the requester columns")
     }
 
     /// Returns the number of rows in this ROM.
@@ -145,77 +191,6 @@ define_columns! {
         ARG1: B32,
         ARG2: B32,
         SELECTOR: Bit,
-    }
-}
-
-/// CPU fetch unit column layout for ROM linking.
-///
-/// The CPU side must match the ROM key structure.
-///
-/// # Column Schema
-/// ```text
-/// | pc_b0 | pc_b1 | pc_b2 | pc_b3 | opcode | arg0 | arg1 | arg2 | s_fetch |
-/// |-------|-------|-------|-------|--------|------|------|------|---------|
-/// |  0x00 |  0x01 |  0x00 |  0x00 |  0x01  | ...  | ...  | ...  |    1    |
-/// |  0x04 |  0x01 |  0x00 |  0x00 |  0x02  | ...  | ...  | ...  |    1    |
-/// |  ...  |  ...  |  ...  |  ...  |  ...   | ...  | ...  | ...  |   ...   |
-/// |  0x00 |  0x00 |  0x00 |  0x00 |  0x00  | 0x00 | 0x00 | 0x00 |    0    |
-/// ```
-///
-/// # Columns (9 total)
-/// - `pc_b0..pc_b3`: Fetched PC bytes
-/// - `opcode`: Fetched opcode
-/// - `arg0..arg2`: Fetched arguments
-/// - `s_fetch`: Selector (1 = active fetch, 0 = halted/padding)
-#[derive(Clone, Debug)]
-pub struct CpuFetchUnit;
-
-impl CpuFetchUnit {
-    /// Returns the `Lookup`-kind permutation
-    /// check spec for the CPU fetch side.
-    pub fn linking_spec() -> PermutationCheckSpec {
-        PermutationCheckSpec::new_lookup(
-            vec![
-                (
-                    Source::Column(CpuFetchColumns::PC_B0),
-                    b"kappa_pc_b0" as &[u8],
-                ),
-                (
-                    Source::Column(CpuFetchColumns::PC_B1),
-                    b"kappa_pc_b1" as &[u8],
-                ),
-                (
-                    Source::Column(CpuFetchColumns::PC_B2),
-                    b"kappa_pc_b2" as &[u8],
-                ),
-                (
-                    Source::Column(CpuFetchColumns::PC_B3),
-                    b"kappa_pc_b3" as &[u8],
-                ),
-                (
-                    Source::Column(CpuFetchColumns::OPCODE),
-                    b"kappa_opcode" as &[u8],
-                ),
-                (
-                    Source::Column(CpuFetchColumns::ARG0),
-                    b"kappa_arg0" as &[u8],
-                ),
-                (
-                    Source::Column(CpuFetchColumns::ARG1),
-                    b"kappa_arg1" as &[u8],
-                ),
-                (
-                    Source::Column(CpuFetchColumns::ARG2),
-                    b"kappa_arg2" as &[u8],
-                ),
-            ],
-            Some(CpuFetchColumns::SELECTOR),
-        )
-    }
-
-    /// Returns the number of columns in CPU fetch traces.
-    pub fn num_columns(&self) -> usize {
-        CpuFetchColumns::NUM_COLUMNS
     }
 }
 
@@ -319,11 +294,15 @@ impl<F: TowerField> Air<F> for RomChiplet {
         vec![(Self::BUS_ID.into(), Self::linking_spec())]
     }
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(RomColumns::SELECTOR));
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::prefix(
+            RomColumns::SELECTOR,
+            self.num_instructions,
+        )]
+    }
 
-        cs.build()
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        ConstraintSystem::<F>::new().build()
     }
 }
 
@@ -332,10 +311,11 @@ mod tests {
     use super::*;
     use hekate_core::trace::Trace;
     use hekate_math::Bit;
+    use hekate_program::permutation::Source;
 
     #[test]
     fn rom_chiplet_column_count() {
-        let rom = RomChiplet::new(16);
+        let rom = RomChiplet::new(16, 16);
         assert_eq!(rom.num_columns(), 9);
         assert_eq!(rom.num_rows(), 16);
     }
@@ -354,7 +334,7 @@ mod tests {
     #[test]
     fn cpu_fetch_linking_spec_matches_rom() {
         let rom_spec = RomChiplet::linking_spec();
-        let cpu_spec = CpuFetchUnit::linking_spec();
+        let cpu_spec = RomChiplet::cpu_linking_spec();
 
         // Both specs must have same number of sources
         assert_eq!(rom_spec.num_sources(), cpu_spec.num_sources());
@@ -442,7 +422,7 @@ mod tests {
     #[test]
     fn byte_stitching_no_row_index() {
         let rom_spec = RomChiplet::linking_spec();
-        let cpu_spec = CpuFetchUnit::linking_spec();
+        let cpu_spec = RomChiplet::cpu_linking_spec();
 
         // Verify that specs have 5 sources:
         // 4 PC bytes + 1 opcode

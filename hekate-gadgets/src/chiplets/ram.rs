@@ -18,7 +18,7 @@ use hekate_math::{Bit, Block32, Block128, TowerField};
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
 use hekate_program::expander::VirtualExpander;
-use hekate_program::permutation::{PermutationCheckSpec, Source};
+use hekate_program::permutation::{BusKind, PermutationCheckSpec, Service, ServiceSlot, Source};
 use hekate_program::{Air, FixedColumn, define_columns};
 use once_cell::race::OnceBox;
 
@@ -112,19 +112,23 @@ define_columns! {
 /// RAM chiplet column layout.
 #[derive(Clone, Debug)]
 pub struct RamChiplet {
-    /// Number of memory events (power of 2)
+    /// Number of rows (power of 2)
     pub num_rows: usize,
+    pub num_events: usize,
 }
 
 impl RamChiplet {
     pub const BUS_ID: &'static str = "ram_link";
     pub const VALUE_BUS_ID: &'static str = "ram_value_bind";
 
-    /// Creates a new RAM chiplet
-    /// with the given number of rows.
-    pub fn new(num_rows: usize) -> Self {
+    pub fn new(num_rows: usize, num_events: usize) -> Self {
         assert!(num_rows.is_power_of_two(), "RAM size must be power of 2");
-        Self { num_rows }
+        assert!(num_events <= num_rows, "event count exceeds RAM rows");
+
+        Self {
+            num_rows,
+            num_events,
+        }
     }
 
     pub fn num_rows(&self) -> usize {
@@ -160,6 +164,28 @@ impl RamChiplet {
         layout
     }
 
+    /// Both endpoints derive from this schema: address
+    /// bytes, byte-split clock, value bytes, direction.
+    pub fn service() -> Service {
+        Service {
+            bus_id: Self::BUS_ID,
+            kind: BusKind::Permutation,
+            slots: vec![
+                ServiceSlot::Value(b"kappa_addr_b0"),
+                ServiceSlot::Value(b"kappa_addr_b1"),
+                ServiceSlot::Value(b"kappa_addr_b2"),
+                ServiceSlot::Value(b"kappa_addr_b3"),
+                ServiceSlot::RequestIdxBytes { num_bytes: 4 },
+                ServiceSlot::Value(b"kappa_val_b0"),
+                ServiceSlot::Value(b"kappa_val_b1"),
+                ServiceSlot::Value(b"kappa_val_b2"),
+                ServiceSlot::Value(b"kappa_val_b3"),
+                ServiceSlot::Value(b"kappa_is_write"),
+            ],
+            clock_waiver: None,
+        }
+    }
+
     /// Returns the permutation check
     /// specification for RAM-CPU linking.
     ///
@@ -169,43 +195,48 @@ impl RamChiplet {
     /// All 13 data fields are included in
     /// the key to ensure complete event matching.
     pub fn linking_spec() -> PermutationCheckSpec {
-        PermutationCheckSpec::new(
-            vec![
-                (
-                    Source::Column(RamColumns::ADDR_B0),
-                    b"kappa_addr_b0" as &[u8],
-                ),
-                (
-                    Source::Column(RamColumns::ADDR_B1),
-                    b"kappa_addr_b1" as &[u8],
-                ),
-                (
-                    Source::Column(RamColumns::ADDR_B2),
-                    b"kappa_addr_b2" as &[u8],
-                ),
-                (
-                    Source::Column(RamColumns::ADDR_B3),
-                    b"kappa_addr_b3" as &[u8],
-                ),
-                (Source::Column(RamColumns::CLK_B0), b"kappa_clk_b0" as &[u8]),
-                (Source::Column(RamColumns::CLK_B1), b"kappa_clk_b1" as &[u8]),
-                (Source::Column(RamColumns::CLK_B2), b"kappa_clk_b2" as &[u8]),
-                (Source::Column(RamColumns::CLK_B3), b"kappa_clk_b3" as &[u8]),
-                (Source::Column(RamColumns::VAL_B0), b"kappa_val_b0" as &[u8]),
-                (Source::Column(RamColumns::VAL_B1), b"kappa_val_b1" as &[u8]),
-                (Source::Column(RamColumns::VAL_B2), b"kappa_val_b2" as &[u8]),
-                (Source::Column(RamColumns::VAL_B3), b"kappa_val_b3" as &[u8]),
-                (
-                    Source::Column(RamColumns::IS_WRITE),
-                    b"kappa_is_write" as &[u8],
-                ),
-            ],
-            Some(RamColumns::SELECTOR),
-        )
-        .with_clock_waiver(
-            "see ram.rs: partner CpuMemoryUnit::linking_spec carries Source::RowIndexByte; \
-             this side stores that clock in committed CLK_B0..3 columns sorted by AIR",
-        )
+        Self::service()
+            .respond(
+                &[
+                    RamColumns::ADDR_B0,
+                    RamColumns::ADDR_B1,
+                    RamColumns::ADDR_B2,
+                    RamColumns::ADDR_B3,
+                    RamColumns::VAL_B0,
+                    RamColumns::VAL_B1,
+                    RamColumns::VAL_B2,
+                    RamColumns::VAL_B3,
+                    RamColumns::IS_WRITE,
+                ],
+                &[
+                    RamColumns::CLK_B0,
+                    RamColumns::CLK_B1,
+                    RamColumns::CLK_B2,
+                    RamColumns::CLK_B3,
+                ],
+                RamColumns::SELECTOR,
+            )
+            .expect("service slots match the responder columns")
+    }
+
+    /// Requester endpoint over `CpuMemColumns`.
+    pub fn cpu_linking_spec() -> PermutationCheckSpec {
+        Self::service()
+            .request(
+                &[
+                    CpuMemColumns::ADDR_B0,
+                    CpuMemColumns::ADDR_B1,
+                    CpuMemColumns::ADDR_B2,
+                    CpuMemColumns::ADDR_B3,
+                    CpuMemColumns::VAL_B0,
+                    CpuMemColumns::VAL_B1,
+                    CpuMemColumns::VAL_B2,
+                    CpuMemColumns::VAL_B3,
+                    CpuMemColumns::IS_WRITE,
+                ],
+                CpuMemColumns::SELECTOR,
+            )
+            .expect("service slots match the requester columns")
     }
 
     pub fn value_binding_spec() -> PermutationCheckSpec {
@@ -251,81 +282,9 @@ impl RamChiplet {
             Some(RamColumns::SELECTOR),
         )
         .with_clock_waiver(
-            "see hekate-gadgets/src/ram.rs: RAM-internal value binding pinned by \
-             sorted-by-(addr,clk) AIR transitions plus CpuMemoryUnit linking_spec",
+            "see hekate-gadgets/src/chiplets/ram.rs: RAM-internal value binding pinned \
+             by sorted-by-(addr,clk) AIR transitions plus RamChiplet::cpu_linking_spec",
         )
-    }
-}
-
-/// CPU memory event column
-/// layout for RAM linking.
-///
-/// The CPU side emits memory events
-/// in execution order (unsorted).
-///
-/// # Column Schema (14 columns total)
-/// Same as RAM side, but:
-/// - Clock bytes are generated virtually from RowIndexLeBytes (CPU execution time)
-/// - Events are in execution order (not sorted)
-#[derive(Clone, Debug)]
-pub struct CpuMemoryUnit;
-
-impl CpuMemoryUnit {
-    /// Returns the permutation check
-    /// specification for CPU memory side.
-    ///
-    /// This uses RowIndexLeBytes for clock (virtual time),
-    /// unlike RAM which has committed columns.
-    pub fn linking_spec() -> PermutationCheckSpec {
-        PermutationCheckSpec::new(
-            vec![
-                (
-                    Source::Column(CpuMemColumns::ADDR_B0),
-                    b"kappa_addr_b0" as &[u8],
-                ),
-                (
-                    Source::Column(CpuMemColumns::ADDR_B1),
-                    b"kappa_addr_b1" as &[u8],
-                ),
-                (
-                    Source::Column(CpuMemColumns::ADDR_B2),
-                    b"kappa_addr_b2" as &[u8],
-                ),
-                (
-                    Source::Column(CpuMemColumns::ADDR_B3),
-                    b"kappa_addr_b3" as &[u8],
-                ),
-                (Source::RowIndexByte(0), b"kappa_clk_b0" as &[u8]),
-                (Source::RowIndexByte(1), b"kappa_clk_b1" as &[u8]),
-                (Source::RowIndexByte(2), b"kappa_clk_b2" as &[u8]),
-                (Source::RowIndexByte(3), b"kappa_clk_b3" as &[u8]),
-                (
-                    Source::Column(CpuMemColumns::VAL_B0),
-                    b"kappa_val_b0" as &[u8],
-                ),
-                (
-                    Source::Column(CpuMemColumns::VAL_B1),
-                    b"kappa_val_b1" as &[u8],
-                ),
-                (
-                    Source::Column(CpuMemColumns::VAL_B2),
-                    b"kappa_val_b2" as &[u8],
-                ),
-                (
-                    Source::Column(CpuMemColumns::VAL_B3),
-                    b"kappa_val_b3" as &[u8],
-                ),
-                (
-                    Source::Column(CpuMemColumns::IS_WRITE),
-                    b"kappa_is_write" as &[u8],
-                ),
-            ],
-            Some(CpuMemColumns::SELECTOR),
-        )
-    }
-
-    pub fn num_columns(&self) -> usize {
-        CpuMemColumns::NUM_COLUMNS
     }
 }
 
@@ -421,6 +380,7 @@ impl<F: TowerField> Air<F> for RamChiplet {
         vec![
             FixedColumn::last_row(RamColumns::Q_STEP),
             FixedColumn::first_row(RamColumns::Q_FIRST),
+            FixedColumn::prefix(RamColumns::SELECTOR, self.num_events),
         ]
     }
 
@@ -451,9 +411,6 @@ impl<F: TowerField> Air<F> for RamChiplet {
         let is_write_next = cs.next(RamColumns::IS_WRITE);
         let s_mem_next = cs.next(RamColumns::SELECTOR);
 
-        cs.assert_boolean(selector);
-        cs.assert_boolean(q_step);
-        cs.assert_boolean(q_first);
         cs.assert_boolean(is_write);
 
         // Address/value column arrays
@@ -927,7 +884,7 @@ mod tests {
 
     #[test]
     fn ram_chiplet_column_count() {
-        let ram = RamChiplet::new(16);
+        let ram = RamChiplet::new(16, 16);
         assert_eq!(ram.num_columns(), 83);
         assert_eq!(ram.num_rows(), 16);
     }
@@ -1090,7 +1047,7 @@ mod tests {
     /// Spec Verification, CPU uses Virtual Clock.
     #[test]
     fn cpu_uses_row_index_for_clock() {
-        let cpu_spec = CpuMemoryUnit::linking_spec();
+        let cpu_spec = RamChiplet::cpu_linking_spec();
 
         // CPU spec should have 13 sources
         assert_eq!(cpu_spec.num_sources(), 13);

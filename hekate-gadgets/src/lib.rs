@@ -17,12 +17,8 @@ pub mod atoms;
 pub mod chiplets;
 
 pub use chiplets::int::arith::{
-    ArithmeticOpcode, CpuArithColumns, CpuIntArithmeticUnit, IntArithmeticChiplet,
-    IntArithmeticLayout, IntArithmeticOp, generate_arithmetic_trace,
+    ArithmeticOpcode, CpuArithColumns, IntArithmeticChiplet, IntArithmeticLayout, IntArithmeticOp,
+    generate_arithmetic_trace,
 };
-pub use chiplets::ram::{
-    CpuMemColumns, CpuMemoryUnit, MemoryEvent, RamChiplet, RamColumns, generate_ram_trace,
-};
-pub use chiplets::rom::{
-    CpuFetchColumns, CpuFetchUnit, Instruction, RomChiplet, RomColumns, generate_rom_trace,
-};
+pub use chiplets::ram::{CpuMemColumns, MemoryEvent, RamChiplet, RamColumns, generate_ram_trace};
+pub use chiplets::rom::{CpuFetchColumns, Instruction, RomChiplet, RomColumns, generate_rom_trace};

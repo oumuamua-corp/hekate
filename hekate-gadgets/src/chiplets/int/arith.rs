@@ -18,12 +18,13 @@ use alloc::vec::Vec;
 use hekate_core::errors;
 use hekate_core::trace::{ColumnTrace, ColumnType, TraceBuilder};
 use hekate_math::{Bit, Block32, Block64, TowerField};
-use hekate_program::Air;
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::{ConstraintSystem, Expr};
 use hekate_program::define_columns;
 use hekate_program::expander::VirtualExpander;
-use hekate_program::permutation::{PermutationCheckSpec, REQUEST_IDX_LABEL, Source};
+use hekate_program::permutation::{BusKind, PermutationCheckSpec, Service, ServiceSlot};
+use hekate_program::{Air, FixedColumn};
+
 // =================================================================
 // 0. LAYOUT
 // =================================================================
@@ -186,6 +187,7 @@ impl IntArithmeticLayout {
 pub struct IntArithmeticChiplet {
     pub bit_width: usize,
     pub num_rows: usize,
+    pub num_ops: usize,
 
     bus_id: String,
     layout: IntArithmeticLayout,
@@ -196,7 +198,7 @@ pub struct IntArithmeticChiplet {
 impl IntArithmeticChiplet {
     pub const BUS_ID: &'static str = "int_arith_link";
 
-    pub fn new(bit_width: usize, num_rows: usize) -> errors::Result<Self> {
+    pub fn new(bit_width: usize, num_rows: usize, num_ops: usize) -> errors::Result<Self> {
         if bit_width != 32 && bit_width != 64 {
             return Err(errors::Error::Protocol {
                 protocol: "arithmetic",
@@ -211,6 +213,13 @@ impl IntArithmeticChiplet {
             });
         }
 
+        if num_ops > num_rows {
+            return Err(errors::Error::Protocol {
+                protocol: "arithmetic",
+                message: "op count exceeds num_rows",
+            });
+        }
+
         let layout = IntArithmeticLayout::compute(bit_width);
         let expander = layout.build_expander()?;
         let physical_layout = layout.build_physical_layout();
@@ -218,6 +227,7 @@ impl IntArithmeticChiplet {
         Ok(Self {
             bit_width,
             num_rows,
+            num_ops,
             bus_id: Self::BUS_ID.to_owned(),
             layout,
             expander,
@@ -234,20 +244,48 @@ impl IntArithmeticChiplet {
         &self.bus_id
     }
 
-    pub fn linking_spec(&self) -> PermutationCheckSpec {
-        PermutationCheckSpec::new(
-            vec![
-                (Source::Column(self.layout.val_a), b"kappa_val_a" as &[u8]),
-                (Source::Column(self.layout.val_b), b"kappa_val_b" as &[u8]),
-                (
-                    Source::Column(self.layout.val_res),
-                    b"kappa_val_res" as &[u8],
-                ),
-                (Source::Column(self.layout.opcode), b"kappa_opcode" as &[u8]),
-                (Source::Column(self.layout.request_idx), REQUEST_IDX_LABEL),
+    /// Both endpoints derive from this schema:
+    /// the operand triple, the opcode, the clock.
+    pub fn service() -> Service {
+        Service {
+            bus_id: Self::BUS_ID,
+            kind: BusKind::Permutation,
+            slots: vec![
+                ServiceSlot::Value(b"kappa_val_a"),
+                ServiceSlot::Value(b"kappa_val_b"),
+                ServiceSlot::Value(b"kappa_val_res"),
+                ServiceSlot::Value(b"kappa_opcode"),
+                ServiceSlot::RequestIdx { num_bytes: 4 },
             ],
-            Some(self.layout.s_output),
-        )
+            clock_waiver: None,
+        }
+    }
+
+    pub fn linking_spec(&self) -> PermutationCheckSpec {
+        let ly = &self.layout;
+
+        Self::service()
+            .respond(
+                &[ly.val_a, ly.val_b, ly.val_res, ly.opcode],
+                &[ly.request_idx],
+                ly.s_output,
+            )
+            .expect("service slots match the responder columns")
+    }
+
+    /// Requester endpoint over `CpuArithColumns`.
+    pub fn cpu_linking_spec() -> PermutationCheckSpec {
+        Self::service()
+            .request(
+                &[
+                    CpuArithColumns::VAL_A,
+                    CpuArithColumns::VAL_B,
+                    CpuArithColumns::VAL_RES,
+                    CpuArithColumns::OPCODE,
+                ],
+                CpuArithColumns::SELECTOR,
+            )
+            .expect("service slots match the requester columns")
     }
 
     pub fn layout(&self) -> &IntArithmeticLayout {
@@ -270,43 +308,6 @@ define_columns! {
         VAL_RES: B32,
         OPCODE: B32,
         SELECTOR: Bit,
-    }
-}
-
-/// CPU arithmetic event column layout.
-///
-/// The CPU side emits arithmetic operation requests.
-#[derive(Clone, Debug)]
-pub struct CpuIntArithmeticUnit;
-
-impl CpuIntArithmeticUnit {
-    pub fn linking_spec() -> PermutationCheckSpec {
-        PermutationCheckSpec::new(
-            vec![
-                (
-                    Source::Column(CpuArithColumns::VAL_A),
-                    b"kappa_val_a" as &[u8],
-                ),
-                (
-                    Source::Column(CpuArithColumns::VAL_B),
-                    b"kappa_val_b" as &[u8],
-                ),
-                (
-                    Source::Column(CpuArithColumns::VAL_RES),
-                    b"kappa_val_res" as &[u8],
-                ),
-                (
-                    Source::Column(CpuArithColumns::OPCODE),
-                    b"kappa_opcode" as &[u8],
-                ),
-                (Source::RowIndexLeBytes(4), REQUEST_IDX_LABEL),
-            ],
-            Some(CpuArithColumns::SELECTOR),
-        )
-    }
-
-    pub fn num_columns(&self) -> usize {
-        CpuArithColumns::NUM_COLUMNS
     }
 }
 
@@ -339,6 +340,10 @@ impl<F: TowerField> Air<F> for IntArithmeticChiplet {
 
     fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
         vec![(self.bus_id.clone(), self.linking_spec())]
+    }
+
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::prefix(self.layout.s_output, self.num_ops)]
     }
 
     fn virtual_expander(&self) -> Option<&VirtualExpander> {
@@ -374,7 +379,7 @@ impl<F: TowerField> Air<F> for IntArithmeticChiplet {
         let s_not = cs.col(ly.s_not);
         let s_lt = cs.col(ly.s_lt);
 
-        for s in [s_out, s_add, s_sub, s_and, s_xor, s_not, s_lt] {
+        for s in [s_add, s_sub, s_and, s_xor, s_not, s_lt] {
             cs.assert_boolean(s);
         }
 
@@ -911,24 +916,24 @@ mod tests {
 
     #[test]
     fn new_rejects_invalid_bit_width() {
-        assert!(IntArithmeticChiplet::new(16, 16).is_err());
-        assert!(IntArithmeticChiplet::new(33, 16).is_err());
-        assert!(IntArithmeticChiplet::new(128, 16).is_err());
+        assert!(IntArithmeticChiplet::new(16, 16, 0).is_err());
+        assert!(IntArithmeticChiplet::new(33, 16, 0).is_err());
+        assert!(IntArithmeticChiplet::new(128, 16, 0).is_err());
     }
 
     #[test]
     fn new_rejects_non_power_of_two_rows() {
-        assert!(IntArithmeticChiplet::new(32, 10).is_err());
-        assert!(IntArithmeticChiplet::new(32, 3).is_err());
+        assert!(IntArithmeticChiplet::new(32, 10, 0).is_err());
+        assert!(IntArithmeticChiplet::new(32, 3, 0).is_err());
     }
 
     #[test]
     fn new_accepts_valid_shapes() {
-        let chip32 = IntArithmeticChiplet::new(32, 16).unwrap();
+        let chip32 = IntArithmeticChiplet::new(32, 16, 16).unwrap();
         assert_eq!(chip32.num_columns(), 141);
         assert_eq!(chip32.num_rows(), 16);
 
-        let chip64 = IntArithmeticChiplet::new(64, 8).unwrap();
+        let chip64 = IntArithmeticChiplet::new(64, 8, 8).unwrap();
         assert_eq!(chip64.num_columns(), 269);
         assert_eq!(chip64.num_rows(), 8);
     }
@@ -1080,7 +1085,7 @@ mod tests {
 
     #[test]
     fn constraints_satisfied_on_u32_honest_trace() {
-        let chiplet = IntArithmeticChiplet::new(32, 8).unwrap();
+        let chiplet = IntArithmeticChiplet::new(32, 8, 6).unwrap();
         let ly = chiplet.layout().clone();
         let ops = vec![
             op_add(10, 20),
@@ -1113,7 +1118,7 @@ mod tests {
 
     #[test]
     fn constraints_satisfied_on_u64_honest_trace() {
-        let chiplet = IntArithmeticChiplet::new(64, 4).unwrap();
+        let chiplet = IntArithmeticChiplet::new(64, 4, 4).unwrap();
         let ly = chiplet.layout().clone();
         let ops = vec![
             IntArithmeticOp::U64 {
