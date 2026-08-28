@@ -13,18 +13,17 @@ use hekate_core::config::Config;
 use hekate_core::errors;
 use hekate_core::trace::TraceBuilder;
 use hekate_gadgets::{
-    ArithmeticOpcode, CpuArithColumns, CpuFetchColumns, CpuFetchUnit, CpuIntArithmeticUnit,
-    Instruction, IntArithmeticChiplet, IntArithmeticLayout, IntArithmeticOp, RomChiplet,
-    generate_arithmetic_trace, generate_rom_trace,
+    ArithmeticOpcode, CpuArithColumns, CpuFetchColumns, Instruction, IntArithmeticChiplet,
+    IntArithmeticLayout, IntArithmeticOp, RomChiplet, generate_arithmetic_trace,
+    generate_rom_trace,
 };
 use hekate_math::{Bit, Block32, TowerField};
-use hekate_program::chiplet::{
-    ChipletDef, CompositeChiplet, compose_chiplet_defs, compose_external_buses,
-};
+use hekate_program::chiplet::{CompositeChiplet, compose_chiplet_defs, compose_external_buses};
+use hekate_program::circuit::{Circuit, CircuitProgram};
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
 use hekate_program::permutation::{PermutationCheckSpec, Source};
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::{Air, FixedColumn, FixedShape, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 use rand::TryRngCore;
@@ -39,7 +38,6 @@ type H = DefaultHasher;
 
 const CPU_FETCH: usize = 0;
 const CPU_ARITH: usize = CpuFetchColumns::NUM_COLUMNS;
-const NUM_CPU_COLS: usize = CPU_ARITH + CpuArithColumns::NUM_COLUMNS;
 
 // =================================================================
 // 2. DUMMY CHIPLET (chiplet<>chiplet internal bus)
@@ -50,7 +48,9 @@ const DUMMY_SEL: usize = 1;
 const DUMMY_BUS_ID: &str = "data_pipe";
 
 #[derive(Clone)]
-struct DummyChiplet;
+struct DummyChiplet {
+    num_events: usize,
+}
 
 impl Air<F> for DummyChiplet {
     fn num_columns(&self) -> usize {
@@ -63,22 +63,22 @@ impl Air<F> for DummyChiplet {
 
     fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
         let spec = PermutationCheckSpec::new(
-            vec![(Source::Column(DUMMY_DATA), b"kappa_data")],
+            vec![
+                (Source::Column(DUMMY_DATA), b"kappa_data"),
+                (Source::RowIndexLeBytes(4), b"kappa_row"),
+            ],
             Some(DUMMY_SEL),
-        )
-        .with_clock_waiver(
-            "see hekate/examples/composite_chiplets.rs: synthetic demo bus; \
-             example only, not security-critical",
         );
 
         vec![(DUMMY_BUS_ID.into(), spec)]
     }
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(DUMMY_SEL));
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::prefix(DUMMY_SEL, self.num_events)]
+    }
 
-        cs.build()
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        ConstraintSystem::<F>::new().build()
     }
 }
 
@@ -116,19 +116,19 @@ struct Pipeline {
 }
 
 impl Pipeline {
-    fn new(rom_rows: usize, arith_rows: usize) -> Self {
-        let cpu_fetch = CpuFetchUnit::linking_spec();
+    fn new(rom_rows: usize, arith_rows: usize, num_ops: usize) -> Self {
+        let cpu_fetch = RomChiplet::cpu_linking_spec();
 
-        let mut cpu_arith = CpuIntArithmeticUnit::linking_spec();
+        let mut cpu_arith = IntArithmeticChiplet::cpu_linking_spec();
         cpu_arith.shift_column_indices(CPU_ARITH);
 
         let arith_layout = IntArithmeticLayout::compute(32);
 
         let composite = CompositeChiplet::<F>::builder("pipeline")
-            .chiplet(RomChiplet::new(rom_rows))
+            .chiplet(RomChiplet::new(rom_rows, num_ops))
             .chiplet(
-                IntArithmeticChiplet::new(32, arith_rows)
-                    .expect("IntArithmeticChiplet::new(32, arith_rows)"),
+                IntArithmeticChiplet::new(32, arith_rows, num_ops)
+                    .expect("IntArithmeticChiplet::new(32, arith_rows, num_ops)"),
             )
             .external_bus(RomChiplet::BUS_ID, cpu_fetch)
             .external_bus(IntArithmeticChiplet::BUS_ID, cpu_arith)
@@ -170,10 +170,10 @@ struct Audit {
 }
 
 impl Audit {
-    fn new(num_rows: usize) -> Self {
+    fn new(num_rows: usize, num_events: usize) -> Self {
         let composite = CompositeChiplet::<F>::builder("audit")
-            .chiplet(DummyChiplet)
-            .chiplet(DummyChiplet)
+            .chiplet(DummyChiplet { num_events })
+            .chiplet(DummyChiplet { num_events })
             .build()
             .unwrap();
 
@@ -202,54 +202,38 @@ impl Audit {
 // 4. PROGRAM DEFINITION
 // =================================================================
 
-#[derive(Clone)]
-struct CompositeChipletsProgram {
-    pipeline: CompositeChiplet<F>,
-    audit: CompositeChiplet<F>,
-}
+/// The composites keep their own bus namespacing;
+/// the circuit takes their flattened defs and the
+/// external buses they expose to the main trace.
+fn build_program(
+    num_rows: usize,
+    num_ops: usize,
+    composites: &[&CompositeChiplet<F>; 2],
+) -> errors::Result<CircuitProgram<F>> {
+    let mut cx = Circuit::<F>::new("CompositeExample", num_rows)?;
 
-impl CompositeChipletsProgram {
-    fn composites(&self) -> [&CompositeChiplet<F>; 2] {
-        [&self.pipeline, &self.audit]
-    }
-}
+    let fetch = cx.schema(&CpuFetchColumns::build_layout());
+    let arith = cx.schema(&CpuArithColumns::build_layout());
 
-impl Air<F> for CompositeChipletsProgram {
-    fn name(&self) -> String {
-        "CompositeExample".into()
-    }
+    let ops_prefix = || FixedShape::Cadence {
+        stride: 1,
+        count: num_ops,
+        origin: 0,
+        values: vec![F::ONE],
+    };
 
-    fn num_columns(&self) -> usize {
-        NUM_CPU_COLS
-    }
+    cx.fix(fetch.at(CpuFetchColumns::SELECTOR), ops_prefix());
+    cx.fix(arith.at(CpuArithColumns::SELECTOR), ops_prefix());
 
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        LAYOUT.get_or_init(|| {
-            let mut cols = CpuFetchColumns::build_layout();
-            cols.extend(CpuArithColumns::build_layout());
-
-            cols
-        })
+    for (bus_id, spec) in compose_external_buses(composites) {
+        cx.bus(&bus_id, spec);
     }
 
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        compose_external_buses(&self.composites())
+    for def in compose_chiplet_defs(composites)? {
+        cx.attach(def);
     }
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CPU_FETCH + CpuFetchColumns::SELECTOR));
-        cs.assert_boolean(cs.col(CPU_ARITH + CpuArithColumns::SELECTOR));
-
-        cs.build()
-    }
-}
-
-impl Program<F> for CompositeChipletsProgram {
-    fn chiplet_defs(&self) -> errors::Result<Vec<ChipletDef<F>>> {
-        compose_chiplet_defs(&self.composites())
-    }
+    cx.compile()
 }
 
 // =================================================================
@@ -403,8 +387,8 @@ fn main() {
 
     // Composites own row counts and
     // encapsulate trace generation.
-    let pipeline = Pipeline::new(rom_num_rows, arith_num_rows);
-    let audit = Audit::new(dummy_num_rows);
+    let pipeline = Pipeline::new(rom_num_rows, arith_num_rows, num_ops);
+    let audit = Audit::new(dummy_num_rows, num_ops);
 
     let config = Config {
         zero_knowledge: common::zero_knowledge(),
@@ -446,10 +430,12 @@ fn main() {
         (cpu_trace, chiplet_traces)
     });
 
-    let air = CompositeChipletsProgram {
-        pipeline: pipeline.composite().clone(),
-        audit: audit.composite().clone(),
-    };
+    let air = build_program(
+        main_num_rows,
+        num_ops,
+        &[pipeline.composite(), audit.composite()],
+    )
+    .unwrap();
 
     let instance = ProgramInstance::new(main_num_rows, vec![]);
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(chiplet_traces);
@@ -471,9 +457,17 @@ fn main() {
 
     let mut verifier_transcript = Transcript::<H>::new(b"Composite_Example");
 
+    let pinned_id = common::audited_id(&air);
     let is_valid = common::phase_with_mem("Verifying", || {
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut verifier_transcript, &config)
-            .expect("Verifier failed")
+        HekateVerifier::<F, H>::verify(
+            &pinned_id,
+            &air,
+            &instance,
+            &proof,
+            &mut verifier_transcript,
+            &config,
+        )
+        .expect("Verifier failed")
     });
 
     common::result(is_valid);

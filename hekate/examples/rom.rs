@@ -6,20 +6,17 @@
 mod common;
 
 use hekate::core::trace::ColumnTrace;
-use hekate::core::trace::ColumnType;
 use hekate::crypto::DefaultHasher;
 use hekate::crypto::transcript::Transcript;
 use hekate::math::{Block128, TowerField};
 use hekate_core::config::Config;
 use hekate_core::errors;
 use hekate_core::trace::TraceBuilder;
-use hekate_gadgets::{
-    CpuFetchColumns, CpuFetchUnit, Instruction, RomChiplet, RomColumns, generate_rom_trace,
-};
+use hekate_gadgets::{CpuFetchColumns, Instruction, RomChiplet, generate_rom_trace};
 use hekate_math::{Bit, Block32};
-use hekate_program::constraint::ConstraintAst;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::chiplet::ChipletDef;
+use hekate_program::circuit::{Circuit, CircuitProgram};
+use hekate_program::{FixedShape, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 use rand::{TryRngCore, rngs::OsRng};
@@ -30,60 +27,31 @@ type H = DefaultHasher;
 // =================================================================
 // 1. ROM TEST PROGRAM DEFINITION
 // =================================================================
-#[derive(Clone)]
-struct RomInlineChipletProgram {
-    #[allow(dead_code)]
-    num_rows: usize,
+
+/// CPU columns in `CpuFetchColumns` order;
+/// the circuit handles match the trace generator's schema.
+fn build_program(num_rows: usize) -> errors::Result<CircuitProgram<F>> {
+    let mut cx = Circuit::<F>::new("RomInline", num_rows)?;
+
+    let cpu = cx.schema(&CpuFetchColumns::build_layout());
+    let selector = cpu.at(CpuFetchColumns::SELECTOR);
+
+    cx.fix(
+        selector,
+        FixedShape::Cadence {
+            stride: 1,
+            count: num_rows,
+            origin: 0,
+            values: vec![F::ONE],
+        },
+    );
+
+    cx.bus(RomChiplet::BUS_ID, RomChiplet::cpu_linking_spec());
+
+    cx.mount(ChipletDef::from_air(&RomChiplet::new(num_rows, num_rows))?);
+
+    cx.compile()
 }
-
-impl Air<F> for RomInlineChipletProgram {
-    fn num_columns(&self) -> usize {
-        // CPU Fetch (6 cols) + ROM Chiplet (9 cols)
-        CpuFetchColumns::NUM_COLUMNS + RomColumns::NUM_COLUMNS
-    }
-
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        LAYOUT.get_or_init(|| {
-            let mut cols = CpuFetchColumns::build_layout();
-            cols.extend(RomColumns::build_layout());
-
-            cols
-        })
-    }
-
-    fn permutation_checks(
-        &self,
-    ) -> Vec<(String, hekate_program::permutation::PermutationCheckSpec)> {
-        let cpu_spec = CpuFetchUnit::linking_spec();
-        let mut rom_spec = RomChiplet::linking_spec();
-
-        // Adjust ROM indices to account for
-        // CPU columns offset in the combined trace.
-        rom_spec.shift_column_indices(CpuFetchColumns::NUM_COLUMNS);
-
-        vec![
-            (RomChiplet::BUS_ID.to_string(), cpu_spec),
-            (RomChiplet::BUS_ID.to_string(), rom_spec),
-        ]
-    }
-
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CpuFetchColumns::SELECTOR));
-
-        let mut ast = cs.build();
-
-        let mut rom_ast = RomChiplet::new(self.num_rows).constraint_ast();
-        rom_ast.arena.shift_cells(CpuFetchColumns::NUM_COLUMNS);
-
-        ast.merge(rom_ast);
-
-        ast
-    }
-}
-
-impl Program<F> for RomInlineChipletProgram {}
 
 // =================================================================
 // 2. TRACE GENERATION HELPERS
@@ -165,7 +133,7 @@ fn main() {
         generate_combined_trace(&instructions, num_rows).unwrap()
     });
 
-    let air = RomInlineChipletProgram { num_rows };
+    let air = build_program(num_rows).unwrap();
     let instance = ProgramInstance::new(num_rows, vec![]);
     let witness = ProgramWitness::new(trace);
 
@@ -185,10 +153,18 @@ fn main() {
     common::proof_breakdown(&proof);
 
     let mut verifier_transcript = Transcript::<H>::new(b"ROM_Example");
+    let pinned_id = common::audited_id(&air);
 
     let is_valid = common::phase_with_mem("Verifying", || {
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut verifier_transcript, &config)
-            .expect("Verifier failed")
+        HekateVerifier::<F, H>::verify(
+            &pinned_id,
+            &air,
+            &instance,
+            &proof,
+            &mut verifier_transcript,
+            &config,
+        )
+        .expect("Verifier failed")
     });
 
     common::result(is_valid);

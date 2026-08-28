@@ -6,7 +6,6 @@
 mod common;
 
 use hekate::core::trace::ColumnTrace;
-use hekate::core::trace::ColumnType;
 use hekate::crypto::DefaultHasher;
 use hekate::crypto::transcript::Transcript;
 use hekate::math::{Block128, TowerField};
@@ -14,16 +13,14 @@ use hekate_core::config::Config;
 use hekate_core::errors;
 use hekate_core::trace::TraceBuilder;
 use hekate_gadgets::{
-    ArithmeticOpcode, CpuArithColumns, CpuFetchColumns, CpuFetchUnit, CpuIntArithmeticUnit,
-    CpuMemColumns, CpuMemoryUnit, Instruction, IntArithmeticChiplet, IntArithmeticLayout,
-    IntArithmeticOp, MemoryEvent, RamChiplet, RomChiplet, generate_arithmetic_trace,
-    generate_ram_trace, generate_rom_trace,
+    ArithmeticOpcode, CpuArithColumns, CpuFetchColumns, CpuMemColumns, Instruction,
+    IntArithmeticChiplet, IntArithmeticLayout, IntArithmeticOp, MemoryEvent, RamChiplet,
+    RomChiplet, generate_arithmetic_trace, generate_ram_trace, generate_rom_trace,
 };
 use hekate_math::{Bit, Block32};
 use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::ConstraintAst;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::circuit::{Circuit, CircuitProgram};
+use hekate_program::{FixedShape, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 use rand::{TryRngCore, rngs::OsRng};
@@ -32,7 +29,7 @@ type F = Block128;
 type H = DefaultHasher;
 
 // =================================================================
-// 1. COLUMN LAYOUT — CPU COLUMNS ONLY (MAIN TRACE)
+// 1. COLUMN LAYOUT: CPU COLUMNS ONLY (MAIN TRACE)
 // =================================================================
 //
 // ROM, Arithmetic, RAM chiplets now have independent traces.
@@ -41,86 +38,62 @@ type H = DefaultHasher;
 const CPU_FETCH: usize = 0;
 const CPU_ARITH: usize = CpuFetchColumns::NUM_COLUMNS;
 const CPU_MEM: usize = CPU_ARITH + CpuArithColumns::NUM_COLUMNS;
-const NUM_CPU_COLS: usize = CPU_MEM + CpuMemColumns::NUM_COLUMNS;
 
 // =================================================================
 // 2. PROGRAM DEFINITION
 // =================================================================
-#[derive(Clone)]
-struct ManyInlineChipletsProgram {
+
+/// Three CPU schemas back to back; the chiplet
+/// constraints live on their own traces.
+fn build_program(
+    num_rows: usize,
     rom_num_rows: usize,
     arith_num_rows: usize,
     ram_num_rows: usize,
-}
+    num_ops: usize,
+) -> errors::Result<CircuitProgram<F>> {
+    let mut cx = Circuit::<F>::new("AluRamRomWithChiplets", num_rows)?;
 
-impl Air<F> for ManyInlineChipletsProgram {
-    fn name(&self) -> String {
-        "AluRamRomWithChiplets".to_string()
-    }
+    let fetch = cx.schema(&CpuFetchColumns::build_layout());
+    let arith = cx.schema(&CpuArithColumns::build_layout());
+    let mem = cx.schema(&CpuMemColumns::build_layout());
 
-    fn num_columns(&self) -> usize {
-        NUM_CPU_COLS
-    }
+    let ops_prefix = || FixedShape::Cadence {
+        stride: 1,
+        count: num_ops,
+        origin: 0,
+        values: vec![F::ONE],
+    };
 
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
+    cx.fix(fetch.at(CpuFetchColumns::SELECTOR), ops_prefix());
+    cx.fix(arith.at(CpuArithColumns::SELECTOR), ops_prefix());
+    cx.fix(mem.at(CpuMemColumns::SELECTOR), ops_prefix());
 
-        LAYOUT.get_or_init(|| {
-            let mut cols = CpuFetchColumns::build_layout();
-            cols.extend(CpuArithColumns::build_layout());
-            cols.extend(CpuMemColumns::build_layout());
+    let mut cpu_arith = IntArithmeticChiplet::cpu_linking_spec();
+    cpu_arith.shift_column_indices(arith.start());
 
-            cols
-        })
-    }
+    let mut cpu_mem = RamChiplet::cpu_linking_spec();
+    cpu_mem.shift_column_indices(mem.start());
 
-    fn permutation_checks(
-        &self,
-    ) -> Vec<(String, hekate_program::permutation::PermutationCheckSpec)> {
-        // CPU-side bus endpoints only.
-        // bus_ids match the chiplet supply-side IDs.
-        let cpu_fetch = CpuFetchUnit::linking_spec();
+    cx.bus(RomChiplet::BUS_ID, RomChiplet::cpu_linking_spec());
+    cx.bus(IntArithmeticChiplet::BUS_ID, cpu_arith);
+    cx.bus(RamChiplet::BUS_ID, cpu_mem);
 
-        let mut cpu_arith = CpuIntArithmeticUnit::linking_spec();
-        cpu_arith.shift_column_indices(CPU_ARITH);
+    cx.attach(ChipletDef::from_air(&RomChiplet::new(
+        rom_num_rows,
+        num_ops,
+    ))?);
+    cx.attach(ChipletDef::from_air(&IntArithmeticChiplet::new(
+        32,
+        arith_num_rows,
+        num_ops,
+    )?)?);
+    cx.attach(ChipletDef::from_air(&RamChiplet::new(
+        ram_num_rows,
+        num_ops,
+    ))?);
 
-        let mut cpu_mem = CpuMemoryUnit::linking_spec();
-        cpu_mem.shift_column_indices(CPU_MEM);
-
-        vec![
-            (RomChiplet::BUS_ID.into(), cpu_fetch),
-            (IntArithmeticChiplet::BUS_ID.into(), cpu_arith),
-            (RamChiplet::BUS_ID.into(), cpu_mem),
-        ]
-    }
-
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        // CPU selector booleanity,
-        // the only main-trace constraints.
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CPU_FETCH + CpuFetchColumns::SELECTOR));
-        cs.assert_boolean(cs.col(CPU_ARITH + CpuArithColumns::SELECTOR));
-        cs.assert_boolean(cs.col(CPU_MEM + CpuMemColumns::SELECTOR));
-
-        // ROM, Arithmetic, RAM constraints
-        // live on their own chiplet traces.
-        cs.build()
-    }
-}
-
-impl Program<F> for ManyInlineChipletsProgram {
-    fn chiplet_defs(&self) -> errors::Result<Vec<ChipletDef<F>>> {
-        let rom = RomChiplet::new(self.rom_num_rows);
-        let arith = IntArithmeticChiplet::new(32, self.arith_num_rows)
-            .expect("IntArithmeticChiplet::new(32, arith_num_rows)");
-        let ram = RamChiplet::new(self.ram_num_rows);
-
-        Ok(vec![
-            ChipletDef::from_air(&rom)?,
-            ChipletDef::from_air(&arith)?,
-            ChipletDef::from_air(&ram)?,
-        ])
-    }
+    cx.compile()
 }
 
 // =================================================================
@@ -391,11 +364,14 @@ fn main() {
         ram_trace.columns.len(),
     );
 
-    let air = ManyInlineChipletsProgram {
+    let air = build_program(
+        main_num_rows,
         rom_num_rows,
         arith_num_rows,
         ram_num_rows,
-    };
+        num_ops,
+    )
+    .unwrap();
 
     let instance = ProgramInstance::new(main_num_rows, vec![]);
     let witness =
@@ -418,9 +394,17 @@ fn main() {
 
     let mut verifier_transcript = Transcript::<H>::new(b"Unified_Example");
 
+    let pinned_id = common::audited_id(&air);
     let is_valid = common::phase_with_mem("Verifying", || {
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut verifier_transcript, &config)
-            .expect("Verifier failed")
+        HekateVerifier::<F, H>::verify(
+            &pinned_id,
+            &air,
+            &instance,
+            &proof,
+            &mut verifier_transcript,
+            &config,
+        )
+        .expect("Verifier failed")
     });
 
     common::result(is_valid);

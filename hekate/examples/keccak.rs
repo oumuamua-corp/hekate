@@ -9,16 +9,13 @@ use hekate::crypto::DefaultHasher;
 use hekate::crypto::transcript::Transcript;
 use hekate::math::{Block128, TowerField};
 use hekate_core::config::Config;
-use hekate_core::trace::{ColumnTrace, ColumnType, TraceBuilder};
-use hekate_keccak::{
-    CpuKeccakColumns, CpuKeccakUnit, KeccakChiplet, KeccakColumns, generate_keccak_trace,
-};
+use hekate_core::errors;
+use hekate_core::trace::{ColumnTrace, TraceBuilder};
+use hekate_keccak::{CpuKeccakColumns, KeccakChiplet, KeccakColumns, generate_keccak_trace};
 use hekate_math::{Bit, Block64};
 use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
-use hekate_program::permutation::PermutationCheckSpec;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::circuit::{Circuit, CircuitProgram, Col};
+use hekate_program::{ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 use rand::{TryRngCore, rngs::OsRng};
@@ -34,58 +31,46 @@ type H = DefaultHasher;
 // chiplet with its own trace, commitment, and ZeroCheck.
 // The kernel activates automatically through ChipletDef.
 
-#[derive(Clone)]
-struct KeccakIsolatedChipletProgram {
-    keccak_num_rows: usize,
-}
+/// CPU columns in `CpuKeccakColumns` order;
+/// the circuit handles match the trace generator's schema.
+/// The digest is the first 4 lanes of the final state,
+/// read where the cadence forces the last output emit.
+fn build_program(num_rows: usize) -> errors::Result<CircuitProgram<F>> {
+    let num_blocks = num_rows / KeccakChiplet::BLOCK_ROWS;
 
-impl Air<F> for KeccakIsolatedChipletProgram {
-    fn num_columns(&self) -> usize {
-        CpuKeccakColumns::NUM_COLUMNS
+    let mut cx = Circuit::<F>::new("KeccakIsolated", num_rows)?;
+
+    let cpu = cx.schema(&CpuKeccakColumns::build_layout());
+
+    let selector = cpu.at(CpuKeccakColumns::SELECTOR);
+    let is_output = cpu.at(CpuKeccakColumns::IS_OUTPUT);
+
+    let call_values: Vec<Col> = (0..25)
+        .map(|lane| cpu.at(CpuKeccakColumns::LANES + lane))
+        .chain([is_output])
+        .collect();
+
+    cx.call(&KeccakChiplet::service(), &call_values, selector)?;
+
+    cx.fix(
+        selector,
+        KeccakChiplet::host_selector_shape(KeccakChiplet::BLOCK_ROWS, num_blocks),
+    );
+    cx.fix(
+        is_output,
+        KeccakChiplet::host_direction_shape(KeccakChiplet::BLOCK_ROWS, num_blocks),
+    );
+
+    cx.attach(ChipletDef::from_air(&KeccakChiplet::new(
+        num_rows, num_blocks,
+    ))?);
+
+    let last_output_row = KeccakChiplet::BLOCK_ROWS * num_blocks - 1;
+    for i in 0..4 {
+        cx.publish(cpu.at(CpuKeccakColumns::LANES + i), last_output_row);
     }
 
-    fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
-        // Keccak-256 digest = first 4 lanes of final state.
-        // Last output row sits at 25*max_blocks-1,
-        // which only equals num_rows-1 when 25 divides
-        // num_rows; trailing rows beyond that are
-        // zero-padded and must not be pinned.
-        let max_blocks = self.keccak_num_rows / 25;
-        let last_output_row = 25 * max_blocks - 1;
-
-        (0..4)
-            .map(|i| BoundaryConstraint::with_public_input(i, last_output_row, i))
-            .chain([CpuKeccakUnit::direction_boundary(0)])
-            .collect()
-    }
-
-    fn column_layout(&self) -> &'static [ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        LAYOUT.get_or_init(CpuKeccakColumns::build_layout)
-    }
-
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![(KeccakChiplet::BUS_ID.into(), CpuKeccakUnit::linking_spec())]
-    }
-
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-
-        CpuKeccakUnit::constrain(&cs, 0);
-
-        cs.build()
-    }
-}
-
-impl Program<F> for KeccakIsolatedChipletProgram {
-    fn num_public_inputs(&self) -> usize {
-        4
-    }
-
-    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        let keccak = KeccakChiplet::new(self.keccak_num_rows);
-        Ok(vec![ChipletDef::from_air(&keccak)?])
-    }
+    cx.compile()
 }
 
 // =================================================================
@@ -198,7 +183,11 @@ fn main() {
     let mut blinding_seed = [0u8; 32];
     OsRng.try_fill_bytes(&mut blinding_seed).unwrap();
 
-    println!("Rows: 2^{} ({} permutations)", num_vars, num_rows / 25);
+    println!(
+        "Rows: 2^{} ({} permutations)",
+        num_vars,
+        num_rows / KeccakChiplet::BLOCK_ROWS
+    );
     println!(
         "Total Columns: {} CPU + {} Keccak chiplet",
         CpuKeccakColumns::NUM_COLUMNS,
@@ -206,7 +195,7 @@ fn main() {
     );
 
     let (cpu_trace, keccak_trace, air, digest) = common::phase("Trace Generation", || {
-        let max_blocks = num_rows / 25;
+        let max_blocks = num_rows / KeccakChiplet::BLOCK_ROWS;
         let message_len = max_blocks * 136 - 136;
 
         println!("   Max Blocks: {}", max_blocks);
@@ -239,9 +228,7 @@ fn main() {
             .collect();
         let keccak = generate_keccak_trace(&inputs, Some(&pairs), num_rows).unwrap();
 
-        let air = KeccakIsolatedChipletProgram {
-            keccak_num_rows: num_rows,
-        };
+        let air = build_program(num_rows).unwrap();
 
         (cpu, keccak, air, digest)
     });
@@ -275,10 +262,18 @@ fn main() {
     common::proof_breakdown(&proof);
 
     let mut verifier_transcript = Transcript::<H>::new(b"Keccak_E2E");
+    let pinned_id = common::audited_id(&air);
 
     let is_valid = common::phase_with_mem("Verifying", || {
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut verifier_transcript, &config)
-            .expect("Verifier failed")
+        HekateVerifier::<F, H>::verify(
+            &pinned_id,
+            &air,
+            &instance,
+            &proof,
+            &mut verifier_transcript,
+            &config,
+        )
+        .expect("Verifier failed")
     });
 
     common::result(is_valid);
