@@ -14,10 +14,8 @@
 
 use hekate_core::trace::{ColumnTrace, ColumnType, TraceColumn};
 use hekate_math::{Bit, Block32, Block128, Flat, TowerField};
-use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::ConstraintAst;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::circuit::{Circuit, CircuitProgram};
+use hekate_program::{ProgramInstance, ProgramWitness};
 use hekate_scribble::{
     Mutation, MutationKind, ScribbleConfig, Target, apply_mutation, check_single_mutation,
     mutation_strategy,
@@ -30,24 +28,13 @@ const NUM_VARS: usize = 2;
 
 type F = Block128;
 
-#[derive(Clone)]
-struct TrivialAir;
+fn trivial_air(num_rows: usize) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("Trivial", num_rows).unwrap();
 
-impl Air<F> for TrivialAir {
-    fn column_layout(&self) -> &[ColumnType] {
-        static L: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        L.get_or_init(|| vec![ColumnType::Bit, ColumnType::B32])
-    }
+    cx.column(ColumnType::Bit);
+    cx.column(ColumnType::B32);
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        ConstraintSystem::<F>::new().build()
-    }
-}
-
-impl Program<F> for TrivialAir {
-    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        Ok(vec![])
-    }
+    cx.compile().unwrap()
 }
 
 fn build_trace() -> ColumnTrace {
@@ -199,7 +186,7 @@ fn row_segment_zero_cross_product() {
 
 #[test]
 fn row_segment_zero_on_zeroed_cell_is_noop_not_escape() {
-    let air = TrivialAir;
+    let air = trivial_air(N);
     let instance = ProgramInstance::new(N, vec![]);
     let witness = build_witness();
 
@@ -367,7 +354,7 @@ fn check_single_mutation_preserves_input_witness_for_new_kinds() {
     // the verdict; we verify the engine round-trip
     // (clone + apply + preflight + restore) does
     // not mutate the caller's witness.
-    let air = TrivialAir;
+    let air = trivial_air(N);
     let instance = ProgramInstance::new(N, vec![]);
     let witness = build_witness();
 
@@ -404,7 +391,7 @@ fn compound_of_new_kinds_round_trips() {
     // `apply_mutation` + `collect_patches`
     // for `Compound` containing the new
     // variants.
-    let air = TrivialAir;
+    let air = trivial_air(N);
     let instance = ProgramInstance::new(N, vec![]);
     let witness = build_witness();
 
@@ -755,7 +742,7 @@ fn strategy_emits_duplicate_row_when_opt_in() {
 
 #[test]
 fn check_single_mutation_preserves_input_witness_for_all_variants() {
-    let air = TrivialAir;
+    let air = trivial_air(N);
     let instance = ProgramInstance::new(N, vec![]);
     let witness = build_witness();
 
@@ -814,7 +801,7 @@ fn check_single_mutation_preserves_input_witness_for_all_variants() {
 
 #[test]
 fn nested_compound_round_trips() {
-    let air = TrivialAir;
+    let air = trivial_air(N);
     let instance = ProgramInstance::new(N, vec![]);
     let witness = build_witness();
 

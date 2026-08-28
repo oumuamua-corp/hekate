@@ -12,15 +12,13 @@
 
 use hekate_core::trace::{ColumnTrace, ColumnType, TraceBuilder};
 use hekate_gadgets::{
-    ArithmeticOpcode, CpuArithColumns, CpuIntArithmeticUnit, IntArithmeticChiplet,
-    IntArithmeticLayout, IntArithmeticOp, generate_arithmetic_trace,
+    ArithmeticOpcode, CpuArithColumns, IntArithmeticChiplet, IntArithmeticLayout, IntArithmeticOp,
+    generate_arithmetic_trace,
 };
 use hekate_math::{Bit, Block32, Block128, TowerField};
 use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::ConstraintAst;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::permutation::PermutationCheckSpec;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::circuit::{Circuit, CircuitProgram};
+use hekate_program::{FixedShape, ProgramInstance, ProgramWitness};
 use hekate_scribble::{
     Mutation, MutationKind, ScribbleConfig, Target, assert_all_caught, check_single_mutation,
 };
@@ -29,63 +27,43 @@ type F = Block128;
 
 const BIT_WIDTH: usize = 32;
 
-#[derive(Clone)]
-struct ArithTestProgram {
-    arith_num_rows: usize,
-    cpu_layout: Vec<ColumnType>,
-}
+fn arith_test_program(arith_num_rows: usize, num_ops: usize) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("ArithScribble", arith_num_rows).unwrap();
+    let cpu = cx.schema(&CpuArithColumns::build_layout());
 
-impl ArithTestProgram {
-    fn new(arith_num_rows: usize) -> Self {
-        let cpu_layout = vec![
-            ColumnType::B32,
-            ColumnType::B32,
-            ColumnType::B32,
-            ColumnType::B32,
-            ColumnType::Bit,
-        ];
+    cx.fix(
+        cpu.at(CpuArithColumns::SELECTOR),
+        FixedShape::Cadence {
+            stride: 1,
+            count: num_ops,
+            origin: 0,
+            values: vec![F::ONE],
+        },
+    );
 
-        Self {
-            arith_num_rows,
-            cpu_layout,
-        }
-    }
-}
+    cx.bus(
+        IntArithmeticChiplet::BUS_ID,
+        IntArithmeticChiplet::cpu_linking_spec(),
+    );
 
-impl Air<F> for ArithTestProgram {
-    fn column_layout(&self) -> &[ColumnType] {
-        &self.cpu_layout
-    }
+    let cs = cx.cs();
 
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![(
-            IntArithmeticChiplet::BUS_ID.into(),
-            CpuIntArithmeticUnit::linking_spec(),
-        )]
-    }
+    let selector = cs.col(CpuArithColumns::SELECTOR);
+    let not_active = cs.one() + selector;
+    cs.assert_zero_when(not_active, cs.col(CpuArithColumns::VAL_A));
+    cs.assert_zero_when(not_active, cs.col(CpuArithColumns::VAL_B));
+    cs.assert_zero_when(not_active, cs.col(CpuArithColumns::VAL_RES));
+    cs.assert_zero_when(not_active, cs.col(CpuArithColumns::OPCODE));
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
+    cx.attach(
+        ChipletDef::from_air(
+            &IntArithmeticChiplet::new(BIT_WIDTH, arith_num_rows, num_ops)
+                .expect("IntArithmeticChiplet::new"),
+        )
+        .unwrap(),
+    );
 
-        let selector = cs.col(CpuArithColumns::SELECTOR);
-        cs.assert_boolean(selector);
-
-        let not_active = cs.one() + selector;
-        cs.assert_zero_when(not_active, cs.col(CpuArithColumns::VAL_A));
-        cs.assert_zero_when(not_active, cs.col(CpuArithColumns::VAL_B));
-        cs.assert_zero_when(not_active, cs.col(CpuArithColumns::VAL_RES));
-        cs.assert_zero_when(not_active, cs.col(CpuArithColumns::OPCODE));
-
-        cs.build()
-    }
-}
-
-impl Program<F> for ArithTestProgram {
-    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        let arith = IntArithmeticChiplet::new(BIT_WIDTH, self.arith_num_rows)
-            .expect("IntArithmeticChiplet::new");
-        Ok(vec![ChipletDef::from_air(&arith)?])
-    }
+    cx.compile().unwrap()
 }
 
 fn compute_u32(op: ArithmeticOpcode, a: u32, b: u32) -> u32 {
@@ -144,14 +122,14 @@ fn build_fixture(
     raw_ops: &[(ArithmeticOpcode, u32, u32)],
     num_rows: usize,
 ) -> (
-    ArithTestProgram,
+    CircuitProgram<F>,
     ProgramInstance<F>,
     ProgramWitness<F, ColumnTrace>,
 ) {
     let ops = with_request_idx(raw_ops);
 
-    let air = ArithTestProgram::new(num_rows);
-    let cpu_trace = generate_cpu_trace(&ops, num_rows, &air.cpu_layout);
+    let air = arith_test_program(num_rows, ops.len());
+    let cpu_trace = generate_cpu_trace(&ops, num_rows, &CpuArithColumns::build_layout());
 
     let layout = IntArithmeticLayout::compute(BIT_WIDTH);
     let arith_trace = generate_arithmetic_trace(&ops, &layout, num_rows).expect("arith trace gen");
@@ -163,7 +141,7 @@ fn build_fixture(
 }
 
 fn setup_dense_fixture() -> (
-    ArithTestProgram,
+    CircuitProgram<F>,
     ProgramInstance<F>,
     ProgramWitness<F, ColumnTrace>,
 ) {
@@ -177,7 +155,7 @@ fn setup_dense_fixture() -> (
 }
 
 fn setup_padding_fixture() -> (
-    ArithTestProgram,
+    CircuitProgram<F>,
     ProgramInstance<F>,
     ProgramWitness<F, ColumnTrace>,
 ) {
@@ -192,7 +170,7 @@ fn setup_padding_fixture() -> (
 }
 
 fn setup_overflow_fixture() -> (
-    ArithTestProgram,
+    CircuitProgram<F>,
     ProgramInstance<F>,
     ProgramWitness<F, ColumnTrace>,
 ) {

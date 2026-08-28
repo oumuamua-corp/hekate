@@ -15,7 +15,6 @@
 pub mod apply;
 pub mod check;
 pub mod config;
-pub mod language;
 pub mod mutation;
 pub mod prelude;
 pub mod strategy;
