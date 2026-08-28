@@ -3,19 +3,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use hekate::core::config::Config;
-use hekate::core::trace::{ColumnTrace, ColumnType, Trace, TraceColumn};
+use hekate::core::trace::{ColumnTrace, Trace, TraceColumn};
 use hekate::crypto::DefaultHasher;
 use hekate::crypto::transcript::Transcript;
 use hekate::math::{Block128, TowerField};
 use hekate_core::trace::IntoTraceColumn;
-use hekate_gadgets::{
-    CpuFetchColumns, CpuFetchUnit, Instruction, RomChiplet, RomColumns, generate_rom_trace,
-};
+use hekate_gadgets::{CpuFetchColumns, Instruction, RomChiplet, RomColumns, generate_rom_trace};
 use hekate_math::{Bit, Block32};
-use hekate_program::constraint::ConstraintAst;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::permutation::PermutationCheckSpec;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::circuit::{Circuit, CircuitProgram, Col};
+use hekate_program::digest::program_id;
+use hekate_program::{Air, FixedShape, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 
@@ -24,55 +21,52 @@ type H = DefaultHasher;
 
 // --- 1. Define Combined AIR using Library Specs ---
 
-#[derive(Clone)]
-struct CpuRomAir {
-    #[allow(dead_code)]
-    num_rows: usize,
+// Both endpoints sit on the main trace for this
+// combined AIR, they share the ROM's canonical
+// bus_id and their paired LogUp sums must cancel.
+fn cpu_rom_air(num_rows: usize) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("CpuRom", num_rows).unwrap();
+
+    let cpu = cx.schema(&CpuFetchColumns::build_layout());
+    let rom = cx.schema(&RomColumns::build_layout());
+
+    let full_prefix = || FixedShape::Cadence {
+        stride: 1,
+        count: num_rows,
+        origin: 0,
+        values: vec![F::ONE],
+    };
+
+    cx.fix(cpu.at(CpuFetchColumns::SELECTOR), full_prefix());
+    cx.fix(rom.at(RomColumns::SELECTOR), full_prefix());
+
+    let values: Vec<Col> = [
+        CpuFetchColumns::PC_B0,
+        CpuFetchColumns::PC_B1,
+        CpuFetchColumns::PC_B2,
+        CpuFetchColumns::PC_B3,
+        CpuFetchColumns::OPCODE,
+        CpuFetchColumns::ARG0,
+        CpuFetchColumns::ARG1,
+        CpuFetchColumns::ARG2,
+    ]
+    .map(|c| cpu.at(c))
+    .to_vec();
+
+    cx.call(
+        &RomChiplet::service(),
+        &values,
+        cpu.at(CpuFetchColumns::SELECTOR),
+    )
+    .unwrap();
+
+    let mut rom_spec = RomChiplet::linking_spec();
+    rom_spec.shift_column_indices(rom.start());
+
+    cx.bus(RomChiplet::BUS_ID, rom_spec);
+
+    cx.compile().unwrap()
 }
-
-impl Air<F> for CpuRomAir {
-    fn num_columns(&self) -> usize {
-        // CPU Fetch (6 cols) defined in CpuFetchUnit
-        // ROM (9 cols) defined in RomChiplet
-        CpuFetchColumns::NUM_COLUMNS + RomColumns::NUM_COLUMNS
-    }
-
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-
-        LAYOUT.get_or_init(|| {
-            let mut cols = CpuFetchColumns::build_layout();
-            cols.extend(RomColumns::build_layout());
-
-            cols
-        })
-    }
-
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        // Both endpoints sit on the main trace
-        // for this combined AIR, so they share
-        // the ROM's canonical bus_id and their
-        // paired LogUp sums must cancel.
-        let cpu_spec = CpuFetchUnit::linking_spec();
-
-        let mut rom_spec = RomChiplet::linking_spec();
-        rom_spec.shift_column_indices(CpuFetchColumns::NUM_COLUMNS);
-
-        vec![
-            (RomChiplet::BUS_ID.into(), cpu_spec),
-            (RomChiplet::BUS_ID.into(), rom_spec),
-        ]
-    }
-
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CpuFetchColumns::SELECTOR));
-
-        cs.build()
-    }
-}
-
-impl Program<F> for CpuRomAir {}
 
 // --- 2. Trace Generation ---
 
@@ -151,7 +145,7 @@ fn chiplets_integration() {
     let num_rows = 1 << num_vars;
     let seed = [0u8; 32];
 
-    let air = CpuRomAir { num_rows };
+    let air = cpu_rom_air(num_rows);
     let trace = generate_combined_trace(num_vars);
 
     // Verify trace dimensions match AIR expectation
@@ -182,9 +176,18 @@ fn chiplets_integration() {
 
     // 2. Verify
     println!("-> Verifying...");
+
     let mut verifier_transcript = Transcript::<H>::new(b"ChipletTestRefactored");
-    let result =
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut verifier_transcript, &config);
+    let pinned_id = program_id(&air).unwrap();
+
+    let result = HekateVerifier::<F, H>::verify(
+        &pinned_id,
+        &air,
+        &instance,
+        &proof,
+        &mut verifier_transcript,
+        &config,
+    );
 
     assert!(result.unwrap(), "Verification failed");
 

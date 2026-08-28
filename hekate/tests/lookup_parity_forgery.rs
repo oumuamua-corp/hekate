@@ -11,8 +11,9 @@ use hekate_math::{Bit, Block32, TowerField};
 use hekate_program::chiplet::ChipletDef;
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
+use hekate_program::digest::program_id;
 use hekate_program::permutation::{PermutationCheckSpec, REQUEST_IDX_LABEL, Source};
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::{Air, FixedColumn, Program, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 
@@ -51,11 +52,12 @@ impl Air<F> for LookupEndpoint {
         )]
     }
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(LK_SELECTOR));
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::prefix(LK_SELECTOR, 4)]
+    }
 
-        cs.build()
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        ConstraintSystem::<F>::new().build()
     }
 }
 
@@ -73,6 +75,10 @@ impl Air<F> for LookupForgeryProgram {
 
     fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
         LookupEndpoint.permutation_checks()
+    }
+
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        Air::<F>::fixed_columns(&LookupEndpoint)
     }
 
     fn constraint_ast(&self) -> ConstraintAst<F> {
@@ -123,11 +129,12 @@ impl Air<F> for ReqIdxReader {
         )]
     }
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(RDR_SELECTOR));
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::prefix(RDR_SELECTOR, 4)]
+    }
 
-        cs.build()
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        ConstraintSystem::<F>::new().build()
     }
 }
 
@@ -157,11 +164,12 @@ impl Air<F> for ReqIdxTable {
         )]
     }
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(TBL_SELECTOR));
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::prefix(TBL_SELECTOR, 4)]
+    }
 
-        cs.build()
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        ConstraintSystem::<F>::new().build()
     }
 }
 
@@ -179,6 +187,10 @@ impl Air<F> for ReqIdxForgeryProgram {
 
     fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
         ReqIdxReader.permutation_checks()
+    }
+
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        Air::<F>::fixed_columns(&ReqIdxReader)
     }
 
     fn constraint_ast(&self) -> ConstraintAst<F> {
@@ -272,8 +284,17 @@ fn run_lookup(reader: &[(Block32, Bit)], table: &[(Block32, Bit)]) -> bool {
     };
 
     let mut verifier_ts = Transcript::<H>::new(b"FORGERY");
-    HekateVerifier::<F, H>::verify(&program, &instance, &proof, &mut verifier_ts, &config)
-        .unwrap_or(false)
+    let pinned_id = program_id(&program).unwrap();
+
+    HekateVerifier::<F, H>::verify(
+        &pinned_id,
+        &program,
+        &instance,
+        &proof,
+        &mut verifier_ts,
+        &config,
+    )
+    .unwrap_or(false)
 }
 
 fn run_req_idx(reader: &[(Block32, Bit)], table: &[(Block32, u32, Bit)]) -> bool {
@@ -304,8 +325,17 @@ fn run_req_idx(reader: &[(Block32, Bit)], table: &[(Block32, u32, Bit)]) -> bool
     };
 
     let mut verifier_ts = Transcript::<H>::new(b"FORGERY");
-    HekateVerifier::<F, H>::verify(&program, &instance, &proof, &mut verifier_ts, &config)
-        .unwrap_or(false)
+    let pinned_id = program_id(&program).unwrap();
+
+    HekateVerifier::<F, H>::verify(
+        &pinned_id,
+        &program,
+        &instance,
+        &proof,
+        &mut verifier_ts,
+        &config,
+    )
+    .unwrap_or(false)
 }
 
 // =========
@@ -325,6 +355,8 @@ fn honest_lookup_table() -> Vec<(Block32, Bit)> {
     vec![
         (Block32::from(0xA1A1A1A1u32), Bit::ONE),
         (Block32::from(0xB2B2B2B2u32), Bit::ONE),
+        (Block32::from(0xC3C3C3C3u32), Bit::ONE),
+        (Block32::from(0xD4D4D4D4u32), Bit::ONE),
     ]
 }
 
@@ -332,6 +364,8 @@ fn honest_req_idx_table() -> Vec<(Block32, u32, Bit)> {
     vec![
         (Block32::from(0xA1A1A1A1u32), 0, Bit::ONE),
         (Block32::from(0xB2B2B2B2u32), 1, Bit::ONE),
+        (Block32::from(0xC3C3C3C3u32), 2, Bit::ONE),
+        (Block32::from(0xD4D4D4D4u32), 3, Bit::ONE),
     ]
 }
 
@@ -339,6 +373,26 @@ fn matched_reader() -> Vec<(Block32, Bit)> {
     vec![
         (Block32::from(0xA1A1A1A1u32), Bit::ONE),
         (Block32::from(0xB2B2B2B2u32), Bit::ONE),
+        (Block32::from(0xC3C3C3C3u32), Bit::ONE),
+        (Block32::from(0xD4D4D4D4u32), Bit::ONE),
+    ]
+}
+
+fn cancelling_lookup_table() -> Vec<(Block32, Bit)> {
+    vec![
+        (Block32::from(0xA1A1A1A1u32), Bit::ONE),
+        (Block32::from(0xB2B2B2B2u32), Bit::ONE),
+        (Block32::from(0xFEEDFACEu32), Bit::ONE),
+        (Block32::from(0xFEEDFACEu32), Bit::ONE),
+    ]
+}
+
+fn cancelling_req_idx_table() -> Vec<(Block32, u32, Bit)> {
+    vec![
+        (Block32::from(0xA1A1A1A1u32), 0, Bit::ONE),
+        (Block32::from(0xB2B2B2B2u32), 1, Bit::ONE),
+        (Block32::from(0xFEEDFACEu32), 2, Bit::ONE),
+        (Block32::from(0xFEEDFACEu32), 3, Bit::ONE),
     ]
 }
 
@@ -348,7 +402,7 @@ fn matched_reader() -> Vec<(Block32, Bit)> {
 
 #[test]
 fn permutation_with_request_idx_rejects_forged_pair() {
-    let accepted = run_req_idx(&forged_reader(), &honest_req_idx_table());
+    let accepted = run_req_idx(&forged_reader(), &cancelling_req_idx_table());
     assert!(!accepted);
 }
 
@@ -360,7 +414,7 @@ fn permutation_with_request_idx_accepts_honest_match() {
 
 #[test]
 fn lookup_bus_rejects_forged_pair() {
-    let accepted = run_lookup(&forged_reader(), &honest_lookup_table());
+    let accepted = run_lookup(&forged_reader(), &cancelling_lookup_table());
     assert!(!accepted);
 }
 

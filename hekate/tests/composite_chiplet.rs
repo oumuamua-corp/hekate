@@ -9,14 +9,15 @@ use hekate::crypto::transcript::Transcript;
 use hekate::math::{Block128, TowerField};
 use hekate_core::errors;
 use hekate_core::trace::TraceBuilder;
-use hekate_gadgets::{CpuFetchColumns, CpuFetchUnit, Instruction, RomChiplet, generate_rom_trace};
+use hekate_gadgets::{CpuFetchColumns, Instruction, RomChiplet, generate_rom_trace};
 use hekate_keccak::KeccakChiplet;
 use hekate_math::{Bit, Block32};
 use hekate_program::chiplet::{ChipletDef, CompositeChiplet};
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
+use hekate_program::digest::program_id;
 use hekate_program::permutation::PermutationCheckSpec;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::{Air, FixedColumn, Program, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 
@@ -61,7 +62,10 @@ fn prove_and_verify<P: Program<F>>(
         .expect("proving failed");
 
     let mut vt = Transcript::<H>::new(b"CompositeTest");
-    HekateVerifier::<F, H>::verify(air, instance, &proof, &mut vt, config).unwrap_or(false)
+    let pinned_id = program_id(air).unwrap();
+
+    HekateVerifier::<F, H>::verify(&pinned_id, air, instance, &proof, &mut vt, config)
+        .unwrap_or(false)
 }
 
 fn try_prove_and_verify<P: Program<F>>(
@@ -80,7 +84,9 @@ fn try_prove_and_verify<P: Program<F>>(
         })?;
 
     let mut vt = Transcript::<H>::new(b"CompositeTest");
-    HekateVerifier::<F, H>::verify(air, instance, &proof, &mut vt, config)
+    let pinned_id = program_id(air).unwrap();
+
+    HekateVerifier::<F, H>::verify(&pinned_id, air, instance, &proof, &mut vt, config)
 }
 
 // ==========================================================
@@ -134,8 +140,8 @@ fn chiplet_to_chiplet_bus_valid() {
     let num_rows = 1 << TEST_NUM_VARS;
     let instructions = test_instructions(num_rows);
 
-    let rom1 = RomChiplet::new(num_rows);
-    let rom2 = RomChiplet::new(num_rows);
+    let rom1 = RomChiplet::new(num_rows, num_rows);
+    let rom2 = RomChiplet::new(num_rows, num_rows);
 
     let air = BareMainAir {
         defs: vec![
@@ -169,8 +175,8 @@ fn chiplet_to_chiplet_bus_product_mismatch() {
         .map(|i| Instruction::new((i * 4 + 999) as u32, 2, [1, 2, 3]))
         .collect();
 
-    let rom1 = RomChiplet::new(num_rows);
-    let rom2 = RomChiplet::new(num_rows);
+    let rom1 = RomChiplet::new(num_rows, num_rows);
+    let rom2 = RomChiplet::new(num_rows, num_rows);
 
     let air = BareMainAir {
         defs: vec![
@@ -201,7 +207,7 @@ fn dangling_chiplet_bus() {
     let num_rows = 1 << TEST_NUM_VARS;
     let instructions = test_instructions(num_rows);
 
-    let rom = RomChiplet::new(num_rows);
+    let rom = RomChiplet::new(num_rows, num_rows);
 
     // Single chiplet, bus
     // "rom_link" has no counterpart.
@@ -228,9 +234,9 @@ fn three_endpoint_bus_rejected() {
     let num_rows = 1 << TEST_NUM_VARS;
     let instructions = test_instructions(num_rows);
 
-    let rom1 = RomChiplet::new(num_rows);
-    let rom2 = RomChiplet::new(num_rows);
-    let rom3 = RomChiplet::new(num_rows);
+    let rom1 = RomChiplet::new(num_rows, num_rows);
+    let rom2 = RomChiplet::new(num_rows, num_rows);
+    let rom3 = RomChiplet::new(num_rows, num_rows);
 
     let air = BareMainAir {
         defs: vec![
@@ -278,20 +284,27 @@ fn main_chiplet_bus_backward_compat() {
         }
 
         fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-            vec![(RomChiplet::BUS_ID.into(), CpuFetchUnit::linking_spec())]
+            vec![(RomChiplet::BUS_ID.into(), RomChiplet::cpu_linking_spec())]
+        }
+
+        fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+            vec![FixedColumn::prefix(
+                CpuFetchColumns::SELECTOR,
+                self.num_rows,
+            )]
         }
 
         fn constraint_ast(&self) -> ConstraintAst<F> {
-            let cs = ConstraintSystem::<F>::new();
-            cs.assert_boolean(cs.col(CpuFetchColumns::SELECTOR));
-
-            cs.build()
+            ConstraintSystem::<F>::new().build()
         }
     }
 
     impl Program<F> for ClassicAir {
         fn chiplet_defs(&self) -> errors::Result<Vec<ChipletDef<F>>> {
-            Ok(vec![ChipletDef::from_air(&RomChiplet::new(self.num_rows))?])
+            Ok(vec![ChipletDef::from_air(&RomChiplet::new(
+                self.num_rows,
+                self.num_rows,
+            ))?])
         }
     }
 
@@ -351,7 +364,7 @@ fn main_chiplet_bus_backward_compat() {
 #[test]
 fn composite_flatten_deterministic() {
     let composite = CompositeChiplet::<F>::builder("test")
-        .chiplet(KeccakChiplet::new(64))
+        .chiplet(KeccakChiplet::new(64, 2))
         .build()
         .unwrap();
 
@@ -381,8 +394,8 @@ fn composite_flatten_deterministic() {
 #[test]
 fn composite_prefix_external_bus_untouched() {
     let composite = CompositeChiplet::<F>::builder("mycomp")
-        .chiplet(RomChiplet::new(64))
-        .external_bus(RomChiplet::BUS_ID, CpuFetchUnit::linking_spec())
+        .chiplet(RomChiplet::new(64, 64))
+        .external_bus(RomChiplet::BUS_ID, RomChiplet::cpu_linking_spec())
         .build()
         .unwrap();
 
@@ -410,7 +423,7 @@ fn composite_prefix_external_bus_untouched() {
 #[test]
 fn composite_prefix_internal_bus_namespaced() {
     let composite = CompositeChiplet::<F>::builder("mycomp")
-        .chiplet(RomChiplet::new(64))
+        .chiplet(RomChiplet::new(64, 64))
         .build()
         .unwrap();
 
@@ -445,8 +458,8 @@ fn composite_end_to_end_prove_verify() {
     let instructions = test_instructions(num_rows);
 
     let composite = CompositeChiplet::<F>::builder("dual_rom")
-        .chiplet(RomChiplet::new(num_rows))
-        .chiplet(RomChiplet::new(num_rows))
+        .chiplet(RomChiplet::new(num_rows, num_rows))
+        .chiplet(RomChiplet::new(num_rows, num_rows))
         .build()
         .unwrap();
 

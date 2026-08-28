@@ -14,89 +14,56 @@ use hekate::crypto::DefaultHasher;
 use hekate::crypto::transcript::Transcript;
 use hekate::math::{Bit, Block32, Block128, TowerField};
 use hekate_core::trace::{IntoTraceColumn, TraceBuilder};
-use hekate_gadgets::{CpuMemColumns, CpuMemoryUnit, MemoryEvent, RamChiplet, generate_ram_trace};
+use hekate_gadgets::{CpuMemColumns, MemoryEvent, RamChiplet, generate_ram_trace};
 use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
-use hekate_program::permutation::PermutationCheckSpec;
-use hekate_program::{Air, FixedColumn, Program, ProgramInstance, ProgramWitness};
+use hekate_program::circuit::{Circuit, CircuitProgram};
+use hekate_program::digest::program_id;
+use hekate_program::{FixedShape, Program, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 
 type F = Block128;
 type H = DefaultHasher;
 
-/// Boundary on column 0 (public input), fixed
-/// selector on column 1, one transition constraint.
-#[derive(Clone)]
-struct PinnedAir;
+fn pinned_air(num_rows: usize) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("Pinned", num_rows).unwrap();
 
-impl Air<F> for PinnedAir {
-    fn num_columns(&self) -> usize {
-        2
-    }
+    let val_col = cx.column(ColumnType::B32);
+    let q = cx.column(ColumnType::Bit);
 
-    fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
-        vec![BoundaryConstraint::with_public_input(0, 0, 0)]
-    }
+    let cs = cx.cs();
 
-    fn column_layout(&self) -> &'static [ColumnType] {
-        &[ColumnType::B32, ColumnType::Bit]
-    }
+    let val = cs.col(val_col.index());
+    cs.constrain(cs.col(q.index()) * (cs.next(val_col.index()) + val));
 
-    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
-        vec![FixedColumn::last_row(1)]
-    }
+    cx.fix(q, FixedShape::LastRow);
+    cx.publish(val_col, 0);
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        let val = cs.col(0);
-        let q = cs.col(1);
-
-        cs.constrain(q * (cs.next(0) + val));
-
-        cs.build()
-    }
+    cx.compile().unwrap()
 }
 
-impl Program<F> for PinnedAir {
-    fn num_public_inputs(&self) -> usize {
-        1
-    }
-}
+fn ram_air(num_rows: usize, num_events: usize) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("RamHiding", num_rows).unwrap();
+    let cpu = cx.schema(&CpuMemColumns::build_layout());
 
-#[derive(Clone)]
-struct RamAir {
-    num_rows: usize,
-}
+    cx.fix(
+        cpu.at(CpuMemColumns::SELECTOR),
+        FixedShape::Cadence {
+            stride: 1,
+            count: num_events,
+            origin: 0,
+            values: vec![F::ONE],
+        },
+    );
 
-impl Air<F> for RamAir {
-    fn num_columns(&self) -> usize {
-        CpuMemColumns::NUM_COLUMNS
-    }
+    cx.bus(RamChiplet::BUS_ID, RamChiplet::cpu_linking_spec());
 
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        LAYOUT.get_or_init(CpuMemColumns::build_layout)
-    }
+    let cs = cx.cs();
+    cs.assert_boolean(cs.col(CpuMemColumns::IS_WRITE));
 
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![(RamChiplet::BUS_ID.into(), CpuMemoryUnit::linking_spec())]
-    }
+    cx.attach(ChipletDef::from_air(&RamChiplet::new(num_rows, num_events)).unwrap());
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CpuMemColumns::SELECTOR));
-        cs.assert_boolean(cs.col(CpuMemColumns::IS_WRITE));
-
-        cs.build()
-    }
-}
-
-impl Program<F> for RamAir {
-    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        Ok(vec![ChipletDef::from_air(&RamChiplet::new(self.num_rows))?])
-    }
+    cx.compile().unwrap()
 }
 
 fn config() -> Config {
@@ -114,7 +81,7 @@ fn config() -> Config {
 fn pinned_case_with(
     public_input: u32,
     mutate: impl FnOnce(&mut Vec<Block32>, &mut Vec<Bit>),
-) -> (PinnedAir, ProgramInstance<F>, InnerProof<F>) {
+) -> (CircuitProgram<F>, ProgramInstance<F>, InnerProof<F>) {
     let num_vars = 4;
     let num_rows = 1 << num_vars;
 
@@ -130,10 +97,11 @@ fn pinned_case_with(
 
     let instance = ProgramInstance::new(num_rows, vec![F::from(public_input)]);
     let witness = ProgramWitness::new(trace);
+    let air = pinned_air(num_rows);
 
     let proof = prove(
         b"Tamper_Pinned",
-        &PinnedAir,
+        &air,
         &instance,
         &witness,
         &config(),
@@ -142,10 +110,10 @@ fn pinned_case_with(
     )
     .unwrap();
 
-    (PinnedAir, instance, proof)
+    (air, instance, proof)
 }
 
-fn pinned_case() -> (PinnedAir, ProgramInstance<F>, InnerProof<F>) {
+fn pinned_case() -> (CircuitProgram<F>, ProgramInstance<F>, InnerProof<F>) {
     pinned_case_with(10, |_, _| {})
 }
 
@@ -153,7 +121,7 @@ fn pinned_case() -> (PinnedAir, ProgramInstance<F>, InnerProof<F>) {
 fn ram_case_with(
     cpu_events: &[MemoryEvent],
     ram_events: &[MemoryEvent],
-) -> (RamAir, ProgramInstance<F>, InnerProof<F>) {
+) -> (CircuitProgram<F>, ProgramInstance<F>, InnerProof<F>) {
     let num_vars = 4;
     let num_rows = 1 << num_vars;
 
@@ -175,7 +143,7 @@ fn ram_case_with(
         tb.set_bit(CpuMemColumns::SELECTOR, i, Bit::ONE).unwrap();
     }
 
-    let air = RamAir { num_rows };
+    let air = ram_air(num_rows, ram_events.len());
     let witness = ProgramWitness::new(tb.build())
         .with_chiplets(vec![generate_ram_trace(ram_events, num_rows).unwrap()]);
     let instance = ProgramInstance::new(num_rows, vec![]);
@@ -203,7 +171,7 @@ fn ram_events() -> Vec<MemoryEvent> {
     ]
 }
 
-fn ram_case() -> (RamAir, ProgramInstance<F>, InnerProof<F>) {
+fn ram_case() -> (CircuitProgram<F>, ProgramInstance<F>, InnerProof<F>) {
     let events = ram_events();
     ram_case_with(&events, &events)
 }
@@ -215,8 +183,17 @@ fn accepted<P: Program<F> + Sync>(
     proof: &InnerProof<F>,
 ) -> bool {
     let mut transcript = Transcript::<H>::new(label);
+    let pinned_id = program_id(program).unwrap();
+
     matches!(
-        HekateVerifier::<F, H>::verify(program, instance, proof, &mut transcript, &config()),
+        HekateVerifier::<F, H>::verify(
+            &pinned_id,
+            program,
+            instance,
+            proof,
+            &mut transcript,
+            &config()
+        ),
         Ok(true)
     )
 }

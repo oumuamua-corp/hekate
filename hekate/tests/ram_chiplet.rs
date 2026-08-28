@@ -8,15 +8,15 @@ use hekate::crypto::DefaultHasher;
 use hekate::crypto::transcript::Transcript;
 use hekate::math::{Block128, TowerField};
 use hekate_core::trace::TraceBuilder;
-use hekate_gadgets::{
-    CpuMemColumns, CpuMemoryUnit, MemoryEvent, RamChiplet, RamColumns, generate_ram_trace,
-};
+use hekate_gadgets::{CpuMemColumns, MemoryEvent, RamChiplet, RamColumns, generate_ram_trace};
 use hekate_math::{Bit, Block32};
 use hekate_program::chiplet::ChipletDef;
+use hekate_program::circuit::{Circuit, CircuitProgram};
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
+use hekate_program::digest::program_id;
 use hekate_program::permutation::PermutationCheckSpec;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::{Air, FixedColumn, FixedShape, Program, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_scribble::{MutationKind, ScribbleConfig, assert_all_caught_all_targets};
 use hekate_verifier::HekateVerifier;
@@ -29,45 +29,34 @@ type H = DefaultHasher;
 // CPU-only main trace, RAM as independent chiplet.
 // =================================================================
 
-#[derive(Clone)]
-struct RamTestAir {
-    num_rows: usize,
-}
+fn ram_test_air(num_rows: usize, num_events: usize) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("RamTest", num_rows).unwrap();
+    let cpu = cx.schema(&CpuMemColumns::build_layout());
 
-impl Air<F> for RamTestAir {
-    fn num_columns(&self) -> usize {
-        CpuMemColumns::NUM_COLUMNS
-    }
+    cx.fix(
+        cpu.at(CpuMemColumns::SELECTOR),
+        FixedShape::Cadence {
+            stride: 1,
+            count: num_events,
+            origin: 0,
+            values: vec![F::ONE],
+        },
+    );
 
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        LAYOUT.get_or_init(CpuMemColumns::build_layout)
-    }
+    cx.bus(RamChiplet::BUS_ID, RamChiplet::cpu_linking_spec());
 
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![(RamChiplet::BUS_ID.into(), CpuMemoryUnit::linking_spec())]
-    }
+    let cs = cx.cs();
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
+    cs.assert_boolean(cs.col(CpuMemColumns::IS_WRITE));
 
-        cs.assert_boolean(cs.col(CpuMemColumns::SELECTOR));
-        cs.assert_boolean(cs.col(CpuMemColumns::IS_WRITE));
+    let one = cs.one();
+    let s = cs.col(CpuMemColumns::SELECTOR);
 
-        let one = cs.one();
-        let s = cs.col(CpuMemColumns::SELECTOR);
+    cs.assert_zero_when(one - s, cs.col(CpuMemColumns::IS_WRITE));
 
-        cs.assert_zero_when(one - s, cs.col(CpuMemColumns::IS_WRITE));
+    cx.attach(ChipletDef::from_air(&RamChiplet::new(num_rows, num_events)).unwrap());
 
-        cs.build()
-    }
-}
-
-impl Program<F> for RamTestAir {
-    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        let ram = RamChiplet::new(self.num_rows);
-        Ok(vec![ChipletDef::from_air(&ram)?])
-    }
+    cx.compile().unwrap()
 }
 
 // =================================================================
@@ -80,6 +69,7 @@ impl Program<F> for RamTestAir {
 #[derive(Clone)]
 struct RamExploitAir {
     num_rows: usize,
+    num_events: usize,
 }
 
 impl Air<F> for RamExploitAir {
@@ -99,7 +89,7 @@ impl Air<F> for RamExploitAir {
     }
 
     fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        let cpu_spec = CpuMemoryUnit::linking_spec();
+        let cpu_spec = RamChiplet::cpu_linking_spec();
 
         let mut ram_spec = RamChiplet::linking_spec();
         ram_spec.shift_column_indices(CpuMemColumns::NUM_COLUMNS);
@@ -110,13 +100,21 @@ impl Air<F> for RamExploitAir {
         ]
     }
 
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![
+            FixedColumn::prefix(CpuMemColumns::SELECTOR, self.num_events),
+            FixedColumn::prefix(
+                CpuMemColumns::NUM_COLUMNS + RamColumns::SELECTOR,
+                self.num_events,
+            ),
+        ]
+    }
+
     fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CpuMemColumns::SELECTOR));
+        let ast_cs = ConstraintSystem::<F>::new();
+        let mut ast = ast_cs.build();
 
-        let mut ast = cs.build();
-
-        let mut ram_ast = RamChiplet::new(self.num_rows).constraint_ast();
+        let mut ram_ast = RamChiplet::new(self.num_rows, self.num_rows).constraint_ast();
         ram_ast.arena.shift_cells(CpuMemColumns::NUM_COLUMNS);
 
         ast.merge(ram_ast);
@@ -195,7 +193,7 @@ fn ram_cpu_linking() {
     ];
 
     // 1. Setup
-    let air = RamTestAir { num_rows };
+    let air = ram_test_air(num_rows, events.len());
 
     let cpu_trace = generate_cpu_trace(&events, num_rows);
     let ram_trace = generate_ram_trace(&events, num_rows).unwrap();
@@ -221,8 +219,16 @@ fn ram_cpu_linking() {
     println!("-> Verifying...");
 
     let mut verifier_transcript = Transcript::<H>::new(b"RAM_E2E");
-    let result =
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut verifier_transcript, &config);
+    let pinned_id = program_id(&air).unwrap();
+
+    let result = HekateVerifier::<F, H>::verify(
+        &pinned_id,
+        &air,
+        &instance,
+        &proof,
+        &mut verifier_transcript,
+        &config,
+    );
 
     assert!(result.unwrap(), "Verification failed");
 
@@ -349,9 +355,12 @@ fn exploit_ram_consistency_bypass() {
     // 3. Prove & Verify (RAM as inline, no
     // chiplet path, uses virtual layout directly).
     // This exploit test uses the old inline pattern
-    // to inject malicious data. The RamTestAir for
-    // this test merges RAM into main trace.
-    let air = RamExploitAir { num_rows };
+    // to inject malicious data. The ram_test_air
+    // for this test merges RAM into main trace.
+    let air = RamExploitAir {
+        num_rows,
+        num_events: events.len(),
+    };
 
     let mut combined = cpu_trace;
     for col in ram_trace.into_columns() {
@@ -381,8 +390,16 @@ fn exploit_ram_consistency_bypass() {
     .expect("Prover should succeed (it simply proves the trace it was given)");
 
     let mut verifier_transcript = Transcript::<H>::new(b"ExploitTest");
-    let result =
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut verifier_transcript, &config);
+    let pinned_id = program_id(&air).unwrap();
+
+    let result = HekateVerifier::<F, H>::verify(
+        &pinned_id,
+        &air,
+        &instance,
+        &proof,
+        &mut verifier_transcript,
+        &config,
+    );
 
     // SECURITY CHECK:
     // Verification must FAIL, RAM
@@ -523,7 +540,7 @@ fn exploit_ram_uninitialised_read_via_q_last_chain() {
     let clk_real: u32 = 1;
     let val: u32 = 0xDEAD_BEEF;
 
-    let air = RamTestAir { num_rows };
+    let air = ram_test_air(num_rows, 1);
     let cpu_trace = cpu_trace_one_read(addr, val, clk_real as usize, num_rows);
     let ram_trace = malicious_uninitialised_read_ram_trace(addr, clk_real, val, num_rows);
 
@@ -550,8 +567,16 @@ fn exploit_ram_uninitialised_read_via_q_last_chain() {
     .expect("Prover accepts the malicious trace (all AIR identities pass under q_last ≡ 0)");
 
     let mut verifier_transcript = Transcript::<H>::new(b"QLastExploit");
-    let result =
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut verifier_transcript, &config);
+    let pinned_id = program_id(&air).unwrap();
+
+    let result = HekateVerifier::<F, H>::verify(
+        &pinned_id,
+        &air,
+        &instance,
+        &proof,
+        &mut verifier_transcript,
+        &config,
+    );
 
     assert!(
         result.is_err() || !result.unwrap(),
@@ -572,7 +597,7 @@ fn scribble_ram_flip_selector_caught() {
         MemoryEvent::read(0x2000, 3, 99),
     ];
 
-    let air = RamTestAir { num_rows };
+    let air = ram_test_air(num_rows, events.len());
     let cpu_trace = generate_cpu_trace(&events, num_rows);
     let ram_trace = generate_ram_trace(&events, num_rows).unwrap();
 

@@ -11,8 +11,10 @@ use hekate::crypto::DefaultHasher;
 use hekate::crypto::transcript::Transcript;
 use hekate::math::{Bit, Block128, TowerField};
 use hekate_program::chiplet::ChipletDef;
+use hekate_program::circuit::{Circuit, CircuitProgram};
 use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
+use hekate_program::constraint::{BoundaryConstraint, BoundaryTarget, ConstraintAst};
+use hekate_program::digest::program_id;
 use hekate_program::{Air, Program, ProgramInstance, ProgramWitness, define_columns};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
@@ -58,9 +60,17 @@ where
         prove(domain, prover_air, instance, witness, &cfg, seed, None).expect("prove failed");
 
     let mut verifier_t = Transcript::<H>::new(domain);
+    let pinned_id = program_id(verifier_air).unwrap();
 
-    HekateVerifier::<F, H>::verify(verifier_air, instance, &proof, &mut verifier_t, &cfg)
-        .unwrap_or(false)
+    HekateVerifier::<F, H>::verify(
+        &pinned_id,
+        verifier_air,
+        instance,
+        &proof,
+        &mut verifier_t,
+        &cfg,
+    )
+    .unwrap_or(false)
 }
 
 // =================================================================
@@ -101,31 +111,13 @@ impl Air<F> for SingleBndChiplet {
     }
 }
 
-#[derive(Clone)]
-struct SingleBndHost {
-    pinned_value: F,
-}
+fn single_bnd_host(num_rows: usize, pinned_value: F) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("SingleBndHost", num_rows).unwrap();
 
-impl Air<F> for SingleBndHost {
-    fn num_columns(&self) -> usize {
-        1
-    }
+    cx.column(ColumnType::Bit);
+    cx.attach(ChipletDef::from_air(&SingleBndChiplet { pinned_value }).unwrap());
 
-    fn column_layout(&self) -> &[ColumnType] {
-        &[ColumnType::Bit]
-    }
-
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        ConstraintSystem::<F>::new().build()
-    }
-}
-
-impl Program<F> for SingleBndHost {
-    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        Ok(vec![ChipletDef::from_air(&SingleBndChiplet {
-            pinned_value: self.pinned_value,
-        })?])
-    }
+    cx.compile().unwrap()
 }
 
 fn build_traces(num_vars: usize, row0_flag: Bit) -> (ColumnTrace, ColumnTrace) {
@@ -147,9 +139,7 @@ fn chiplet_boundary_happy_path() {
     let num_vars = 3;
     let num_rows = 1 << num_vars;
 
-    let air = SingleBndHost {
-        pinned_value: F::ONE,
-    };
+    let air = single_bnd_host(num_rows, F::ONE);
     let (main, chiplet) = build_traces(num_vars, Bit::ONE);
 
     let instance = ProgramInstance::new(num_rows, vec![]);
@@ -166,10 +156,7 @@ fn chiplet_boundary_pin_zero_happy_path() {
     let num_vars = 3;
     let num_rows = 1 << num_vars;
 
-    let air = SingleBndHost {
-        pinned_value: F::ZERO,
-    };
-
+    let air = single_bnd_host(num_rows, F::ZERO);
     let (main, chiplet) = build_traces(num_vars, Bit::ZERO);
 
     let instance = ProgramInstance::new(num_rows, vec![]);
@@ -186,9 +173,7 @@ fn chiplet_boundary_violation_rejected() {
     let num_vars = 3;
     let num_rows = 1 << num_vars;
 
-    let air = SingleBndHost {
-        pinned_value: F::ONE,
-    };
+    let air = single_bnd_host(num_rows, F::ONE);
 
     let (main, chiplet) = build_traces(num_vars, Bit::ZERO);
 
@@ -206,12 +191,8 @@ fn chiplet_boundary_constant_swap_rejected() {
     let num_vars = 3;
     let num_rows = 1 << num_vars;
 
-    let prover_air = SingleBndHost {
-        pinned_value: F::ONE,
-    };
-    let verifier_air = SingleBndHost {
-        pinned_value: F::ZERO,
-    };
+    let prover_air = single_bnd_host(num_rows, F::ONE);
+    let verifier_air = single_bnd_host(num_rows, F::ZERO);
 
     let (main, chiplet) = build_traces(num_vars, Bit::ONE);
 
@@ -245,11 +226,6 @@ impl Air<F> for MultiBndChiplet {
         MultiBndCols::NUM_COLUMNS
     }
 
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        LAYOUT.get_or_init(MultiBndCols::build_layout)
-    }
-
     fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
         vec![
             BoundaryConstraint::with_constant(MultiBndCols::FLAG_FIRST, 0, F::ONE),
@@ -257,23 +233,9 @@ impl Air<F> for MultiBndChiplet {
         ]
     }
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        ConstraintSystem::<F>::new().build()
-    }
-}
-
-#[derive(Clone)]
-struct MultiBndHost {
-    num_rows: usize,
-}
-
-impl Air<F> for MultiBndHost {
-    fn num_columns(&self) -> usize {
-        1
-    }
-
     fn column_layout(&self) -> &[ColumnType] {
-        &[ColumnType::Bit]
+        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
+        LAYOUT.get_or_init(MultiBndCols::build_layout)
     }
 
     fn constraint_ast(&self) -> ConstraintAst<F> {
@@ -281,12 +243,13 @@ impl Air<F> for MultiBndHost {
     }
 }
 
-impl Program<F> for MultiBndHost {
-    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        Ok(vec![ChipletDef::from_air(&MultiBndChiplet {
-            num_rows: self.num_rows,
-        })?])
-    }
+fn multi_bnd_host(num_rows: usize) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("MultiBndHost", num_rows).unwrap();
+
+    cx.column(ColumnType::Bit);
+    cx.attach(ChipletDef::from_air(&MultiBndChiplet { num_rows }).unwrap());
+
+    cx.compile().unwrap()
 }
 
 fn build_multi_traces(
@@ -317,8 +280,7 @@ fn chiplet_multiple_boundaries_all_satisfied() {
     let num_vars = 3;
     let num_rows = 1 << num_vars;
 
-    let air = MultiBndHost { num_rows };
-
+    let air = multi_bnd_host(num_rows);
     let (main, chiplet) = build_multi_traces(num_vars, Bit::ONE, Bit::ONE);
 
     let instance = ProgramInstance::new(num_rows, vec![]);
@@ -332,8 +294,7 @@ fn chiplet_multiple_boundaries_first_violated() {
     let num_vars = 3;
     let num_rows = 1 << num_vars;
 
-    let air = MultiBndHost { num_rows };
-
+    let air = multi_bnd_host(num_rows);
     let (main, chiplet) = build_multi_traces(num_vars, Bit::ZERO, Bit::ONE);
 
     let instance = ProgramInstance::new(num_rows, vec![]);
@@ -347,8 +308,7 @@ fn chiplet_multiple_boundaries_last_violated() {
     let num_vars = 3;
     let num_rows = 1 << num_vars;
 
-    let air = MultiBndHost { num_rows };
-
+    let air = multi_bnd_host(num_rows);
     let (main, chiplet) = build_multi_traces(num_vars, Bit::ONE, Bit::ZERO);
 
     let instance = ProgramInstance::new(num_rows, vec![]);
@@ -362,8 +322,7 @@ fn chiplet_multiple_boundaries_both_violated() {
     let num_vars = 3;
     let num_rows = 1 << num_vars;
 
-    let air = MultiBndHost { num_rows };
-
+    let air = multi_bnd_host(num_rows);
     let (main, chiplet) = build_multi_traces(num_vars, Bit::ZERO, Bit::ZERO);
 
     let instance = ProgramInstance::new(num_rows, vec![]);
@@ -387,7 +346,11 @@ fn chiplet_with_public_input_target_rejected_at_snapshot() {
         }
 
         fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
-            vec![BoundaryConstraint::with_public_input(0, 0, 0)]
+            vec![BoundaryConstraint {
+                col_idx: 0,
+                row_idx: 0,
+                target: BoundaryTarget::PublicInput(0),
+            }]
         }
 
         fn column_layout(&self) -> &[ColumnType] {

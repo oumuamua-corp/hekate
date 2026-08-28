@@ -16,16 +16,13 @@ use hekate::crypto::DefaultHasher;
 use hekate::crypto::transcript::Transcript;
 use hekate::math::{Bit, Block32, Block64, Block128, TowerField};
 use hekate_core::trace::{IntoTraceColumn, TraceBuilder};
-use hekate_gadgets::{CpuMemColumns, CpuMemoryUnit, MemoryEvent, RamChiplet, generate_ram_trace};
-use hekate_keccak::{
-    CpuKeccakColumns, CpuKeccakUnit, KeccakChiplet, KeccakWitness, generate_keccak_trace,
-};
+use hekate_gadgets::{CpuMemColumns, MemoryEvent, RamChiplet, generate_ram_trace};
+use hekate_keccak::{CpuKeccakColumns, KeccakChiplet, KeccakWitness, generate_keccak_trace};
 use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
+use hekate_program::circuit::{Circuit, CircuitProgram, Col};
+use hekate_program::digest::program_id;
 use hekate_program::outer::OuterStatement;
-use hekate_program::permutation::PermutationCheckSpec;
-use hekate_program::{Air, FixedColumn, Program, ProgramInstance, ProgramWitness};
+use hekate_program::{Air, FixedShape, Program, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 
@@ -34,106 +31,67 @@ type H = DefaultHasher;
 
 const NUM_VARS: usize = 4;
 
-#[derive(Clone)]
-struct StepAir;
+fn step_air(num_rows: usize) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("Step", num_rows).unwrap();
 
-impl Air<F> for StepAir {
-    fn num_columns(&self) -> usize {
-        2
-    }
+    let val_col = cx.column(ColumnType::B32);
+    let q = cx.column(ColumnType::Bit);
 
-    fn column_layout(&self) -> &'static [ColumnType] {
-        &[ColumnType::B32, ColumnType::Bit]
-    }
+    let cs = cx.cs();
 
-    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
-        vec![FixedColumn::last_row(1)]
-    }
+    let val = cs.col(val_col.index());
+    cs.constrain(cs.col(q.index()) * (cs.next(val_col.index()) + val));
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        let val = cs.col(0);
-        let q = cs.col(1);
+    cx.fix(q, FixedShape::LastRow);
 
-        cs.constrain(q * (cs.next(0) + val));
-
-        cs.build()
-    }
+    cx.compile().unwrap()
 }
 
-impl Program<F> for StepAir {}
+fn ram_air(num_rows: usize, num_events: usize) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("RamCensus", num_rows).unwrap();
+    let cpu = cx.schema(&CpuMemColumns::build_layout());
 
-#[derive(Clone)]
-struct RamAir {
-    num_rows: usize,
+    cx.fix(
+        cpu.at(CpuMemColumns::SELECTOR),
+        FixedShape::Cadence {
+            stride: 1,
+            count: num_events,
+            origin: 0,
+            values: vec![F::ONE],
+        },
+    );
+
+    cx.bus(RamChiplet::BUS_ID, RamChiplet::cpu_linking_spec());
+
+    let cs = cx.cs();
+    cs.assert_boolean(cs.col(CpuMemColumns::IS_WRITE));
+
+    cx.attach(ChipletDef::from_air(&RamChiplet::new(num_rows, num_events)).unwrap());
+
+    cx.compile().unwrap()
 }
 
-impl Air<F> for RamAir {
-    fn num_columns(&self) -> usize {
-        CpuMemColumns::NUM_COLUMNS
-    }
+fn keccak_cpu_program(num_rows: usize, chiplet_rows: usize) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("KeccakCensus", num_rows).unwrap();
+    let cpu = cx.schema(&CpuKeccakColumns::build_layout());
 
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        LAYOUT.get_or_init(CpuMemColumns::build_layout)
-    }
+    let selector = cpu.at(CpuKeccakColumns::SELECTOR);
+    let is_output = cpu.at(CpuKeccakColumns::IS_OUTPUT);
 
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![(RamChiplet::BUS_ID.into(), CpuMemoryUnit::linking_spec())]
-    }
+    let call_values: Vec<Col> = (0..25)
+        .map(|lane| cpu.at(CpuKeccakColumns::LANES + lane))
+        .chain([is_output])
+        .collect();
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CpuMemColumns::SELECTOR));
-        cs.assert_boolean(cs.col(CpuMemColumns::IS_WRITE));
+    cx.call(&KeccakChiplet::service(), &call_values, selector)
+        .unwrap();
 
-        cs.build()
-    }
-}
+    cx.fix(selector, KeccakChiplet::host_selector_shape(2, 1));
+    cx.fix(is_output, KeccakChiplet::host_direction_shape(2, 1));
 
-impl Program<F> for RamAir {
-    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        Ok(vec![ChipletDef::from_air(&RamChiplet::new(self.num_rows))?])
-    }
-}
+    cx.attach(ChipletDef::from_air(&KeccakChiplet::new(chiplet_rows, 1)).unwrap());
 
-#[derive(Clone)]
-struct KeccakCpu {
-    chiplet_rows: usize,
-}
-
-impl Air<F> for KeccakCpu {
-    fn num_columns(&self) -> usize {
-        CpuKeccakColumns::NUM_COLUMNS
-    }
-
-    fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
-        vec![CpuKeccakUnit::direction_boundary(0)]
-    }
-
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        LAYOUT.get_or_init(CpuKeccakColumns::build_layout)
-    }
-
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![(KeccakChiplet::BUS_ID.into(), CpuKeccakUnit::linking_spec())]
-    }
-
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        CpuKeccakUnit::constrain(&cs, 0);
-
-        cs.build()
-    }
-}
-
-impl Program<F> for KeccakCpu {
-    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        Ok(vec![ChipletDef::from_air(&KeccakChiplet::new(
-            self.chiplet_rows,
-        ))?])
-    }
+    cx.compile().unwrap()
 }
 
 #[derive(Default)]
@@ -287,9 +245,16 @@ fn pad_reuse<P: Program<F>>(program: &P) -> usize {
 }
 
 fn pad_budget<P: Program<F> + Sync>(program: &P, chiplet_num_vars: &[usize]) -> usize {
-    let statement =
-        OuterStatement::for_program(program, NUM_VARS, chiplet_num_vars, config().blind_units())
-            .unwrap();
+    let defs = program.chiplet_defs().unwrap();
+
+    let statement = OuterStatement::for_tables(
+        program,
+        NUM_VARS,
+        &defs,
+        chiplet_num_vars,
+        config().blind_units(),
+    )
+    .unwrap();
 
     statement.masked_scalars + pad_reuse(program)
 }
@@ -309,10 +274,11 @@ fn every_scalar_of_bus_free_proof_is_accounted() {
 
     let instance = ProgramInstance::new(num_rows, vec![]);
     let witness = ProgramWitness::new(trace);
+    let air = step_air(num_rows);
 
     let proof = prove(
         b"Census_Step",
-        &StepAir,
+        &air,
         &instance,
         &witness,
         &config(),
@@ -323,12 +289,20 @@ fn every_scalar_of_bus_free_proof_is_accounted() {
 
     let mut vt = Transcript::<H>::new(b"Census_Step");
     assert!(
-        HekateVerifier::<F, H>::verify(&StepAir, &instance, &proof, &mut vt, &config()).unwrap()
+        HekateVerifier::<F, H>::verify(
+            &program_id(&air).unwrap(),
+            &air,
+            &instance,
+            &proof,
+            &mut vt,
+            &config()
+        )
+        .unwrap()
     );
 
     let counted = census(&proof);
 
-    assert_eq!(counted.padded, pad_budget(&StepAir, &[]));
+    assert_eq!(counted.padded, pad_budget(&air, &[]));
     assert_eq!(counted.running_claim, 2);
     assert_eq!(counted.ring_fold, 0);
     assert!(counted.padded > 0);
@@ -369,7 +343,7 @@ fn every_scalar_of_bus_proof_is_accounted() {
         tb.set_bit(CpuMemColumns::SELECTOR, i, Bit::ONE).unwrap();
     }
 
-    let air = RamAir { num_rows };
+    let air = ram_air(num_rows, events.len());
     let instance = ProgramInstance::new(num_rows, vec![]);
     let witness = ProgramWitness::new(tb.build())
         .with_chiplets(vec![generate_ram_trace(&events, num_rows).unwrap()]);
@@ -386,7 +360,17 @@ fn every_scalar_of_bus_proof_is_accounted() {
     .unwrap();
 
     let mut vt = Transcript::<H>::new(b"Census_Ram");
-    assert!(HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config()).unwrap());
+    assert!(
+        HekateVerifier::<F, H>::verify(
+            &program_id(&air).unwrap(),
+            &air,
+            &instance,
+            &proof,
+            &mut vt,
+            &config()
+        )
+        .unwrap()
+    );
 
     let counted = census(&proof);
     let budget = pad_budget(&air, &[NUM_VARS]);
@@ -447,7 +431,7 @@ fn every_scalar_of_virtually_packed_proof_is_accounted() {
     })];
     let chiplet = generate_keccak_trace(&calls, Some(&[(0, 1)]), chiplet_rows).unwrap();
 
-    let air = KeccakCpu { chiplet_rows };
+    let air = keccak_cpu_program(num_rows, chiplet_rows);
     let instance = ProgramInstance::new(num_rows, vec![]);
     let witness = ProgramWitness::new(tb.build()).with_chiplets(vec![chiplet]);
 
@@ -463,7 +447,17 @@ fn every_scalar_of_virtually_packed_proof_is_accounted() {
     .unwrap();
 
     let mut vt = Transcript::<H>::new(b"Census_Keccak");
-    assert!(HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config()).unwrap());
+    assert!(
+        HekateVerifier::<F, H>::verify(
+            &program_id(&air).unwrap(),
+            &air,
+            &instance,
+            &proof,
+            &mut vt,
+            &config()
+        )
+        .unwrap()
+    );
 
     let counted = census(&proof);
 

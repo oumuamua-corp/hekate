@@ -9,9 +9,9 @@ use hekate::crypto::transcript::Transcript;
 use hekate::math::{Block128, TowerField};
 use hekate_core::trace::{IntoTraceColumn, Trace};
 use hekate_math::{Bit, Block32};
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::circuit::{Circuit, CircuitProgram};
+use hekate_program::digest::program_id;
+use hekate_program::{FixedShape, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 use proptest::prelude::*;
@@ -38,47 +38,27 @@ fn test_config() -> Config {
     }
 }
 
-#[derive(Clone)]
-struct FibProgram {
-    num_cols: usize,
-    num_rows: usize,
-}
+fn fib_program(num_rows: usize) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("Fib", num_rows).unwrap();
 
-impl Air<F> for FibProgram {
-    fn num_columns(&self) -> usize {
-        self.num_cols
-    }
+    let words = cx.columns(2, ColumnType::B32);
+    let q = cx.column(ColumnType::Bit);
 
-    fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
-        // Enforce:
-        // b[last_row] == public_inputs[0].
-        vec![BoundaryConstraint::with_public_input(
-            1,
-            self.num_rows - 1,
-            0,
-        )]
-    }
+    let cs = cx.cs();
 
-    fn column_layout(&self) -> &'static [ColumnType] {
-        &[ColumnType::B32, ColumnType::B32, ColumnType::Bit]
-    }
+    let [a, b] = [cs.col(words.at(0).index()), cs.col(words.at(1).index())];
+    let q_cell = cs.col(q.index());
+    let [na, nb] = [cs.next(words.at(0).index()), cs.next(words.at(1).index())];
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        let [a, b, q] = [cs.col(0), cs.col(1), cs.col(2)];
-        let [na, nb] = [cs.next(0), cs.next(1)];
+    cs.constrain(q_cell * (na + b));
+    cs.constrain(q_cell * (nb + a + b));
 
-        cs.constrain(q * (na + b));
-        cs.constrain(q * (nb + a + b));
+    cx.fix(q, FixedShape::LastRow);
+    cx.boundary(words.at(0), 0, F::ZERO);
+    cx.boundary(words.at(1), 0, F::ONE);
+    cx.publish(words.at(1), num_rows - 1);
 
-        cs.build()
-    }
-}
-
-impl Program<F> for FibProgram {
-    fn num_public_inputs(&self) -> usize {
-        1
-    }
+    cx.compile().unwrap()
 }
 
 fn generate_fib_trace(num_vars: usize) -> ColumnTrace {
@@ -95,11 +75,11 @@ fn generate_fib_trace(num_vars: usize) -> ColumnTrace {
         a_col.push(a);
         b_col.push(b);
 
-        if i == num_rows - 1 {
-            sel_col.push(Bit::ZERO);
+        sel_col.push(if i == num_rows - 1 {
+            Bit::ZERO
         } else {
-            sel_col.push(Bit::ONE);
-        }
+            Bit::ONE
+        });
 
         let tmp = a + b;
         a = b;
@@ -127,10 +107,7 @@ fn air_fib_e2e() {
     let instance = ProgramInstance::new(num_rows, vec![expected_pub]);
     let witness = ProgramWitness::new(trace);
 
-    let air = FibProgram {
-        num_cols: 3,
-        num_rows,
-    };
+    let air = fib_program(num_rows);
 
     let config = test_config();
 
@@ -146,8 +123,14 @@ fn air_fib_e2e() {
     .unwrap();
 
     let mut verifier_transcript = Transcript::<H>::new(b"FibAir_E2E");
-    let result =
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut verifier_transcript, &config);
+    let result = HekateVerifier::<F, H>::verify(
+        &program_id(&air).unwrap(),
+        &air,
+        &instance,
+        &proof,
+        &mut verifier_transcript,
+        &config,
+    );
 
     match result {
         Ok(true) => {}
@@ -170,10 +153,7 @@ fn transcript_binding_security_trace_root_changes_challenges() {
     let instance = ProgramInstance::new(num_rows, vec![expected_pub]);
     let witness = ProgramWitness::new(trace);
 
-    let air = FibProgram {
-        num_cols: 3,
-        num_rows,
-    };
+    let air = fib_program(num_rows);
 
     let config_a = Config {
         num_queries: 8,
@@ -250,10 +230,7 @@ fn zk_air_happy_path() {
     let instance = ProgramInstance::new(num_rows, vec![expected_pub]);
     let witness = ProgramWitness::new(trace);
 
-    let air = FibProgram {
-        num_cols: 3,
-        num_rows,
-    };
+    let air = fib_program(num_rows);
 
     let mut config = test_config();
     config.zero_knowledge = true;
@@ -273,9 +250,15 @@ fn zk_air_happy_path() {
     .unwrap();
 
     let mut verifier_transcript = Transcript::<H>::new(b"FibAir_ZK");
-    let ok =
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut verifier_transcript, &config)
-            .unwrap();
+    let ok = HekateVerifier::<F, H>::verify(
+        &program_id(&air).unwrap(),
+        &air,
+        &instance,
+        &proof,
+        &mut verifier_transcript,
+        &config,
+    )
+    .unwrap();
 
     assert!(ok, "ZK Program verification failed");
 }
@@ -296,10 +279,7 @@ proptest! {
         let instance = ProgramInstance::new(num_rows, vec![expected_pub]);
         let witness = ProgramWitness::new(trace);
 
-        let air = FibProgram {
-            num_cols: 3,
-            num_rows,
-        };
+        let air = fib_program(num_rows);
 
         let config = Config {
             zero_knowledge,
@@ -321,7 +301,14 @@ proptest! {
         .unwrap();
 
         let mut verifier_transcript = Transcript::<H>::new(b"FibAir_Fuzz");
-        let ok = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut verifier_transcript, &config)
+        let ok = HekateVerifier::<F, H>::verify(
+        &program_id(&air).unwrap(),
+        &air,
+        &instance,
+        &proof,
+        &mut verifier_transcript,
+        &config,
+    )
             .unwrap();
 
         prop_assert!(ok, "Program verification failed for num_vars={num_vars}");
