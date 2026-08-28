@@ -5,18 +5,12 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use hekate_core::config::Config;
 use hekate_core::errors;
-use hekate_core::trace::{ColumnTrace, ColumnType, TraceBuilder};
-use hekate_keccak::{
-    CpuKeccakColumns, CpuKeccakUnit, KeccakChiplet, KeccakColumns, KeccakWitness,
-    generate_keccak_trace,
-};
+use hekate_core::trace::{ColumnTrace, TraceBuilder};
+use hekate_keccak::{CpuKeccakColumns, KeccakChiplet, KeccakWitness, generate_keccak_trace};
 use hekate_math::{Bit, Block64, Block128, TowerField};
 use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
-use hekate_program::expander::VirtualExpander;
-use hekate_program::permutation::PermutationCheckSpec;
-use hekate_program::{Air, InlineKernelHint, Program, ProgramInstance, ProgramWitness};
+use hekate_program::circuit::{Circuit, CircuitProgram, Col};
+use hekate_program::{ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use rand::{TryRngCore, rngs::OsRng};
 use std::hint::black_box;
@@ -24,92 +18,40 @@ use std::time::Duration;
 
 type F = Block128;
 
-const KECCAK_OFFSET: usize = CpuKeccakColumns::NUM_COLUMNS;
-
 // =======================================
 // 1. KECCAK BENCH AIR
 // =======================================
 
-#[derive(Clone)]
-struct KeccakBenchAir {
-    num_rows: usize,
+fn build_program(num_rows: usize) -> CircuitProgram<F> {
+    let num_blocks = num_rows / KeccakChiplet::BLOCK_ROWS;
+
+    let mut cx = Circuit::<F>::new("KeccakBench", num_rows).unwrap();
+    let cpu = cx.schema(&CpuKeccakColumns::build_layout());
+
+    let selector = cpu.at(CpuKeccakColumns::SELECTOR);
+    let is_output = cpu.at(CpuKeccakColumns::IS_OUTPUT);
+
+    let call_values: Vec<Col> = (0..25)
+        .map(|lane| cpu.at(CpuKeccakColumns::LANES + lane))
+        .chain([is_output])
+        .collect();
+
+    cx.call(&KeccakChiplet::service(), &call_values, selector)
+        .unwrap();
+
+    cx.fix(
+        selector,
+        KeccakChiplet::host_selector_shape(KeccakChiplet::BLOCK_ROWS, num_blocks),
+    );
+    cx.fix(
+        is_output,
+        KeccakChiplet::host_direction_shape(KeccakChiplet::BLOCK_ROWS, num_blocks),
+    );
+
+    cx.mount(ChipletDef::from_air(&KeccakChiplet::new(num_rows, num_blocks)).unwrap());
+
+    cx.compile().unwrap()
 }
-
-impl Air<F> for KeccakBenchAir {
-    fn num_columns(&self) -> usize {
-        CpuKeccakColumns::NUM_COLUMNS + KeccakColumns::NUM_COLUMNS
-    }
-
-    fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
-        vec![CpuKeccakUnit::direction_boundary(0)]
-    }
-
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        LAYOUT.get_or_init(|| {
-            let mut cols = CpuKeccakColumns::build_layout();
-            cols.extend_from_slice(KeccakChiplet::physical_layout());
-
-            cols
-        })
-    }
-
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        let cpu_spec = CpuKeccakUnit::linking_spec();
-
-        let mut keccak_spec = KeccakChiplet::linking_spec();
-        keccak_spec.shift_column_indices(KECCAK_OFFSET);
-
-        vec![
-            (KeccakChiplet::BUS_ID.into(), cpu_spec),
-            (KeccakChiplet::BUS_ID.into(), keccak_spec),
-        ]
-    }
-
-    fn virtual_expander(&self) -> Option<&VirtualExpander> {
-        static E: std::sync::OnceLock<VirtualExpander> = std::sync::OnceLock::new();
-        Some(E.get_or_init(|| {
-            let cpu = VirtualExpander::new()
-                .pass_through(25, ColumnType::B64)
-                .control_bits(2);
-
-            KeccakChiplet::expand_into(cpu, KECCAK_OFFSET)
-                .build()
-                .expect("keccak bench expander")
-        }))
-    }
-
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-
-        CpuKeccakUnit::constrain(&cs, 0);
-
-        let mut ast = cs.build();
-
-        let mut keccak_ast = KeccakChiplet::new(self.num_rows).constraint_ast();
-        keccak_ast.arena.shift_cells(KECCAK_OFFSET);
-
-        ast.merge(keccak_ast);
-
-        ast
-    }
-
-    fn inline_chiplets(&self) -> errors::Result<Vec<ChipletDef<F>>> {
-        Ok(vec![ChipletDef::from_air(&KeccakChiplet::new(
-            self.num_rows,
-        ))?])
-    }
-
-    fn inline_chiplet_kernels(&self) -> Vec<InlineKernelHint> {
-        vec![InlineKernelHint {
-            chiplet_idx: 0,
-            root_offset: CpuKeccakUnit::NUM_ROOTS,
-            column_offset: KECCAK_OFFSET,
-        }]
-    }
-}
-
-impl Program<F> for KeccakBenchAir {}
 
 // =================================================================
 // 2. TRACE GENERATION
@@ -219,7 +161,7 @@ fn bench_keccak_prove(c: &mut Criterion) {
 
     for &num_vars in &[12usize, 15, 20] {
         let num_rows = 1usize << num_vars;
-        let max_blocks = num_rows / 25;
+        let max_blocks = num_rows / KeccakChiplet::BLOCK_ROWS;
         let message_len = max_blocks * 136 - 136;
 
         group.throughput(Throughput::Bytes((max_blocks * 136) as u64));
@@ -231,7 +173,7 @@ fn bench_keccak_prove(c: &mut Criterion) {
         let inputs: Vec<[Block64; 25]> = calls.iter().map(|(inp, _)| *inp).collect();
         let trace = generate_combined_trace(&calls, &inputs, num_rows).unwrap();
 
-        let air = KeccakBenchAir { num_rows };
+        let air = build_program(num_rows);
         let instance = ProgramInstance::new(num_rows, vec![]);
         let witness = ProgramWitness::new(trace);
 

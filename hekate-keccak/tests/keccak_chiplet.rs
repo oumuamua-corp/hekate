@@ -3,18 +3,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use hekate_core::config::Config;
-use hekate_core::trace::{ColumnTrace, ColumnType, TraceBuilder, TraceColumn};
+use hekate_core::trace::{ColumnTrace, TraceBuilder, TraceColumn};
 use hekate_crypto::DefaultHasher;
 use hekate_crypto::transcript::Transcript;
 use hekate_keccak::{
-    CpuKeccakColumns, CpuKeccakUnit, KeccakChiplet, KeccakWitness, generate_keccak_trace,
+    CpuKeccakColumns, KeccakChiplet, KeccakWitness, PhysKeccakColumns, generate_keccak_trace,
 };
 use hekate_math::{Bit, Block32, Block64, Block128, Flat, HardwareField, TowerField};
 use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
-use hekate_program::permutation::PermutationCheckSpec;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::circuit::{Circuit, CircuitProgram, Col};
+use hekate_program::digest::program_id;
+use hekate_program::{ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_scribble::{MutationKind, ScribbleConfig, assert_all_caught_all_targets};
 use hekate_sdk::preflight;
@@ -26,11 +25,6 @@ type H = DefaultHasher;
 
 const CPU_ROWS: usize = 32;
 const KECCAK_ROWS: usize = 32;
-
-const PHYS_LANES: usize = 0;
-const PHYS_ROUND: usize = 25;
-const PHYS_S_ROUND: usize = 27;
-const PHYS_S_IN_OUT: usize = 28;
 
 fn test_input_state() -> [u64; 25] {
     let mut state = [0u64; 25];
@@ -54,44 +48,33 @@ fn compute_keccak_f(input: [u64; 25]) -> [u64; 25] {
 // Test Program
 // =================================================================
 
-#[derive(Clone)]
-struct KeccakTestProgram {
-    keccak_rows: usize,
-}
+fn build_program(cpu_rows: usize, keccak_rows: usize, num_blocks: usize) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("KeccakTest", cpu_rows).unwrap();
+    let cpu = cx.schema(&CpuKeccakColumns::build_layout());
 
-impl Air<F> for KeccakTestProgram {
-    fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
-        vec![CpuKeccakUnit::direction_boundary(0)]
-    }
+    let selector = cpu.at(CpuKeccakColumns::SELECTOR);
+    let is_output = cpu.at(CpuKeccakColumns::IS_OUTPUT);
 
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        LAYOUT.get_or_init(CpuKeccakColumns::build_layout)
-    }
+    let call_values: Vec<Col> = (0..25)
+        .map(|lane| cpu.at(CpuKeccakColumns::LANES + lane))
+        .chain([is_output])
+        .collect();
 
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![(KeccakChiplet::BUS_ID.into(), CpuKeccakUnit::linking_spec())]
-    }
+    cx.call(&KeccakChiplet::service(), &call_values, selector)
+        .unwrap();
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
+    cx.fix(
+        selector,
+        KeccakChiplet::host_selector_shape(KeccakChiplet::BLOCK_ROWS, num_blocks),
+    );
+    cx.fix(
+        is_output,
+        KeccakChiplet::host_direction_shape(KeccakChiplet::BLOCK_ROWS, num_blocks),
+    );
 
-        CpuKeccakUnit::constrain(&cs, 0);
+    cx.attach(ChipletDef::from_air(&KeccakChiplet::new(keccak_rows, num_blocks)).unwrap());
 
-        cs.build()
-    }
-}
-
-impl Program<F> for KeccakTestProgram {
-    fn num_public_inputs(&self) -> usize {
-        0
-    }
-
-    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        Ok(vec![ChipletDef::from_air(&KeccakChiplet::new(
-            self.keccak_rows,
-        ))?])
-    }
+    cx.compile().unwrap()
 }
 
 // =================================================================
@@ -144,8 +127,9 @@ fn prove_and_verify(
     chiplet_trace: ColumnTrace,
     cpu_rows: usize,
     keccak_rows: usize,
+    num_blocks: usize,
 ) -> Result<bool, String> {
-    let air = KeccakTestProgram { keccak_rows };
+    let air = build_program(cpu_rows, keccak_rows, num_blocks);
 
     let instance = ProgramInstance::new(cpu_rows, vec![]);
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(vec![chiplet_trace]);
@@ -189,7 +173,9 @@ fn prove_and_verify(
     .map_err(|e| format!("prover: {e:?}"))?;
 
     let mut vt = Transcript::<H>::new(b"Keccak_E2E");
-    HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config)
+    let pinned_id = program_id(&air).unwrap();
+
+    HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config)
         .map_err(|e| format!("verifier: {e:?}"))
 }
 
@@ -209,9 +195,7 @@ where
 
     tamper(&mut chiplet_trace, &mut cpu_trace);
 
-    let air = KeccakTestProgram {
-        keccak_rows: KECCAK_ROWS,
-    };
+    let air = build_program(CPU_ROWS, KECCAK_ROWS, 1);
 
     let instance = ProgramInstance::new(CPU_ROWS, vec![]);
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(vec![chiplet_trace]);
@@ -238,7 +222,11 @@ where
         Err(_) => true,
         Ok(proof) => {
             let mut vt = Transcript::<H>::new(b"Keccak_Adversarial");
-            let result = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
+            let pinned_id = program_id(&air).unwrap();
+
+            let result = HekateVerifier::<F, H>::verify(
+                &pinned_id, &air, &instance, &proof, &mut vt, &config,
+            );
 
             result.is_err() || !result.unwrap()
         }
@@ -289,7 +277,7 @@ fn keccak_e2e() {
     let cpu_trace = build_cpu_trace(&[(input, output)], CPU_ROWS);
     let chiplet_trace = build_chiplet_trace(&[input], KECCAK_ROWS);
 
-    match prove_and_verify(cpu_trace, chiplet_trace, CPU_ROWS, KECCAK_ROWS) {
+    match prove_and_verify(cpu_trace, chiplet_trace, CPU_ROWS, KECCAK_ROWS, 1) {
         Ok(true) => {}
         Ok(false) => panic!("verifier rejected honest proof"),
         Err(e) => panic!("error: {e}"),
@@ -314,7 +302,7 @@ fn keccak_e2e_multi_call_default_pairs() {
     let cpu_trace = build_cpu_trace(&calls, ROWS);
     let chiplet_trace = build_chiplet_trace(&inputs, ROWS);
 
-    match prove_and_verify(cpu_trace, chiplet_trace, ROWS, ROWS) {
+    match prove_and_verify(cpu_trace, chiplet_trace, ROWS, ROWS, 2) {
         Ok(true) => {}
         Ok(false) => panic!("verifier rejected honest multi-call proof"),
         Err(e) => panic!("error: {e}"),
@@ -329,7 +317,7 @@ fn keccak_e2e_multi_call_default_pairs() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_round_state_tamper() {
     let detected = run_tampered_keccak(|keccak, _| {
-        flip_b64(keccak, PHYS_LANES, 5, 0x01);
+        flip_b64(keccak, PhysKeccakColumns::P_LANES, 5, 0x01);
     });
 
     assert!(
@@ -342,7 +330,7 @@ fn exploit_round_state_tamper() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_round_index_tamper() {
     let detected = run_tampered_keccak(|keccak, _| {
-        flip_b32(keccak, PHYS_ROUND, 3, 0x01);
+        flip_b32(keccak, PhysKeccakColumns::P_ROUND, 3, 0x01);
     });
 
     assert!(detected);
@@ -352,7 +340,7 @@ fn exploit_round_index_tamper() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_lane_swap() {
     let detected = run_tampered_keccak(|keccak, _| {
-        let (col0, col1) = (PHYS_LANES, PHYS_LANES + 1);
+        let (col0, col1) = (PhysKeccakColumns::P_LANES, PhysKeccakColumns::P_LANES + 1);
 
         let v0 = match &keccak.columns[col0] {
             TraceColumn::B64(d) => d[5],
@@ -381,8 +369,8 @@ fn exploit_lane_swap() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_multi_round_tamper() {
     let detected = run_tampered_keccak(|keccak, _| {
-        flip_b64(keccak, PHYS_LANES + 3, 10, 0xFF);
-        flip_b64(keccak, PHYS_LANES + 7, 15, 0xFF);
+        flip_b64(keccak, PhysKeccakColumns::P_LANES + 3, 10, 0xFF);
+        flip_b64(keccak, PhysKeccakColumns::P_LANES + 7, 15, 0xFF);
     });
 
     assert!(
@@ -399,7 +387,7 @@ fn exploit_multi_round_tamper() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_chiplet_output_tamper() {
     let detected = run_tampered_keccak(|keccak, _| {
-        flip_b64(keccak, PHYS_LANES, 24, 0x01);
+        flip_b64(keccak, PhysKeccakColumns::P_LANES, 24, 0x01);
     });
 
     assert!(
@@ -466,7 +454,7 @@ fn exploit_consistent_output_forgery() {
         // Tamper output on BOTH sides so bus passes.
         // Round chain must still catch it:
         // next_bit[24] ≠ chi(state[23]).
-        flip_b64(keccak, PHYS_LANES, 24, 0x01);
+        flip_b64(keccak, PhysKeccakColumns::P_LANES, 24, 0x01);
         flip_b64(cpu, CpuKeccakColumns::LANES, 24, 0x01);
     });
 
@@ -484,7 +472,7 @@ fn exploit_consistent_output_forgery() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_s_in_out_injection() {
     let detected = run_tampered_keccak(|keccak, _| {
-        set_bit_val(keccak, PHYS_S_IN_OUT, 5, Bit::ONE);
+        set_bit_val(keccak, PhysKeccakColumns::P_S_IN_OUT, 5, Bit::ONE);
     });
 
     assert!(
@@ -497,7 +485,7 @@ fn exploit_s_in_out_injection() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_s_in_out_deactivation() {
     let detected = run_tampered_keccak(|keccak, _| {
-        set_bit_val(keccak, PHYS_S_IN_OUT, 24, Bit::ZERO);
+        set_bit_val(keccak, PhysKeccakColumns::P_S_IN_OUT, 24, Bit::ZERO);
     });
 
     assert!(
@@ -517,8 +505,8 @@ fn exploit_ghost_state_injection() {
         // Inject non-zero state + s_round on padding row.
         // Row 26 is all-zero padding → chi(non-zero state)
         // produces non-zero output ≠ zero next_bit.
-        set_bit_val(keccak, PHYS_S_ROUND, 25, Bit::ONE);
-        match &mut keccak.columns[PHYS_LANES] {
+        set_bit_val(keccak, PhysKeccakColumns::P_S_ROUND, 25, Bit::ONE);
+        match &mut keccak.columns[PhysKeccakColumns::P_LANES] {
             TraceColumn::B64(data) => {
                 data[25] = Flat::from_raw(Block64(0xDEADBEEF));
             }
@@ -536,7 +524,7 @@ fn exploit_ghost_state_injection() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_s_round_deactivation() {
     let detected = run_tampered_keccak(|keccak, _| {
-        set_bit_val(keccak, PHYS_S_ROUND, 23, Bit::ZERO);
+        set_bit_val(keccak, PhysKeccakColumns::P_S_ROUND, 23, Bit::ZERO);
     });
 
     assert!(
@@ -549,7 +537,7 @@ fn exploit_s_round_deactivation() {
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_s_round_input_deactivation() {
     let detected = run_tampered_keccak(|keccak, _| {
-        set_bit_val(keccak, PHYS_S_ROUND, 0, Bit::ZERO);
+        set_bit_val(keccak, PhysKeccakColumns::P_S_ROUND, 0, Bit::ZERO);
     });
 
     assert!(
@@ -566,9 +554,7 @@ fn scribble_keccak_flip_selector_caught() {
     let cpu_trace = build_cpu_trace(&[(input, output)], CPU_ROWS);
     let chiplet_trace = build_chiplet_trace(&[input], KECCAK_ROWS);
 
-    let air = KeccakTestProgram {
-        keccak_rows: KECCAK_ROWS,
-    };
+    let air = build_program(CPU_ROWS, KECCAK_ROWS, 1);
 
     let instance = ProgramInstance::new(CPU_ROWS, vec![]);
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(vec![chiplet_trace]);

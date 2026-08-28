@@ -14,12 +14,12 @@ use core::cmp;
 use hekate_core::errors::Error;
 use hekate_core::trace::{ColumnTrace, ColumnType, TraceBuilder, TraceCompatibleField};
 use hekate_math::{Bit, Block64, TowerField};
-use hekate_program::Air;
+use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
 use hekate_program::define_columns;
 use hekate_program::expander::VirtualExpander;
-use hekate_program::permutation::{PermutationCheckSpec, REQUEST_IDX_LABEL, Source};
+use hekate_program::permutation::{BusKind, PermutationCheckSpec, Service, ServiceSlot};
+use hekate_program::{Air, FixedColumn, FixedShape, fix};
 use once_cell::race::OnceBox;
 
 // FIPS 202 §6.1-6.2:
@@ -31,15 +31,6 @@ const SHA3_256_RATE: usize = 136; // (1600 - 512) / 8
 const SHA3_512_RATE: usize = 72; // (1600 - 1024) / 8
 const SHAKE128_RATE: usize = 168; // (1600 - 256) / 8
 const SHAKE256_RATE: usize = 136; // (1600 - 512) / 8
-
-// Physical indices. KeccakColumns indexes the virtual trace.
-const PHYS_LANES: usize = 0; // 0..24: B64 state lanes
-const PHYS_ROUND: usize = 25; // B32 one-hot round index
-const PHYS_REQUEST_IDX: usize = 26; // B32 partner-side row index
-const PHYS_S_ROUND: usize = 27; // Bit: active round
-const PHYS_S_IN_OUT: usize = 28; // Bit: input/output row
-const PHYS_IS_OUTPUT: usize = 29; // Bit: emit direction
-const PHYS_NUM_COLS: usize = 30;
 
 /// Separates a block's two emit rows in the bus key.
 pub const KECCAK_DIRECTION_LABEL: &[u8] = b"keccak_is_output";
@@ -73,6 +64,20 @@ pub const KECCAK_LANE_LABELS: [&[u8]; 25] = [
     b"keccak_lane_24",
 ];
 
+// Physical layout. Column order must match VirtualExpander
+// sequence exactly. LANES and ROUND are bit-decomposed by
+// the expander; KeccakColumns indexes the virtual trace.
+define_columns! {
+    pub PhysKeccakColumns {
+        P_LANES: [B64; 25],
+        P_ROUND: B32,
+        P_REQUEST_IDX: B32,
+        P_S_ROUND: Bit,
+        P_S_IN_OUT: Bit,
+        P_IS_OUTPUT: Bit,
+    }
+}
+
 define_columns! {
     pub KeccakColumns {
         STATE_BITS: [Bit; 1600],
@@ -93,61 +98,16 @@ define_columns! {
     }
 }
 
-/// The host writes `IS_OUTPUT` from the row after an input
-/// emit through the row that receives the permutation result,
-/// calls `constrain`, and pins `IS_OUTPUT` at row 0.
-#[derive(Clone, Debug)]
-pub struct CpuKeccakUnit;
-
-impl CpuKeccakUnit {
-    pub const NUM_ROOTS: usize = 2;
-
-    pub fn linking_spec() -> PermutationCheckSpec {
-        let mut sources = Vec::with_capacity(27);
-
-        for (i, label) in KECCAK_LANE_LABELS.iter().enumerate() {
-            let col_idx = CpuKeccakColumns::LANES + i;
-            sources.push((Source::Column(col_idx), *label));
-        }
-
-        sources.push((Source::RowIndexLeBytes(4), REQUEST_IDX_LABEL));
-        sources.push((
-            Source::Column(CpuKeccakColumns::IS_OUTPUT),
-            KECCAK_DIRECTION_LABEL,
-        ));
-
-        PermutationCheckSpec::new(sources, Some(CpuKeccakColumns::SELECTOR))
-    }
-
-    pub fn num_columns(&self) -> usize {
-        CpuKeccakColumns::NUM_COLUMNS
-    }
-
-    /// Caller anchors `IS_OUTPUT` at row 0 with `direction_boundary`;
-    /// the recurrence alone admits the complement.
-    ///
-    /// `offset` is where `CpuKeccakColumns` starts in the host layout.
-    pub fn constrain<F: TowerField>(cs: &ConstraintSystem<F>, offset: usize) {
-        let selector = cs.col(offset + CpuKeccakColumns::SELECTOR);
-        let is_output = cs.col(offset + CpuKeccakColumns::IS_OUTPUT);
-
-        cs.assert_boolean(selector);
-        cs.constrain(cs.next(offset + CpuKeccakColumns::IS_OUTPUT) + is_output + selector);
-    }
-
-    pub fn direction_boundary<F: TowerField>(offset: usize) -> BoundaryConstraint<F> {
-        BoundaryConstraint::with_constant(offset + CpuKeccakColumns::IS_OUTPUT, 0, F::ZERO)
-    }
-}
-
 /// Keccak-f[1600] as 24 round rows plus one output row per block.
 ///
 /// State lives in 1600 virtual bit columns; Chi stays degree 2.
 /// The 25 B64 lanes carrying the bus key are the same physical
-/// columns those bits expand from.
+/// columns those bits expand from. The schedule columns are
+/// fixed columns on a stride-25 cadence of `num_blocks` blocks.
 #[derive(Clone, Debug)]
 pub struct KeccakChiplet {
     pub num_rows: usize,
+    pub num_blocks: usize,
 }
 
 impl KeccakChiplet {
@@ -190,14 +150,27 @@ impl KeccakChiplet {
         0x8000000080008008,
     ];
 
-    pub fn new(num_rows: usize) -> Self {
-        assert!(num_rows.is_power_of_two());
-        Self { num_rows }
-    }
+    /// The 24 round rows plus the output row.
+    pub const BLOCK_ROWS: usize = Self::ROUND_CONSTANTS.len() + 1;
 
-    /// `num_rows` does not reach constraint generation.
-    pub fn for_constraints() -> Self {
-        Self { num_rows: 0 }
+    /// Blocks sit contiguously at rows `0..BLOCK_ROWS·num_blocks`.
+    pub fn new(num_rows: usize, num_blocks: usize) -> Self {
+        assert!(
+            num_rows.is_power_of_two(),
+            "num_rows must be a power of two"
+        );
+        assert!(
+            num_blocks
+                .checked_mul(Self::BLOCK_ROWS)
+                .is_some_and(|span| span <= num_rows),
+            "{num_blocks} blocks need {} rows, the table holds {num_rows}",
+            num_blocks.saturating_mul(Self::BLOCK_ROWS),
+        );
+
+        Self {
+            num_rows,
+            num_blocks,
+        }
     }
 
     #[inline(always)]
@@ -216,42 +189,78 @@ impl KeccakChiplet {
         KeccakColumns::LANES + (y * 5 + x)
     }
 
-    pub fn linking_spec() -> PermutationCheckSpec {
-        let mut sources = Vec::with_capacity(27);
+    /// Both endpoints derive from this schema:
+    /// 25 lanes, the request-index clock, direction.
+    pub fn service() -> Service {
+        let mut slots = Vec::with_capacity(27);
 
-        for y in 0..5 {
-            for x in 0..5 {
-                let lane_idx = y * 5 + x;
-                let col_idx = KeccakColumns::LANES + lane_idx;
-                let label = KECCAK_LANE_LABELS[lane_idx];
-
-                sources.push((Source::Column(col_idx), label));
-            }
+        for label in KECCAK_LANE_LABELS {
+            slots.push(ServiceSlot::Value(label));
         }
 
-        sources.push((
-            Source::Column(KeccakColumns::REQUEST_IDX),
-            REQUEST_IDX_LABEL,
-        ));
+        slots.push(ServiceSlot::RequestIdx { num_bytes: 4 });
+        slots.push(ServiceSlot::Value(KECCAK_DIRECTION_LABEL));
 
-        sources.push((
-            Source::Column(KeccakColumns::IS_OUTPUT),
-            KECCAK_DIRECTION_LABEL,
-        ));
+        Service {
+            bus_id: Self::BUS_ID,
+            kind: BusKind::Permutation,
+            slots,
+            clock_waiver: None,
+        }
+    }
 
-        PermutationCheckSpec::new(sources, Some(KeccakColumns::S_IN_OUT))
+    pub fn linking_spec() -> PermutationCheckSpec {
+        let mut values: Vec<usize> = (0..25).map(|lane| KeccakColumns::LANES + lane).collect();
+        values.push(KeccakColumns::IS_OUTPUT);
+
+        Self::service()
+            .respond(
+                &values,
+                &[KeccakColumns::REQUEST_IDX],
+                KeccakColumns::S_IN_OUT,
+            )
+            .expect("service slots match the responder columns")
+    }
+
+    /// Host emit schedule: `SELECTOR` fires
+    /// at block offsets 0 and `stride - 1`.
+    pub fn host_selector_shape<F: TowerField>(stride: usize, count: usize) -> FixedShape<F> {
+        assert!(stride >= 2);
+
+        FixedShape::Cadence {
+            stride,
+            count,
+            origin: 0,
+            values: (0..stride)
+                .map(|off| {
+                    if off == 0 || off == stride - 1 {
+                        F::ONE
+                    } else {
+                        F::ZERO
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Host emit direction: `IS_OUTPUT` is zero
+    /// only on each block's input row at offset 0.
+    pub fn host_direction_shape<F: TowerField>(stride: usize, count: usize) -> FixedShape<F> {
+        assert!(stride >= 2);
+
+        FixedShape::Cadence {
+            stride,
+            count,
+            origin: 0,
+            values: (0..stride)
+                .map(|off| if off == 0 { F::ZERO } else { F::ONE })
+                .collect(),
+        }
     }
 
     pub fn physical_layout() -> &'static [ColumnType] {
         static PHYSICAL_LAYOUT: OnceBox<Vec<ColumnType>> = OnceBox::new();
-        PHYSICAL_LAYOUT.get_or_init(|| {
-            let mut cols = Vec::with_capacity(PHYS_NUM_COLS);
-            cols.extend(vec![ColumnType::B64; 25]);
-            cols.extend(vec![ColumnType::B32; 2]);
-            cols.extend(vec![ColumnType::Bit; 3]);
-
-            Box::new(cols)
-        })
+        PHYSICAL_LAYOUT.get_or_init(|| Box::new(PhysKeccakColumns::build_layout()))
     }
 
     /// `phys_offset` is absolute in the host program's
@@ -279,11 +288,52 @@ impl<F: TowerField + TraceCompatibleField> Air<F> for KeccakChiplet {
         vec![(Self::BUS_ID.into(), Self::linking_spec())]
     }
 
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        const ROUNDS: usize = KeccakChiplet::ROUND_CONSTANTS.len();
+        const OUTPUT_OFFSET: usize = KeccakChiplet::BLOCK_ROWS - 1;
+
+        let block = |values: Vec<F>| FixedShape::Cadence {
+            stride: Self::BLOCK_ROWS,
+            count: self.num_blocks,
+            origin: 0,
+            values,
+        };
+
+        let shape = |pred: &dyn Fn(usize) -> bool| {
+            block(
+                (0..Self::BLOCK_ROWS)
+                    .map(|off| if pred(off) { F::ONE } else { F::ZERO })
+                    .collect(),
+            )
+        };
+
+        let mut pins = Vec::with_capacity(35);
+
+        pins.push(fix(KeccakColumns::S_ROUND, shape(&|off| off < ROUNDS)));
+        pins.push(fix(
+            KeccakColumns::S_IN_OUT,
+            shape(&|off| off == 0 || off == OUTPUT_OFFSET),
+        ));
+        pins.push(fix(
+            KeccakColumns::IS_OUTPUT,
+            shape(&|off| off == OUTPUT_OFFSET),
+        ));
+
+        for r in 0..32 {
+            pins.push(fix(
+                KeccakColumns::ROUND_BITS + r,
+                shape(&|off| r < ROUNDS && off == r),
+            ));
+        }
+
+        pins
+    }
+
     fn virtual_expander(&self) -> Option<&VirtualExpander> {
         static E: OnceBox<VirtualExpander> = OnceBox::new();
         Some(E.get_or_init(|| {
             Box::new(
-                Self::expand_into(VirtualExpander::new(), PHYS_LANES)
+                Self::expand_into(VirtualExpander::new(), PhysKeccakColumns::P_LANES)
                     .build()
                     .expect("KeccakChiplet expander"),
             )
@@ -370,67 +420,6 @@ impl<F: TowerField + TraceCompatibleField> Air<F> for KeccakChiplet {
                 }
             }
         }
-
-        // Ghost Protocol. A round row is followed
-        // by a round row or an output row.
-        cs.assert_boolean(s_round);
-        cs.assert_boolean(s_in_out);
-
-        let next_s_round = cs.next(KeccakColumns::S_ROUND);
-        let next_s_in_out = cs.next(KeccakColumns::S_IN_OUT);
-        let one = cs.constant(F::ONE);
-
-        cs.constrain(s_round * (one + next_s_round + next_s_in_out));
-
-        // The row before an output row is a round row. `next`
-        // wraps at the trace end, which carries this onto row 0.
-        cs.constrain(next_s_in_out * (one + next_s_round) * (one + s_round));
-
-        // Round index: one-hot at 0 on the input row, one
-        // shift per round row, block ends after round 23.
-        let round = |r: usize| cs.col(Self::get_round_col(r));
-        let weighted = |lo: usize, hi: usize| {
-            cs.sum(
-                &(lo..hi)
-                    .map(|r| cs.scale(F::from(1u128 << r), round(r)))
-                    .collect::<Vec<_>>(),
-            )
-        };
-        let weighted_next = |lo: usize, hi: usize| {
-            cs.sum(
-                &(lo..hi)
-                    .map(|r| cs.scale(F::from(1u128 << r), cs.next(Self::get_round_col(r))))
-                    .collect::<Vec<_>>(),
-            )
-        };
-
-        cs.constrain(weighted(24, 32));
-        cs.constrain(s_round + cs.sum(&(0..24).map(round).collect::<Vec<_>>()));
-
-        let input_row = s_in_out * s_round;
-
-        cs.assert_zero_when(input_row, one + round(0));
-        cs.assert_zero_when(input_row, weighted(1, 24));
-
-        // A chain may only begin on an input row
-        let not_round = one + s_round;
-
-        cs.assert_zero_when(not_round, weighted(0, 24));
-        cs.assert_zero_when(not_round, weighted_next(1, 24));
-        cs.constrain(round(0) * (one + s_in_out));
-
-        for r in 0..23 {
-            cs.constrain(s_round * (cs.next(Self::get_round_col(r + 1)) + round(r)));
-        }
-
-        cs.constrain(s_round * (next_s_round + one + round(23)));
-
-        // The bus key cannot tell a block's
-        // two emit rows apart without this.
-        let is_output = cs.col(KeccakColumns::IS_OUTPUT);
-
-        cs.assert_zero_when(s_in_out, is_output + one + s_round);
-        cs.assert_zero_when(one + s_in_out, is_output);
 
         cs.build()
     }
@@ -556,9 +545,13 @@ pub fn generate_keccak_trace(
 ) -> hekate_core::errors::Result<ColumnTrace> {
     let default_pairs: Vec<(u32, u32)> = match request_idx_pairs {
         Some(_) => Vec::new(),
-        None => (0..calls.len() as u32)
-            .map(|k| (25 * k, 25 * k + 24))
-            .collect(),
+        None => {
+            let stride = KeccakChiplet::BLOCK_ROWS as u32;
+
+            (0..calls.len() as u32)
+                .map(|k| (stride * k, stride * k + stride - 1))
+                .collect()
+        }
     };
 
     let pairs: &[(u32, u32)] = request_idx_pairs.unwrap_or(&default_pairs);
@@ -573,7 +566,7 @@ pub fn generate_keccak_trace(
     let mut rows = Vec::with_capacity(num_rows);
 
     for (call, &(in_idx, out_idx)) in calls.iter().zip(pairs.iter()) {
-        if rows.len() + 25 > num_rows {
+        if rows.len() + KeccakChiplet::BLOCK_ROWS > num_rows {
             return Err(Error::Protocol {
                 protocol: "keccak",
                 message: "trace overflow: too many calls for allocated rows",
@@ -614,27 +607,35 @@ pub fn generate_keccak_trace(
 
     for (i, row) in rows.iter().enumerate() {
         for lane in 0..25 {
-            tb.set_b64(PHYS_LANES + lane, i, Block64::from(row.state[lane]))?;
+            tb.set_b64(
+                PhysKeccakColumns::P_LANES + lane,
+                i,
+                Block64::from(row.state[lane]),
+            )?;
         }
 
-        tb.set_b32(PHYS_ROUND, i, hekate_math::Block32::from(row.round))?;
         tb.set_b32(
-            PHYS_REQUEST_IDX,
+            PhysKeccakColumns::P_ROUND,
+            i,
+            hekate_math::Block32::from(row.round),
+        )?;
+        tb.set_b32(
+            PhysKeccakColumns::P_REQUEST_IDX,
             i,
             hekate_math::Block32::from(row.request_idx),
         )?;
         tb.set_bit(
-            PHYS_S_ROUND,
+            PhysKeccakColumns::P_S_ROUND,
             i,
             if row.s_round { Bit::ONE } else { Bit::ZERO },
         )?;
         tb.set_bit(
-            PHYS_S_IN_OUT,
+            PhysKeccakColumns::P_S_IN_OUT,
             i,
             if row.s_in_out { Bit::ONE } else { Bit::ZERO },
         )?;
         tb.set_bit(
-            PHYS_IS_OUTPUT,
+            PhysKeccakColumns::P_IS_OUTPUT,
             i,
             if row.s_in_out && !row.s_round {
                 Bit::ONE
@@ -845,7 +846,7 @@ mod tests {
 
     #[test]
     fn keccak_chiplet_air_metadata() {
-        let chiplet = KeccakChiplet::new(32);
+        let chiplet = KeccakChiplet::new(32, 1);
         assert_eq!(Air::<F>::num_columns(&chiplet), 1661);
         assert_eq!(Air::<F>::name(&chiplet), "KeccakChiplet".to_string());
     }
@@ -962,7 +963,9 @@ mod tests {
 
         let trace = keccak_trace(message, num_rows).unwrap();
 
-        let s_in_out = trace.columns[PHYS_S_IN_OUT].as_bit_slice().unwrap();
+        let s_in_out = trace.columns[PhysKeccakColumns::P_S_IN_OUT]
+            .as_bit_slice()
+            .unwrap();
 
         assert_eq!(s_in_out[0], Bit::ONE);
         assert_eq!(s_in_out[24], Bit::ONE);
@@ -976,7 +979,9 @@ mod tests {
 
         let trace = keccak_trace(&message, num_rows).unwrap();
 
-        let s_in_out = trace.columns[PHYS_S_IN_OUT].as_bit_slice().unwrap();
+        let s_in_out = trace.columns[PhysKeccakColumns::P_S_IN_OUT]
+            .as_bit_slice()
+            .unwrap();
 
         assert_eq!(s_in_out[0], Bit::ONE);
         assert_eq!(s_in_out[24], Bit::ONE);
@@ -1002,7 +1007,7 @@ mod tests {
 
     #[test]
     fn ast_node_count() {
-        let chiplet = KeccakChiplet::new(1024);
+        let chiplet = KeccakChiplet::new(1024, 40);
         let ast: ConstraintAst<F> = chiplet.constraint_ast();
 
         assert!(
@@ -1012,16 +1017,14 @@ mod tests {
         );
         assert_eq!(
             ast.roots.len(),
-            25 + 1600 + 2 + 2 + 1 + 1 + 2 + 3 + 23 + 1 + 2,
-            "Expected 25 packing + 1600 round + 2 Ghost Protocol + 2 selector boolean \
-             + 1 unused-zero + 1 activity + 2 input pin + 3 chain start + 23 chain \
-             + 1 terminal + 2 emit direction"
+            25 + 1600,
+            "Expected 25 packing + 1600 round; the schedule is cadence pins"
         );
     }
 
     #[test]
     fn ast_matches_flat_constraints() {
-        let chiplet = KeccakChiplet::new(1024);
+        let chiplet = KeccakChiplet::new(1024, 40);
         let ast: ConstraintAst<F> = chiplet.constraint_ast();
         let flat = ast.to_constraints();
 
@@ -1058,7 +1061,7 @@ mod tests {
 
     #[test]
     fn parity_and_theta_nodes_are_shared() {
-        let chiplet = KeccakChiplet::new(1024);
+        let chiplet = KeccakChiplet::new(1024, 40);
         let ast: ConstraintAst<F> = chiplet.constraint_ast();
 
         // Column parity is the only 5-child Sum:
@@ -1126,5 +1129,72 @@ mod tests {
         // SHAKE-256("", 32) = 46b9dd2b0ba88d13...
         assert_eq!(out[0], 0x46);
         assert_eq!(out[1], 0xb9);
+    }
+
+    #[test]
+    fn cadence_pins_pin_every_schedule_column() {
+        let num_vars = 10;
+        let pins = Air::<F>::fixed_columns(&KeccakChiplet::new(1024, 40));
+
+        assert_eq!(pins.len(), 35);
+
+        let pinned: Vec<usize> = pins.iter().map(|p| p.col_idx).collect();
+
+        assert!(pinned.contains(&KeccakColumns::S_ROUND));
+        assert!(pinned.contains(&KeccakColumns::S_IN_OUT));
+        assert!(pinned.contains(&KeccakColumns::IS_OUTPUT));
+
+        for r in 0..32 {
+            assert!(pinned.contains(&(KeccakColumns::ROUND_BITS + r)));
+        }
+
+        let one = hekate_math::Flat::from_raw(F::ONE);
+        let zero = hekate_math::Flat::from_raw(F::ZERO);
+        let at = |col: usize, row: usize| {
+            pins.iter()
+                .find(|p| p.col_idx == col)
+                .unwrap()
+                .shape
+                .value_at_row(row, num_vars)
+        };
+
+        assert_eq!(at(KeccakColumns::S_ROUND, 0), one);
+        assert_eq!(at(KeccakColumns::S_ROUND, 23), one);
+        assert_eq!(at(KeccakColumns::S_ROUND, 24), zero);
+        assert_eq!(at(KeccakColumns::S_IN_OUT, 25), one);
+        assert_eq!(at(KeccakColumns::S_IN_OUT, 26), zero);
+        assert_eq!(at(KeccakColumns::IS_OUTPUT, 49), one);
+        assert_eq!(at(KeccakColumns::ROUND_BITS + 7, 25 + 7), one);
+        assert_eq!(at(KeccakColumns::ROUND_BITS + 7, 25 + 8), zero);
+        assert_eq!(at(KeccakColumns::ROUND_BITS + 30, 30), zero);
+
+        assert_eq!(at(KeccakColumns::S_ROUND, 40 * 25), zero);
+        assert_eq!(at(KeccakColumns::S_IN_OUT, 40 * 25), zero);
+    }
+
+    #[test]
+    fn generated_trace_matches_cadence_pins() {
+        let num_rows = 64;
+        let num_vars = 6;
+        let message = vec![0u8; 136];
+
+        let trace = keccak_trace(&message, num_rows).unwrap();
+
+        let chiplet = KeccakChiplet::new(num_rows, 2);
+        let pins = Air::<F>::fixed_columns(&chiplet);
+        let def = hekate_program::chiplet::ChipletDef::from_air(&chiplet).unwrap();
+        let variants = def.expand_variants(&trace).unwrap();
+
+        for pin in &pins {
+            for row in 0..num_rows {
+                assert_eq!(
+                    variants[pin.col_idx].get_at(row),
+                    pin.shape.value_at_row(row, num_vars),
+                    "col {} row {}",
+                    pin.col_idx,
+                    row
+                );
+            }
+        }
     }
 }
