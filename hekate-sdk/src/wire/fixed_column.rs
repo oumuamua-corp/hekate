@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use flatbuffers::FlatBufferBuilder;
 use hekate_core::errors::Result;
 use hekate_math::TowerField;
-use hekate_program::{FixedColumn, FixedShape};
+use hekate_program::{CadenceSegment, FixedColumn, FixedShape};
 
 use super::field::{field_to_lo_hi, lo_hi_to_field};
 use super::wire_err;
@@ -50,6 +50,42 @@ pub fn serialize_fixed_column<'a, F: TowerField>(
 
             args.kind = fb::FixedShapeKind::Dense;
             args.values = Some(fbb.create_vector(&blocks));
+        }
+        FixedShape::Cadence {
+            stride,
+            count,
+            origin,
+            values,
+        } => {
+            let blocks: Vec<fb::Block128> = values.iter().map(to_block).collect();
+
+            args.kind = fb::FixedShapeKind::Cadence;
+            args.stride = *stride as u64;
+            args.count = *count as u64;
+            args.origin = *origin as u64;
+            args.values = Some(fbb.create_vector(&blocks));
+        }
+        FixedShape::Segments(segments) => {
+            let seg_offsets: Vec<_> = segments
+                .iter()
+                .map(|seg| {
+                    let blocks: Vec<fb::Block128> = seg.values.iter().map(to_block).collect();
+                    let values = fbb.create_vector(&blocks);
+
+                    fb::CadenceSegment::create(
+                        fbb,
+                        &fb::CadenceSegmentArgs {
+                            stride: seg.stride as u64,
+                            count: seg.count as u64,
+                            origin: seg.origin as u64,
+                            values: Some(values),
+                        },
+                    )
+                })
+                .collect();
+
+            args.kind = fb::FixedShapeKind::Segments;
+            args.segments = Some(fbb.create_vector(&seg_offsets));
         }
     }
 
@@ -103,6 +139,37 @@ pub fn deserialize_fixed_column<F: TowerField>(
             FixedShape::Sparse(entries)
         }
         fb::FixedShapeKind::Dense => FixedShape::Dense(read_values(fb_fc.values())?),
+        fb::FixedShapeKind::Cadence => FixedShape::Cadence {
+            stride: usize::try_from(fb_fc.stride())
+                .map_err(|_| wire_err("Cadence stride exceeds usize"))?,
+            count: usize::try_from(fb_fc.count())
+                .map_err(|_| wire_err("Cadence count exceeds usize"))?,
+            origin: usize::try_from(fb_fc.origin())
+                .map_err(|_| wire_err("Cadence origin exceeds usize"))?,
+            values: read_values(fb_fc.values())?,
+        },
+        fb::FixedShapeKind::Segments => {
+            let fb_segs = fb_fc
+                .segments()
+                .ok_or(wire_err("missing segments for Segments fixed column"))?;
+
+            let mut segments = Vec::with_capacity(fb_segs.len());
+            for i in 0..fb_segs.len() {
+                let seg = fb_segs.get(i);
+
+                segments.push(CadenceSegment {
+                    stride: usize::try_from(seg.stride())
+                        .map_err(|_| wire_err("Segments stride exceeds usize"))?,
+                    count: usize::try_from(seg.count())
+                        .map_err(|_| wire_err("Segments count exceeds usize"))?,
+                    origin: usize::try_from(seg.origin())
+                        .map_err(|_| wire_err("Segments origin exceeds usize"))?,
+                    values: read_values(seg.values())?,
+                });
+            }
+
+            FixedShape::Segments(segments)
+        }
         _ => return Err(wire_err("unknown FixedShapeKind")),
     };
 

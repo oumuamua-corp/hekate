@@ -22,40 +22,46 @@ use crate::wire::bundle::DeserializedBundle;
 /// prover and verifier can consume it directly.
 #[derive(Clone)]
 pub struct BundleProgram<F: TowerField> {
-    constraint_ast: ConstraintAst<F>,
+    name: String,
+    num_columns: usize,
+    num_public_inputs: usize,
     column_layout: Vec<ColumnType>,
     virtual_column_layout: Vec<ColumnType>,
-    boundary_constraints: Vec<BoundaryConstraint<F>>,
-    permutation_checks: Vec<(String, PermutationCheckSpec)>,
     virtual_expander: Option<VirtualExpander>,
+    constraint_ast: ConstraintAst<F>,
+    boundary_constraints: Vec<BoundaryConstraint<F>>,
+    fixed_columns: Vec<FixedColumn<F>>,
+    permutation_checks: Vec<(String, PermutationCheckSpec)>,
     chiplet_defs: Vec<ChipletDef<F>>,
     inline_chiplets: Vec<ChipletDef<F>>,
     inline_chiplet_kernels: Vec<InlineKernelHint>,
-    num_columns: usize,
-    num_public_inputs: usize,
-    fixed_columns: Vec<FixedColumn<F>>,
 }
 
 impl<F: TowerField> BundleProgram<F> {
     pub fn from_bundle(bundle: &DeserializedBundle<F>) -> Self {
         Self {
-            constraint_ast: bundle.constraint_ast.clone(),
+            name: bundle.name.clone(),
+            num_columns: bundle.num_columns,
+            num_public_inputs: bundle.num_public_inputs,
             column_layout: bundle.column_layout.clone(),
             virtual_column_layout: bundle.virtual_column_layout.clone(),
-            boundary_constraints: bundle.boundary_constraints.clone(),
-            permutation_checks: bundle.permutation_checks.clone(),
             virtual_expander: bundle.virtual_expander.clone(),
+            constraint_ast: bundle.constraint_ast.clone(),
+            boundary_constraints: bundle.boundary_constraints.clone(),
+            fixed_columns: bundle.fixed_columns.clone(),
+            permutation_checks: bundle.permutation_checks.clone(),
             chiplet_defs: bundle.chiplet_defs.clone(),
             inline_chiplets: bundle.inline_chiplets.clone(),
             inline_chiplet_kernels: bundle.inline_chiplet_kernels.clone(),
-            num_columns: bundle.num_columns,
-            num_public_inputs: bundle.num_public_inputs,
-            fixed_columns: bundle.fixed_columns.clone(),
         }
     }
 }
 
 impl<F: TowerField> Air<F> for BundleProgram<F> {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
     fn num_columns(&self) -> usize {
         self.num_columns
     }

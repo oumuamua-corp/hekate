@@ -18,22 +18,23 @@ use hekate_core::proofs::{
 use hekate_core::trace::ColumnTrace;
 use hekate_core::trace::{ColumnType, Trace, TraceBuilder, TraceColumn};
 use hekate_gadgets::{
-    ArithmeticOpcode, CpuArithColumns, CpuFetchColumns, CpuFetchUnit, CpuIntArithmeticUnit,
-    CpuMemColumns, CpuMemoryUnit, Instruction, IntArithmeticChiplet, IntArithmeticLayout,
-    IntArithmeticOp, MemoryEvent, RamChiplet, RomChiplet, generate_arithmetic_trace,
-    generate_ram_trace, generate_rom_trace,
+    ArithmeticOpcode, CpuArithColumns, CpuFetchColumns, CpuMemColumns, Instruction,
+    IntArithmeticChiplet, IntArithmeticLayout, IntArithmeticOp, MemoryEvent, RamChiplet,
+    RomChiplet, generate_arithmetic_trace, generate_ram_trace, generate_rom_trace,
 };
 use hekate_math::{Bit, Block32, Block128, CanonicalDeserialize, CanonicalSerialize, TowerField};
 use hekate_program::chiplet::ChipletDef;
+use hekate_program::circuit::Circuit;
 use hekate_program::constraint::builder::ConstraintSystem;
 use hekate_program::constraint::{
     BoundaryConstraint, BoundaryTarget, ConstraintAst, ConstraintExpr, ExprId,
 };
 use hekate_program::define_columns;
+use hekate_program::digest::program_id;
 use hekate_program::permutation::{BusKind, PermutationCheckSpec, Source};
 use hekate_program::{Air, FixedColumn, FixedShape, Program, ProgramInstance, ProgramWitness};
 use hekate_sdk::{
-    DeserializedBundle, deserialize_bundle, deserialize_proof, serialize_bundle,
+    BundleProgram, DeserializedBundle, deserialize_bundle, deserialize_proof, serialize_bundle,
     serialize_proof_bytes,
 };
 
@@ -64,11 +65,11 @@ impl Air<F> for FibProgram {
     }
 
     fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
-        vec![BoundaryConstraint::with_public_input(
-            FibColumns::B,
-            self.num_rows - 1,
-            0,
-        )]
+        vec![BoundaryConstraint {
+            col_idx: FibColumns::B,
+            row_idx: self.num_rows - 1,
+            target: BoundaryTarget::PublicInput(0),
+        }]
     }
 
     fn column_layout(&self) -> &[ColumnType] {
@@ -123,6 +124,7 @@ fn fib_trace(num_vars: usize) -> ColumnTrace {
 #[derive(Clone)]
 struct RamProgram {
     ram_num_rows: usize,
+    ram_num_events: usize,
 }
 
 impl Air<F> for RamProgram {
@@ -136,7 +138,7 @@ impl Air<F> for RamProgram {
     }
 
     fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![(RamChiplet::BUS_ID.into(), CpuMemoryUnit::linking_spec())]
+        vec![(RamChiplet::BUS_ID.into(), RamChiplet::cpu_linking_spec())]
     }
 
     fn constraint_ast(&self) -> ConstraintAst<F> {
@@ -150,7 +152,7 @@ impl Air<F> for RamProgram {
 
 impl Program<F> for RamProgram {
     fn chiplet_defs(&self) -> errors::Result<Vec<ChipletDef<F>>> {
-        let ram = RamChiplet::new(self.ram_num_rows);
+        let ram = RamChiplet::new(self.ram_num_rows, self.ram_num_events);
         Ok(vec![ChipletDef::from_air(&ram)?])
     }
 }
@@ -201,6 +203,7 @@ const MC_NUM_CPU_COLS: usize = MC_CPU_MEM + CpuMemColumns::NUM_COLUMNS;
 
 #[derive(Clone)]
 struct ManyChipletsProgram {
+    num_ops: usize,
     rom_num_rows: usize,
     arith_num_rows: usize,
     ram_num_rows: usize,
@@ -223,12 +226,12 @@ impl Air<F> for ManyChipletsProgram {
     }
 
     fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        let cpu_fetch = CpuFetchUnit::linking_spec();
+        let cpu_fetch = RomChiplet::cpu_linking_spec();
 
-        let mut cpu_arith = CpuIntArithmeticUnit::linking_spec();
+        let mut cpu_arith = IntArithmeticChiplet::cpu_linking_spec();
         cpu_arith.shift_column_indices(MC_CPU_ARITH);
 
-        let mut cpu_mem = CpuMemoryUnit::linking_spec();
+        let mut cpu_mem = RamChiplet::cpu_linking_spec();
         cpu_mem.shift_column_indices(MC_CPU_MEM);
 
         vec![
@@ -251,10 +254,10 @@ impl Air<F> for ManyChipletsProgram {
 
 impl Program<F> for ManyChipletsProgram {
     fn chiplet_defs(&self) -> errors::Result<Vec<ChipletDef<F>>> {
-        let rom = RomChiplet::new(self.rom_num_rows);
-        let arith = IntArithmeticChiplet::new(32, self.arith_num_rows)
-            .expect("IntArithmeticChiplet::new(32, arith_num_rows)");
-        let ram = RamChiplet::new(self.ram_num_rows);
+        let rom = RomChiplet::new(self.rom_num_rows, self.num_ops);
+        let arith = IntArithmeticChiplet::new(32, self.arith_num_rows, self.num_ops)
+            .expect("IntArithmeticChiplet::new(32, arith_num_rows, num_ops)");
+        let ram = RamChiplet::new(self.ram_num_rows, self.num_ops);
 
         Ok(vec![
             ChipletDef::from_air(&rom)?,
@@ -750,6 +753,7 @@ fn roundtrip_ram_isolated_chiplet() {
 
     let program = RamProgram {
         ram_num_rows: num_rows,
+        ram_num_events: 4,
     };
 
     let (cpu_trace, ram_trace) = ram_traces(num_rows);
@@ -780,6 +784,7 @@ fn roundtrip_many_chiplets() {
     let ram_rows = 1 << 10;
 
     let program = ManyChipletsProgram {
+        num_ops,
         rom_num_rows: rom_rows,
         arith_num_rows: arith_rows,
         ram_num_rows: ram_rows,
@@ -1171,6 +1176,21 @@ fn fixed_column_sparse_round_trips() {
     assert_eq!(pin_bundle_roundtrip(cols.clone()), cols);
 }
 
+#[test]
+fn fixed_column_cadence_round_trips() {
+    let cols = vec![hekate_program::fix(
+        PinCols::A,
+        FixedShape::Cadence {
+            stride: 3,
+            count: 2,
+            origin: 1,
+            values: vec![wide(1), wide(0), wide(1)],
+        },
+    )];
+
+    assert_eq!(pin_bundle_roundtrip(cols.clone()), cols);
+}
+
 // =================================================================
 // Chiplet boundary (BoundaryTarget::Constant) round-trip
 // =================================================================
@@ -1341,12 +1361,15 @@ impl Air<F> for PairedRtProgram {
         )]
     }
 
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![
+            FixedColumn::sparse(PairedRtCols::S_SEND, vec![(0, F::ONE)]),
+            FixedColumn::sparse(PairedRtCols::S_RECV, vec![(1, F::ONE)]),
+        ]
+    }
+
     fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-
-        cs.assert_paired_bus_mutex(PairedRtCols::S_SEND, PairedRtCols::S_RECV);
-
-        cs.build()
+        ConstraintSystem::<F>::new().build()
     }
 }
 
@@ -1604,4 +1627,51 @@ fn proof_outer_segment_round_trips() {
         );
         assert_eq!(opening.siblings, vec![[9u8; 32], [10u8; 32]]);
     }
+}
+
+/// Every `program_id` input must survive the wire, or
+/// the prover and the verifier bind different transcripts.
+#[test]
+fn program_id_survives_the_wire() {
+    let num_rows = 1 << 10;
+
+    let mut cx = Circuit::<F>::new("DistinctlyNamedProgram", num_rows).unwrap();
+
+    let cpu = cx.schema(&CpuMemColumns::build_layout());
+
+    cx.bus(RamChiplet::BUS_ID, RamChiplet::cpu_linking_spec());
+
+    cx.fix(
+        cpu.at(CpuMemColumns::SELECTOR),
+        FixedShape::Cadence {
+            stride: 1,
+            count: 4,
+            origin: 0,
+            values: vec![F::ONE],
+        },
+    );
+
+    let cs = cx.cs();
+
+    cs.assert_boolean(cs.col(CpuMemColumns::IS_WRITE));
+
+    cx.attach(ChipletDef::from_air(&RamChiplet::new(num_rows, 4)).unwrap());
+    cx.publish(cpu.at(CpuMemColumns::VAL_B0), num_rows - 1);
+
+    let program = cx.compile().unwrap();
+
+    let (trace, ram_trace) = ram_traces(num_rows);
+
+    let instance = ProgramInstance::new(num_rows, vec![F::ZERO]);
+    let witness = ProgramWitness::new(trace).with_chiplets(vec![ram_trace]);
+
+    let bytes = serialize_bundle(&program, &instance, &witness, &Config::default()).unwrap();
+    let restored: DeserializedBundle<F> = deserialize_bundle(&bytes).unwrap();
+    let rebuilt = BundleProgram::from_bundle(&restored);
+
+    assert_eq!(Air::<F>::name(&rebuilt), "DistinctlyNamedProgram");
+    assert_eq!(
+        program_id::<F, _>(&program).unwrap(),
+        program_id::<F, _>(&rebuilt).unwrap()
+    );
 }
