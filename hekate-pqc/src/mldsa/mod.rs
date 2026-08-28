@@ -9,6 +9,7 @@
 
 mod arithmetic;
 mod ctrl;
+mod schedule;
 mod trace;
 mod witness;
 
@@ -17,7 +18,7 @@ pub use witness::{MlDsaPublicKey, MlDsaSignature};
 
 use super::high_bits::HighBitsChiplet;
 use super::norm_check::NormCheckChiplet;
-use super::ntt::NttChiplet;
+use super::ntt::{NttChiplet, NttRun, NttSchedule};
 use super::twiddle_rom::TwiddleRomChiplet;
 use alloc::vec;
 use ctrl::MlDsaCtrlChiplet;
@@ -27,7 +28,8 @@ use hekate_keccak::KeccakChiplet;
 use hekate_math::{Flat, HardwareField, PackableField, TowerField};
 use hekate_program::chiplet::CompositeChiplet;
 use hekate_program::define_columns;
-use hekate_program::permutation::{PermutationCheckSpec, REQUEST_IDX_LABEL, Source};
+use hekate_program::permutation::{BusKind, PermutationCheckSpec, Service, ServiceSlot};
+use schedule::MlDsaCtrlSchedule;
 
 // =================================================================
 // Constants
@@ -44,9 +46,6 @@ pub const N: usize = 256;
 
 /// External bus ID for ML-DSA I/O.
 pub const MLDSA_DATA_BUS_ID: &str = "ml_dsa_data";
-
-/// Bus ID for Keccak input binding.
-const KEC_INPUT_BIND_BUS_ID: &str = "kec_input_bind";
 
 // =================================================================
 // Level Parameters
@@ -169,6 +168,7 @@ impl MlDsaLevel {
 pub(crate) struct MlDsaParams {
     pub ctrl_rows: usize,
     pub keccak_rows: usize,
+    pub keccak_blocks: usize,
     pub ntt_rows: usize,
     pub twiddle_rows: usize,
     pub norm_rows: usize,
@@ -177,39 +177,41 @@ pub(crate) struct MlDsaParams {
 }
 
 impl MlDsaParams {
-    /// Sizes validated against the FIPS 204 KAT vectors.
-    pub(crate) fn for_level(level: MlDsaLevel) -> Self {
-        match level.k() {
-            8 => Self {
-                ctrl_rows: 1 << 17,
-                keccak_rows: 1 << 14,
-                ntt_rows: 1 << 17,
-                twiddle_rows: 1 << 17,
-                norm_rows: 1 << 12,
-                highbits_rows: 1 << 12,
-                ram_rows: 1 << 17,
-            },
-            _ => Self {
-                ctrl_rows: 1 << 16,
-                keccak_rows: 1 << 13,
-                ntt_rows: 1 << 16,
-                twiddle_rows: 1 << 16,
-                norm_rows: 1 << 11,
-                highbits_rows: 1 << 11,
-                ram_rows: 1 << 16,
-            },
+    /// Shifts are the FIPS 204 KAT-validated floors; ctrl and
+    /// Keccak are raised above theirs to fit the message hash.
+    pub(crate) fn for_level(level: MlDsaLevel, schedule: &MlDsaCtrlSchedule) -> Self {
+        let (table_shift, keccak_shift, aux_shift) = match level.k() {
+            8 => (17, 14, 12),
+            _ => (16, 13, 11),
+        };
+
+        let keccak_blocks = schedule.keccak_calls();
+
+        Self {
+            ctrl_rows: (schedule.active_rows() + 1)
+                .next_power_of_two()
+                .max(1 << table_shift),
+            keccak_rows: (keccak_blocks * KeccakChiplet::BLOCK_ROWS)
+                .next_power_of_two()
+                .max(1 << keccak_shift),
+            keccak_blocks,
+            ntt_rows: 1 << table_shift,
+            twiddle_rows: 1 << table_shift,
+            norm_rows: 1 << aux_shift,
+            highbits_rows: 1 << aux_shift,
+            ram_rows: 1 << table_shift,
         }
     }
 }
 
 /// ML-DSA Chiplet.
 ///
-/// Composite wrapping the full
-/// ML-DSA verification pipeline.
+/// Composite wrapping the full ML-DSA verification pipeline.
 #[derive(Clone)]
 pub struct MlDsaChiplet<F: TraceCompatibleField> {
     composite: CompositeChiplet<F>,
     level: MlDsaLevel,
+    msg_len: usize,
     params: MlDsaParams,
 }
 
@@ -219,17 +221,29 @@ where
     <F as PackableField>::Packed: Copy + Send + Sync,
     Flat<F>: Send + Sync,
 {
-    pub fn new(level: MlDsaLevel) -> Self {
-        let params = MlDsaParams::for_level(level);
+    pub fn new(level: MlDsaLevel, msg_len: usize) -> Self {
+        let ctrl_schedule = MlDsaCtrlSchedule::for_level(level, msg_len);
+        let params = MlDsaParams::for_level(level, &ctrl_schedule);
 
-        let ctrl = MlDsaCtrlChiplet::new(params.ctrl_rows);
-        let keccak = KeccakChiplet::new(params.keccak_rows);
-        let ntt = NttChiplet::new(MLDSA_Q, params.ntt_rows);
-        let twiddle = TwiddleRomChiplet::new(MLDSA_Q, params.twiddle_rows);
-        let norm = NormCheckChiplet::new(MLDSA_Q, level.z_bound(), params.norm_rows);
-        let highbits =
-            HighBitsChiplet::new(MLDSA_Q, level.highbits_divisor(), params.highbits_rows);
-        let ram = RamChiplet::new(params.ram_rows);
+        let ntt_schedule = ml_dsa_ntt_schedule(level.k, level.l);
+
+        let norm = NormCheckChiplet::new(
+            MLDSA_Q,
+            level.z_bound(),
+            params.norm_rows,
+            ctrl_schedule.norm_check_ops(),
+        );
+        let highbits = HighBitsChiplet::new(
+            MLDSA_Q,
+            level.highbits_divisor(),
+            params.highbits_rows,
+            ctrl_schedule.highbits_ops(),
+        );
+        let ram = RamChiplet::new(params.ram_rows, ctrl_schedule.ram_events());
+        let ctrl = MlDsaCtrlChiplet::new(params.ctrl_rows, ctrl_schedule);
+        let keccak = KeccakChiplet::new(params.keccak_rows, params.keccak_blocks);
+        let ntt = NttChiplet::new(MLDSA_Q, params.ntt_rows, ntt_schedule.clone());
+        let twiddle = TwiddleRomChiplet::new(MLDSA_Q, params.twiddle_rows, ntt_schedule);
 
         let composite = CompositeChiplet::<F>::builder("mldsa")
             .chiplet(ctrl)
@@ -246,6 +260,7 @@ where
         Self {
             composite,
             level,
+            msg_len,
             params,
         }
     }
@@ -256,6 +271,10 @@ where
 
     pub fn level(&self) -> MlDsaLevel {
         self.level
+    }
+
+    pub fn msg_len(&self) -> usize {
+        self.msg_len
     }
 }
 
@@ -270,29 +289,25 @@ define_columns! {
     }
 }
 
-/// CPU-side unit for ML-DSA chiplet.
-///
-/// Main trace connects to the ML-DSA
-/// composite's "ml_dsa_data" external bus.
-pub struct CpuMlDsaUnit;
-
-impl CpuMlDsaUnit {
-    pub fn num_columns() -> usize {
-        CpuMlDsaColumns::NUM_COLUMNS
+/// Both endpoints derive from this schema:
+/// one commitment word and the request-index clock.
+pub fn data_service() -> Service {
+    Service {
+        bus_id: MLDSA_DATA_BUS_ID,
+        kind: BusKind::Permutation,
+        slots: vec![
+            ServiceSlot::Value(b"kappa_mldsa_d0"),
+            ServiceSlot::RequestIdx { num_bytes: 4 },
+        ],
+        clock_waiver: None,
     }
+}
 
-    pub fn linking_spec() -> PermutationCheckSpec {
-        PermutationCheckSpec::new(
-            vec![
-                (
-                    Source::Column(CpuMlDsaColumns::DATA),
-                    b"kappa_mldsa_d0" as &[u8],
-                ),
-                (Source::RowIndexLeBytes(4), REQUEST_IDX_LABEL),
-            ],
-            Some(CpuMlDsaColumns::SELECTOR),
-        )
-    }
+/// Requester endpoint over `CpuMlDsaColumns`.
+pub fn cpu_data_spec() -> PermutationCheckSpec {
+    data_service()
+        .request(&[CpuMlDsaColumns::DATA], CpuMlDsaColumns::SELECTOR)
+        .expect("data_service slots match the requester columns")
 }
 
 // =================================================================
@@ -332,4 +347,20 @@ pub(crate) enum Phase {
     /// Norm check:
     /// ‖z‖_∞ < γ₁ - β.
     NormCheck = 7,
+}
+
+fn ml_dsa_ntt_schedule(k: usize, l: usize) -> NttSchedule {
+    let mut runs = vec![
+        NttRun::Forward { instances: l + 2 },
+        NttRun::Pointwise { calls: l + 1 },
+    ];
+
+    for _ in 0..k - 1 {
+        runs.push(NttRun::Forward { instances: 1 });
+        runs.push(NttRun::Pointwise { calls: l + 1 });
+    }
+
+    runs.push(NttRun::Inverse { instances: k });
+
+    NttSchedule::new(8, runs)
 }

@@ -130,12 +130,10 @@ where
     <F as PackableField>::Packed: Copy + Send + Sync,
     Flat<F>: Send + Sync,
 {
-    /// Generate chiplet traces for
-    /// ML-KEM decapsulation.
+    /// Generate chiplet traces for ML-KEM decapsulation.
     ///
-    /// Runs the full decapsulation pipeline
-    /// internally and produces all sub-chiplet
-    /// traces in composite order.
+    /// Runs the full decapsulation pipeline internally and
+    /// produces all sub-chiplet traces in composite order.
     ///
     /// Returns `(traces, shared_secret)`.
     pub fn generate_traces(
@@ -143,6 +141,13 @@ where
         ct: &[u8],
         sk: &[u8],
     ) -> errors::Result<(Vec<ColumnTrace>, [u8; 32])> {
+        if ct.len() != self.level.ct_bytes() {
+            return Err(errors::Error::Protocol {
+                protocol: "mlkem",
+                message: "ciphertext length does not match the level",
+            });
+        }
+
         let dk = MlKemDecapsKey::from_nist_bytes(self.level, sk);
         let (result, ntt_ops) = ml_kem_decaps_traced(&dk, ct);
         let traces = self.generate_traces_inner(&result, &ntt_ops, ct)?;

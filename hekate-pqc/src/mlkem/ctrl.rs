@@ -5,9 +5,11 @@
 //! ML-KEM Control Chiplet
 
 use crate::basemul::BasemulChiplet;
+use crate::mlkem::schedule::MlKemCtrlSchedule;
 use crate::mlkem::{KEC_INPUT_BIND_BUS_ID, MLKEM_DATA_BUS_ID, MLKEM_SS_BUS_ID};
 use crate::ntt::NttChiplet;
 use crate::twiddle_rom;
+
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec;
@@ -20,7 +22,7 @@ use hekate_math::TowerField;
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
 use hekate_program::permutation::{PermutationCheckSpec, REQUEST_IDX_LABEL, Source};
-use hekate_program::{Air, define_columns};
+use hekate_program::{Air, FixedColumn, define_columns, fix};
 
 define_columns! {
     pub MlKemCtrlColumns {
@@ -235,31 +237,32 @@ define_columns! {
 pub struct MlKemCtrlChiplet {
     #[allow(dead_code)]
     pub num_rows: usize,
+
+    schedule: MlKemCtrlSchedule,
 }
 
 impl MlKemCtrlChiplet {
-    pub fn new(num_rows: usize) -> Self {
+    pub(crate) fn new(num_rows: usize, schedule: MlKemCtrlSchedule) -> Self {
         assert!(num_rows.is_power_of_two());
-        Self { num_rows }
+        assert!(
+            schedule.active_rows() < num_rows,
+            "ML-KEM ctrl schedule exceeds num_rows"
+        );
+
+        Self { num_rows, schedule }
     }
 
     /// Linking spec for the external
     /// "ml_kem_data" bus. This is what
     /// the main trace connects to.
     pub fn main_linking_spec() -> PermutationCheckSpec {
-        PermutationCheckSpec::new(
-            vec![
-                (
-                    Source::Column(MlKemCtrlColumns::IO_DATA),
-                    b"kappa_mlkem_d0" as &[u8],
-                ),
-                (
-                    Source::Column(MlKemCtrlColumns::REQUEST_IDX_OUT),
-                    REQUEST_IDX_LABEL,
-                ),
-            ],
-            Some(MlKemCtrlColumns::IO_SELECTOR),
-        )
+        crate::mlkem::data_service()
+            .respond(
+                &[MlKemCtrlColumns::IO_DATA],
+                &[MlKemCtrlColumns::REQUEST_IDX_OUT],
+                MlKemCtrlColumns::IO_SELECTOR,
+            )
+            .expect("data_service slots match the responder columns")
     }
 
     /// Linking spec for the
@@ -404,20 +407,15 @@ impl MlKemCtrlChiplet {
     /// Matches twiddle ROM's
     /// w_binding_linking_spec.
     pub fn w_binding_linking_spec() -> PermutationCheckSpec {
-        PermutationCheckSpec::new(
-            vec![
-                (
-                    Source::Column(MlKemCtrlColumns::W_BIND_BFLY_IDX),
-                    b"kappa_wb_bfly" as &[u8],
-                ),
-                (
-                    Source::Column(MlKemCtrlColumns::RAM_VAL_PACKED),
-                    b"kappa_wb_w" as &[u8],
-                ),
-                (Source::RowIndexLeBytes(4), REQUEST_IDX_LABEL),
-            ],
-            Some(MlKemCtrlColumns::W_BIND_SELECTOR),
-        )
+        twiddle_rom::TwiddleRomChiplet::w_binding_service()
+            .request(
+                &[
+                    MlKemCtrlColumns::W_BIND_BFLY_IDX,
+                    MlKemCtrlColumns::RAM_VAL_PACKED,
+                ],
+                MlKemCtrlColumns::W_BIND_SELECTOR,
+            )
+            .expect("service slots match the requester columns")
     }
 
     /// NTT boundary input linking spec.
@@ -520,47 +518,18 @@ impl MlKemCtrlChiplet {
 
     /// Shared secret output bus spec.
     pub fn ss_linking_spec() -> PermutationCheckSpec {
-        PermutationCheckSpec::new(
-            vec![
-                (
-                    Source::Column(MlKemCtrlColumns::SS_LO),
-                    b"kappa_ss_lo0" as &[u8],
-                ),
-                (
-                    Source::Column(MlKemCtrlColumns::SS_LO + 1),
-                    b"kappa_ss_lo1" as &[u8],
-                ),
-                (
-                    Source::Column(MlKemCtrlColumns::SS_LO + 2),
-                    b"kappa_ss_lo2" as &[u8],
-                ),
-                (
-                    Source::Column(MlKemCtrlColumns::SS_LO + 3),
-                    b"kappa_ss_lo3" as &[u8],
-                ),
-                (
-                    Source::Column(MlKemCtrlColumns::SS_HI),
-                    b"kappa_ss_hi0" as &[u8],
-                ),
-                (
-                    Source::Column(MlKemCtrlColumns::SS_HI + 1),
-                    b"kappa_ss_hi1" as &[u8],
-                ),
-                (
-                    Source::Column(MlKemCtrlColumns::SS_HI + 2),
-                    b"kappa_ss_hi2" as &[u8],
-                ),
-                (
-                    Source::Column(MlKemCtrlColumns::SS_HI + 3),
-                    b"kappa_ss_hi3" as &[u8],
-                ),
-                (
-                    Source::Column(MlKemCtrlColumns::REQUEST_IDX_OUT),
-                    REQUEST_IDX_LABEL,
-                ),
-            ],
-            Some(MlKemCtrlColumns::SS_OUT_SEL),
-        )
+        let values: Vec<usize> = (0..4)
+            .map(|i| MlKemCtrlColumns::SS_LO + i)
+            .chain((0..4).map(|i| MlKemCtrlColumns::SS_HI + i))
+            .collect();
+
+        crate::mlkem::ss_service()
+            .respond(
+                &values,
+                &[MlKemCtrlColumns::REQUEST_IDX_OUT],
+                MlKemCtrlColumns::SS_OUT_SEL,
+            )
+            .expect("ss_service slots match the responder columns")
     }
 }
 
@@ -601,6 +570,28 @@ impl<F: TowerField> Air<F> for MlKemCtrlChiplet {
             (KEC_INPUT_BIND_BUS_ID.into(), Self::kec_input_ref_spec()),
             (KEC_INPUT_BIND_BUS_ID.into(), Self::kec_input_bind_spec()),
             (MLKEM_SS_BUS_ID.into(), Self::ss_linking_spec()),
+        ]
+    }
+
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        if self.schedule.is_empty() {
+            return Vec::new();
+        }
+
+        let shapes = self.schedule.fixed_shapes::<F>();
+
+        vec![
+            fix(MlKemCtrlColumns::IO_SELECTOR, shapes.io),
+            fix(MlKemCtrlColumns::KECCAK_SELECTOR, shapes.keccak),
+            fix(MlKemCtrlColumns::KEC_INPUT_REF_SEL, shapes.kec_input_ref),
+            fix(MlKemCtrlColumns::KEC_BIND_LO_SEL, shapes.kec_bind_lo),
+            fix(MlKemCtrlColumns::BM_SELECTOR, shapes.basemul),
+            fix(MlKemCtrlColumns::NTT_SELECTOR, shapes.ntt),
+            fix(MlKemCtrlColumns::W_BIND_SELECTOR, shapes.w_bind),
+            fix(MlKemCtrlColumns::RAM_SELECTOR, shapes.ram),
+            fix(MlKemCtrlColumns::BOUND_IN_SEL, shapes.bound_in),
+            fix(MlKemCtrlColumns::BOUND_OUT_SEL, shapes.bound_out),
+            fix(MlKemCtrlColumns::SS_OUT_SEL, shapes.ss_out),
         ]
     }
 
@@ -1458,7 +1449,7 @@ mod tests {
 
     #[test]
     fn ctrl_chiplet_declares_all_buses() {
-        let ctrl = MlKemCtrlChiplet::new(16);
+        let ctrl = MlKemCtrlChiplet::new(16, MlKemCtrlSchedule::empty());
         let checks: Vec<(String, PermutationCheckSpec)> =
             <MlKemCtrlChiplet as Air<F>>::permutation_checks(&ctrl);
 
@@ -1486,7 +1477,7 @@ mod tests {
         //   eq->diff=0 (2), !eq->diff*inv=1 (2),
         //   ct_match=eq_lo*eq_hi (1)
         // = 7 reverse constraints
-        let ctrl = MlKemCtrlChiplet::new(16);
+        let ctrl = MlKemCtrlChiplet::new(16, MlKemCtrlSchedule::empty());
         let ast = Air::<F>::constraint_ast(&ctrl);
 
         // Pre-patch: ~25 constraints.
@@ -1500,11 +1491,10 @@ mod tests {
 
     #[test]
     fn keccak_bus_labels_match_ctrl_and_chiplet() {
-        let ctrl = MlKemCtrlChiplet::new(16);
+        let ctrl = MlKemCtrlChiplet::new(16, MlKemCtrlSchedule::empty());
         let ctrl_checks: Vec<(String, PermutationCheckSpec)> =
             <MlKemCtrlChiplet as Air<F>>::permutation_checks(&ctrl);
 
-        let keccak = KeccakChiplet::new(32);
         let keccak_spec = KeccakChiplet::linking_spec();
 
         // Find the ctrl's keccak bus
@@ -1523,17 +1513,15 @@ mod tests {
         for (c, k) in ctrl_keccak.1.sources.iter().zip(keccak_spec.sources.iter()) {
             assert_eq!(c.1, k.1, "keccak challenge label mismatch");
         }
-
-        let _ = keccak;
     }
 
     #[test]
     fn ntt_bus_labels_match_ctrl_and_chiplet() {
-        let ctrl = MlKemCtrlChiplet::new(16);
+        let ctrl = MlKemCtrlChiplet::new(16, MlKemCtrlSchedule::empty());
         let ctrl_checks: Vec<(String, PermutationCheckSpec)> =
             <MlKemCtrlChiplet as Air<F>>::permutation_checks(&ctrl);
 
-        let ntt = NttChiplet::new(MLKEM_Q, 16);
+        let ntt = NttChiplet::new(MLKEM_Q, 16, crate::ntt::NttSchedule::empty());
         let ntt_spec = ntt.data_linking_spec();
 
         let ctrl_ntt = ctrl_checks

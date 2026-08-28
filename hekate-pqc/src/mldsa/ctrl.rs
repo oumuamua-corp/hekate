@@ -2,9 +2,13 @@
 // SPDX-FileCopyrightText: 2026 Oumuamua Labs <info@oumuamua.dev>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use crate::mldsa::{KEC_INPUT_BIND_BUS_ID, MLDSA_DATA_BUS_ID};
+use crate::high_bits::HighBitsChiplet;
+use crate::mldsa::MLDSA_DATA_BUS_ID;
+use crate::mldsa::schedule::MlDsaCtrlSchedule;
+use crate::norm_check::NormCheckChiplet;
 use crate::ntt::NttChiplet;
 use crate::twiddle_rom;
+
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec;
@@ -17,7 +21,7 @@ use hekate_math::TowerField;
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
 use hekate_program::permutation::{PermutationCheckSpec, REQUEST_IDX_LABEL, Source};
-use hekate_program::{Air, define_columns};
+use hekate_program::{Air, FixedColumn, define_columns, fix};
 
 // =================================================================
 // ML-DSA Control Chiplet
@@ -28,9 +32,6 @@ define_columns! {
         // I/O column for main trace bus.
         IO_DATA: B32,
         IO_SELECTOR: Bit,
-
-        // SHA3 padding sub-selector.
-        PAD_SEL: Bit,
 
         // Keccak dispatch columns.
         KECCAK_LANES: [B64; 25],
@@ -71,23 +72,6 @@ define_columns! {
         BOUND_IN_SEL: Bit,
         BOUND_OUT_SEL: Bit,
 
-        // Keccak input binding columns.
-        KEC_LANE_ONE_HOT: [Bit; 21],
-        KEC_LANE_DELTA: B64,
-        KEC_LANE_IDX: B32,
-        KEC_INPUT_REF_SEL: Bit,
-        KEC_BIND_LO_SEL: Bit,
-        KEC_BIND_HI_SEL: Bit,
-
-        // Raw-byte IO → Keccak binding.
-        IO_LANE_LO: B32,
-        IO_LANE_HI: B32,
-        IO_LANE_BIND_SEL: Bit,
-        H_INPUT_SEL: Bit,
-
-        // Sticky H(pk) input active marker.
-        H_PK_ACTIVE: Bit,
-
         // NormCheck dispatch columns.
         NC_VALUE: B32,
         NC_IDX: B32,
@@ -119,7 +103,6 @@ define_columns! {
         // c̃ reference from signature bytes.
         // Carried sticky to CMP row.
         CTILDE_REF: [B64; 4],
-        CTILDE_REF_BIND_SEL: Bit,
 
         // Hash comparison:
         // c̃ (CTILDE_REF) vs c̃' (RATE_REG).
@@ -158,12 +141,19 @@ define_columns! {
 pub struct MlDsaCtrlChiplet {
     #[allow(dead_code)]
     pub num_rows: usize,
+
+    schedule: MlDsaCtrlSchedule,
 }
 
 impl MlDsaCtrlChiplet {
-    pub fn new(num_rows: usize) -> Self {
+    pub(crate) fn new(num_rows: usize, schedule: MlDsaCtrlSchedule) -> Self {
         assert!(num_rows.is_power_of_two());
-        Self { num_rows }
+        assert!(
+            schedule.active_rows() < num_rows,
+            "ML-DSA ctrl schedule exceeds num_rows"
+        );
+
+        Self { num_rows, schedule }
     }
 
     // =============================================================
@@ -172,19 +162,13 @@ impl MlDsaCtrlChiplet {
 
     /// External "ml_dsa_data" bus.
     pub fn main_linking_spec() -> PermutationCheckSpec {
-        PermutationCheckSpec::new(
-            vec![
-                (
-                    Source::Column(MlDsaCtrlColumns::IO_DATA),
-                    b"kappa_mldsa_d0" as &[u8],
-                ),
-                (
-                    Source::Column(MlDsaCtrlColumns::REQUEST_IDX_OUT),
-                    REQUEST_IDX_LABEL,
-                ),
-            ],
-            Some(MlDsaCtrlColumns::IO_SELECTOR),
-        )
+        crate::mldsa::data_service()
+            .respond(
+                &[MlDsaCtrlColumns::IO_DATA],
+                &[MlDsaCtrlColumns::REQUEST_IDX_OUT],
+                MlDsaCtrlColumns::IO_SELECTOR,
+            )
+            .expect("data_service slots match the responder columns")
     }
 
     /// Internal "keccak_link" bus.
@@ -297,20 +281,15 @@ impl MlDsaCtrlChiplet {
 
     /// W-side binding bus.
     pub fn w_binding_linking_spec() -> PermutationCheckSpec {
-        PermutationCheckSpec::new(
-            vec![
-                (
-                    Source::Column(MlDsaCtrlColumns::W_BIND_BFLY_IDX),
-                    b"kappa_wb_bfly" as &[u8],
-                ),
-                (
-                    Source::Column(MlDsaCtrlColumns::RAM_VAL_PACKED),
-                    b"kappa_wb_w" as &[u8],
-                ),
-                (Source::RowIndexLeBytes(4), REQUEST_IDX_LABEL),
-            ],
-            Some(MlDsaCtrlColumns::W_BIND_SELECTOR),
-        )
+        twiddle_rom::TwiddleRomChiplet::w_binding_service()
+            .request(
+                &[
+                    MlDsaCtrlColumns::W_BIND_BFLY_IDX,
+                    MlDsaCtrlColumns::RAM_VAL_PACKED,
+                ],
+                MlDsaCtrlColumns::W_BIND_SELECTOR,
+            )
+            .expect("service slots match the requester columns")
     }
 
     /// NTT boundary input bus.
@@ -363,104 +342,31 @@ impl MlDsaCtrlChiplet {
         )
     }
 
-    /// Keccak input ref (consume side).
-    fn kec_input_ref_spec() -> PermutationCheckSpec {
-        PermutationCheckSpec::new(
-            vec![
-                (
-                    Source::Column(MlDsaCtrlColumns::KEC_LANE_DELTA),
-                    b"kappa_kib_delta" as &[u8],
-                ),
-                (
-                    Source::Column(MlDsaCtrlColumns::KEC_LANE_IDX),
-                    b"kappa_kib_idx" as &[u8],
-                ),
-            ],
-            Some(MlDsaCtrlColumns::KEC_INPUT_REF_SEL),
-        )
-        .with_clock_waiver(
-            "see pqc/mldsa/ctrl.rs: KEC_LANE_IDX is positional; paired with \
-             kec_input_bind_spec on the produce side",
-        )
-    }
-
-    /// Keccak input bind (produce side).
-    fn kec_input_bind_spec() -> PermutationCheckSpec {
-        PermutationCheckSpec::new(
-            vec![
-                (
-                    Source::Column(MlDsaCtrlColumns::KEC_LANE_DELTA),
-                    b"kappa_kib_delta" as &[u8],
-                ),
-                (
-                    Source::Column(MlDsaCtrlColumns::KEC_LANE_IDX),
-                    b"kappa_kib_idx" as &[u8],
-                ),
-            ],
-            Some(MlDsaCtrlColumns::KEC_BIND_LO_SEL),
-        )
-        .with_clock_waiver(
-            "see pqc/mldsa/ctrl.rs: KEC_LANE_IDX is positional; paired with \
-             kec_input_ref_spec on the consume side",
-        )
-    }
-
     /// NormCheck dispatch bus.
     fn norm_check_linking_spec() -> PermutationCheckSpec {
-        PermutationCheckSpec::new(
-            vec![
-                (
-                    Source::Column(MlDsaCtrlColumns::NC_VALUE),
-                    b"kappa_nc_value" as &[u8],
-                ),
-                (
-                    Source::Column(MlDsaCtrlColumns::NC_IDX),
-                    b"kappa_nc_idx" as &[u8],
-                ),
-            ],
-            Some(MlDsaCtrlColumns::NC_SELECTOR),
-        )
-        .with_clock_waiver(
-            "see pqc/mldsa/ctrl.rs: paired with NormCheckChiplet::linking_spec; NC_IDX \
-             is positional, AIR-forced unique per active row",
-        )
+        NormCheckChiplet::service()
+            .request(
+                &[MlDsaCtrlColumns::NC_VALUE, MlDsaCtrlColumns::NC_IDX],
+                MlDsaCtrlColumns::NC_SELECTOR,
+            )
+            .expect("service slots match the requester columns")
     }
 
     /// HighBits dispatch bus.
     fn highbits_linking_spec() -> PermutationCheckSpec {
-        PermutationCheckSpec::new(
-            vec![
-                (
-                    Source::Column(MlDsaCtrlColumns::HB_R),
-                    b"kappa_hb_r" as &[u8],
-                ),
-                (
-                    Source::Column(MlDsaCtrlColumns::HB_R1),
-                    b"kappa_hb_r1" as &[u8],
-                ),
-                (
-                    Source::Column(MlDsaCtrlColumns::HB_R0),
-                    b"kappa_hb_r0" as &[u8],
-                ),
-                (
-                    Source::Column(MlDsaCtrlColumns::HB_IDX),
-                    b"kappa_hb_idx" as &[u8],
-                ),
-                (
-                    Source::Column(MlDsaCtrlColumns::HB_H_BIT),
-                    b"kappa_hb_h" as &[u8],
-                ),
-                (
-                    Source::Column(MlDsaCtrlColumns::HB_W1_PRIME),
-                    b"kappa_hb_w1" as &[u8],
-                ),
-            ],
-            Some(MlDsaCtrlColumns::HB_SELECTOR),
-        )
-        .with_clock_waiver(
-            "see pqc/mldsa/ctrl.rs: paired with HighBitsChiplet::linking_spec; HB_IDX \
-             is positional, AIR-forced unique per active row",
-        )
+        HighBitsChiplet::service()
+            .request(
+                &[
+                    MlDsaCtrlColumns::HB_R,
+                    MlDsaCtrlColumns::HB_R1,
+                    MlDsaCtrlColumns::HB_R0,
+                    MlDsaCtrlColumns::HB_IDX,
+                    MlDsaCtrlColumns::HB_H_BIT,
+                    MlDsaCtrlColumns::HB_W1_PRIME,
+                ],
+                MlDsaCtrlColumns::HB_SELECTOR,
+            )
+            .expect("service slots match the requester columns")
     }
 }
 
@@ -500,10 +406,28 @@ impl<F: TowerField> Air<F> for MlDsaCtrlChiplet {
                 NttChiplet::BOUND_OUT_BUS_ID.into(),
                 Self::bound_out_linking_spec(),
             ),
-            (KEC_INPUT_BIND_BUS_ID.into(), Self::kec_input_ref_spec()),
-            (KEC_INPUT_BIND_BUS_ID.into(), Self::kec_input_bind_spec()),
             ("norm_check".into(), Self::norm_check_linking_spec()),
             ("highbits".into(), Self::highbits_linking_spec()),
+        ]
+    }
+
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        if self.schedule.is_empty() {
+            return Vec::new();
+        }
+
+        let shapes = self.schedule.fixed_shapes::<F>();
+
+        vec![
+            fix(MlDsaCtrlColumns::IO_SELECTOR, shapes.io),
+            fix(MlDsaCtrlColumns::KECCAK_SELECTOR, shapes.keccak),
+            fix(MlDsaCtrlColumns::NTT_SELECTOR, shapes.ntt),
+            fix(MlDsaCtrlColumns::W_BIND_SELECTOR, shapes.w_bind),
+            fix(MlDsaCtrlColumns::RAM_SELECTOR, shapes.ram),
+            fix(MlDsaCtrlColumns::BOUND_IN_SEL, shapes.bound_in),
+            fix(MlDsaCtrlColumns::BOUND_OUT_SEL, shapes.bound_out),
+            fix(MlDsaCtrlColumns::NC_SELECTOR, shapes.norm_check),
+            fix(MlDsaCtrlColumns::HB_SELECTOR, shapes.highbits),
         ]
     }
 
@@ -518,7 +442,6 @@ impl<F: TowerField> Air<F> for MlDsaCtrlChiplet {
 
         cs.assert_boolean(s_active);
         cs.assert_boolean(cs.col(MlDsaCtrlColumns::IO_SELECTOR));
-        cs.assert_boolean(cs.col(MlDsaCtrlColumns::PAD_SEL));
         cs.assert_boolean(cs.col(MlDsaCtrlColumns::KECCAK_SELECTOR));
         cs.assert_boolean(cs.col(MlDsaCtrlColumns::KEC_IS_OUTPUT));
         cs.assert_boolean(cs.col(MlDsaCtrlColumns::SPONGE_INIT));
@@ -529,12 +452,6 @@ impl<F: TowerField> Air<F> for MlDsaCtrlChiplet {
         cs.assert_boolean(cs.col(MlDsaCtrlColumns::W_BIND_SELECTOR));
         cs.assert_boolean(cs.col(MlDsaCtrlColumns::BOUND_IN_SEL));
         cs.assert_boolean(cs.col(MlDsaCtrlColumns::BOUND_OUT_SEL));
-        cs.assert_boolean(cs.col(MlDsaCtrlColumns::KEC_INPUT_REF_SEL));
-        cs.assert_boolean(cs.col(MlDsaCtrlColumns::KEC_BIND_LO_SEL));
-        cs.assert_boolean(cs.col(MlDsaCtrlColumns::KEC_BIND_HI_SEL));
-        cs.assert_boolean(cs.col(MlDsaCtrlColumns::IO_LANE_BIND_SEL));
-        cs.assert_boolean(cs.col(MlDsaCtrlColumns::H_INPUT_SEL));
-        cs.assert_boolean(cs.col(MlDsaCtrlColumns::H_PK_ACTIVE));
         cs.assert_boolean(cs.col(MlDsaCtrlColumns::NC_SELECTOR));
         cs.assert_boolean(cs.col(MlDsaCtrlColumns::HB_H_BIT));
         cs.assert_boolean(cs.col(MlDsaCtrlColumns::HB_R0_NONZERO));
@@ -546,7 +463,6 @@ impl<F: TowerField> Air<F> for MlDsaCtrlChiplet {
         cs.assert_boolean(cs.col(MlDsaCtrlColumns::MU_BIND_SEEN));
         cs.assert_boolean(cs.col(MlDsaCtrlColumns::CTILDE_PRIME_BIND_SEEN));
         cs.assert_boolean(cs.col(MlDsaCtrlColumns::CTILDE_REF_BIND_SEEN));
-        cs.assert_boolean(cs.col(MlDsaCtrlColumns::CTILDE_REF_BIND_SEL));
         cs.assert_boolean(cs.col(MlDsaCtrlColumns::CMP_SELECTOR));
         cs.assert_boolean(cs.col(MlDsaCtrlColumns::HASH_EQ_LO));
         cs.assert_boolean(cs.col(MlDsaCtrlColumns::HASH_EQ_HI));
@@ -569,11 +485,6 @@ impl<F: TowerField> Air<F> for MlDsaCtrlChiplet {
         cs.assert_boolean(ph_hint);
         cs.assert_boolean(ph_hash_cmp);
         cs.assert_boolean(ph_norm);
-
-        // KEC_LANE_ONE_HOT booleanity
-        for i in 0..21 {
-            cs.assert_boolean(cs.col(MlDsaCtrlColumns::KEC_LANE_ONE_HOT + i));
-        }
 
         let one = cs.constant(F::ONE);
         let not_active = one + s_active;
@@ -749,7 +660,6 @@ impl<F: TowerField> Air<F> for MlDsaCtrlChiplet {
 
         let ghost_sels = [
             MlDsaCtrlColumns::IO_SELECTOR,
-            MlDsaCtrlColumns::PAD_SEL,
             MlDsaCtrlColumns::KECCAK_SELECTOR,
             MlDsaCtrlColumns::NTT_SELECTOR,
             MlDsaCtrlColumns::RAM_SELECTOR,
@@ -759,15 +669,9 @@ impl<F: TowerField> Air<F> for MlDsaCtrlChiplet {
             MlDsaCtrlColumns::W_BIND_SELECTOR,
             MlDsaCtrlColumns::BOUND_IN_SEL,
             MlDsaCtrlColumns::BOUND_OUT_SEL,
-            MlDsaCtrlColumns::KEC_INPUT_REF_SEL,
-            MlDsaCtrlColumns::KEC_BIND_LO_SEL,
-            MlDsaCtrlColumns::KEC_BIND_HI_SEL,
-            MlDsaCtrlColumns::IO_LANE_BIND_SEL,
-            MlDsaCtrlColumns::H_INPUT_SEL,
             MlDsaCtrlColumns::TR_BIND_SEL,
             MlDsaCtrlColumns::MU_BIND_SEL,
             MlDsaCtrlColumns::CTILDE_PRIME_BIND_SEL,
-            MlDsaCtrlColumns::CTILDE_REF_BIND_SEL,
         ];
 
         for &sel in &ghost_sels {
@@ -897,10 +801,7 @@ impl<F: TowerField> Air<F> for MlDsaCtrlChiplet {
         // IO / hash comparison binding
         // =========================================================
 
-        let pad_sel = cs.col(MlDsaCtrlColumns::PAD_SEL);
-
         cs.constrain(io_sel * (cs.col(MlDsaCtrlColumns::IO_DATA) + ram_val_packed));
-        cs.constrain(io_sel * pad_sel);
 
         // c̃ == c̃' hard equality on CMP row.
         // CTILDE_REF (c̃ from signature)
@@ -1051,7 +952,7 @@ mod tests {
 
     #[test]
     fn keccak_bus_labels_match_ctrl_and_chiplet() {
-        let ctrl = MlDsaCtrlChiplet::new(16);
+        let ctrl = MlDsaCtrlChiplet::new(16, MlDsaCtrlSchedule::empty());
         let ctrl_checks: Vec<(String, PermutationCheckSpec)> =
             <MlDsaCtrlChiplet as Air<F>>::permutation_checks(&ctrl);
 

@@ -4,21 +4,19 @@
 
 use hekate_core::config::Config;
 use hekate_core::trace::ColumnTrace;
-use hekate_core::trace::{ColumnType, TraceBuilder, TraceColumn};
+use hekate_core::trace::{TraceBuilder, TraceColumn};
 use hekate_crypto::DefaultHasher;
 use hekate_crypto::transcript::Transcript;
 use hekate_keccak::{KeccakChiplet, KeccakWitness};
 use hekate_math::{Bit, Block32, Block64, Block128, Flat, HardwareField, TowerField};
 use hekate_pqc::high_bits::HighBitsLayout;
 use hekate_pqc::mldsa::{
-    self, CpuMlDsaColumns, CpuMlDsaUnit, MlDsaChiplet, MlDsaCtrlColumns, MlDsaLevel,
-    MlDsaPublicKey, MlDsaSignature,
+    self, CpuMlDsaColumns, MlDsaChiplet, MlDsaCtrlColumns, MlDsaLevel, MlDsaPublicKey,
+    MlDsaSignature,
 };
-use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
-use hekate_program::permutation::PermutationCheckSpec;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::circuit::{Circuit, CircuitProgram};
+use hekate_program::digest::program_id;
+use hekate_program::{Air, FixedShape, Program, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_sdk::preflight;
 use hekate_verifier::HekateVerifier;
@@ -48,50 +46,37 @@ nist_mldsa!(nist_mldsa_44, MlDsa44);
 nist_mldsa!(nist_mldsa_65, MlDsa65);
 nist_mldsa!(nist_mldsa_87, MlDsa87);
 
-#[derive(Clone)]
-struct MlDsaTestProgram {
-    mldsa: MlDsaChiplet<F>,
+fn mldsa_test_program(
+    mldsa: &MlDsaChiplet<F>,
+    cpu_rows: usize,
     num_public: usize,
-}
+) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("MlDsaTest", cpu_rows).unwrap();
+    let cpu = cx.schema(&CpuMlDsaColumns::build_layout());
 
-impl Air<F> for MlDsaTestProgram {
-    fn num_columns(&self) -> usize {
-        CpuMlDsaUnit::num_columns()
+    cx.bus(mldsa::MLDSA_DATA_BUS_ID, mldsa::cpu_data_spec());
+
+    let selector = cpu.at(CpuMlDsaColumns::SELECTOR);
+
+    cx.fix(
+        selector,
+        FixedShape::Cadence {
+            stride: 1,
+            count: num_public,
+            origin: 0,
+            values: vec![F::ONE],
+        },
+    );
+
+    for k in 0..num_public {
+        cx.publish(cpu.at(CpuMlDsaColumns::DATA), k);
     }
 
-    fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
-        (0..self.num_public)
-            .map(|k| BoundaryConstraint::with_public_input(CpuMlDsaColumns::DATA, k, k))
-            .collect()
+    for def in mldsa.composite().flatten_defs().unwrap() {
+        cx.attach(def);
     }
 
-    fn column_layout(&self) -> &[ColumnType] {
-        Box::leak(CpuMlDsaColumns::build_layout().into_boxed_slice())
-    }
-
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![(
-            mldsa::MLDSA_DATA_BUS_ID.into(),
-            CpuMlDsaUnit::linking_spec(),
-        )]
-    }
-
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CpuMlDsaColumns::SELECTOR));
-
-        cs.build()
-    }
-}
-
-impl Program<F> for MlDsaTestProgram {
-    fn num_public_inputs(&self) -> usize {
-        self.num_public
-    }
-
-    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        self.mldsa.composite().flatten_defs()
-    }
+    cx.compile().unwrap()
 }
 
 fn prove_and_verify_mldsa(
@@ -100,7 +85,7 @@ fn prove_and_verify_mldsa(
     sig_bytes: &[u8],
     msg: &[u8],
 ) -> Result<bool, String> {
-    let mldsa_chiplet = MlDsaChiplet::<F>::new(level);
+    let mldsa_chiplet = MlDsaChiplet::<F>::new(level, msg.len());
 
     let pk = MlDsaPublicKey::from_bytes(level, pk_bytes);
     let sig = MlDsaSignature::from_bytes(level, sig_bytes).expect("NIST signature should parse");
@@ -138,10 +123,7 @@ fn prove_and_verify_mldsa(
         .map(|chunk| Block128(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as u128))
         .collect();
 
-    let air = MlDsaTestProgram {
-        mldsa: mldsa_chiplet,
-        num_public: public_inputs.len(),
-    };
+    let air = mldsa_test_program(&mldsa_chiplet, cpu_rows, public_inputs.len());
 
     let instance = ProgramInstance::new(cpu_rows, public_inputs);
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(chiplet_traces);
@@ -176,7 +158,7 @@ fn prove_and_verify_mldsa(
     }
 
     let mut bus_report = preflight::PreflightReport::new();
-    preflight::check_bus_multisets(&air, &witness, &mut bus_report)
+    preflight::check_bus_multisets(&air, &defs, &witness, &mut bus_report)
         .map_err(|e| format!("bus check: {e:?}"))?;
 
     for d in &bus_report.bus_diagnostics {
@@ -212,8 +194,15 @@ fn prove_and_verify_mldsa(
     .map_err(|e| format!("prover: {e:?}"))?;
 
     let mut vt = Transcript::<H>::new(b"MLDSA_E2E");
-    HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config)
-        .map_err(|e| format!("verifier: {e:?}"))
+    HekateVerifier::<F, H>::verify(
+        &program_id(&air).unwrap(),
+        &air,
+        &instance,
+        &proof,
+        &mut vt,
+        &config,
+    )
+    .map_err(|e| format!("verifier: {e:?}"))
 }
 
 // m=44, exercises uh_wrap
@@ -282,7 +271,7 @@ where
     let (nist_pk, nist_sig) = nist_mldsa_65(msg);
 
     let level = MlDsaLevel::MLDSA_65;
-    let mldsa_chiplet = MlDsaChiplet::<F>::new(level);
+    let mldsa_chiplet = MlDsaChiplet::<F>::new(level, msg.len());
 
     let pk = MlDsaPublicKey::from_bytes(level, &nist_pk);
     let sig = MlDsaSignature::from_bytes(level, &nist_sig).expect("NIST signature must parse");
@@ -320,10 +309,7 @@ where
         .map(|chunk| Block128(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as u128))
         .collect();
 
-    let air = MlDsaTestProgram {
-        mldsa: mldsa_chiplet,
-        num_public: public_inputs.len(),
-    };
+    let air = mldsa_test_program(&mldsa_chiplet, cpu_rows, public_inputs.len());
 
     let instance = ProgramInstance::new(cpu_rows, public_inputs);
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(chiplet_traces);
@@ -350,7 +336,14 @@ where
         Err(_) => true,
         Ok(proof) => {
             let mut vt = Transcript::<H>::new(b"MLDSA_Adversarial");
-            let result = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
+            let result = HekateVerifier::<F, H>::verify(
+                &program_id(&air).unwrap(),
+                &air,
+                &instance,
+                &proof,
+                &mut vt,
+                &config,
+            );
             result.is_err() || !result.unwrap()
         }
     }
@@ -733,14 +726,9 @@ fn exploit_io_data_mismatch() {
     );
 }
 
-// c̃ bytes transit IO bus but nothing
-// constrains their flow into the
-// Keccak absorption. Corrupt RATE_REG
-// on an IO-phase row to corrupt the
-// sponge state before c̃ absorption.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
-fn exploit_ct_substitution() {
+fn rate_reg_tamper_on_io_row_rejected() {
     let detected = run_tampered_mldsa_65(|traces| {
         let ctrl = &mut traces[0];
         let io_rows = rows_with_bit(ctrl, MlDsaCtrlColumns::IO_SELECTOR);
@@ -750,44 +738,12 @@ fn exploit_ct_substitution() {
         flip_b64(ctrl, MlDsaCtrlColumns::RATE_REG, io_rows[0], 0xFF);
     });
 
-    assert!(
-        detected,
-        "c̃ sponge corruption must be caught by sponge carry constraint"
-    );
+    assert!(detected, "sponge state carry chain");
 }
 
-// PAD_SEL is mutually exclusive with
-// IO_SELECTOR. Setting PAD_SEL on an
-// IO row violates io_sel * pad_sel = 0.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
-fn exploit_pad_byte_tamper() {
-    let detected = run_tampered_mldsa_65(|traces| {
-        let ctrl = &mut traces[0];
-        let pad_rows = rows_with_bit(ctrl, MlDsaCtrlColumns::PAD_SEL);
-
-        if !pad_rows.is_empty() {
-            set_bit_val(ctrl, MlDsaCtrlColumns::PAD_SEL, pad_rows[0], Bit::ZERO);
-        } else {
-            let io_row = first_row_with_bit(ctrl, MlDsaCtrlColumns::IO_SELECTOR);
-            set_bit_val(ctrl, MlDsaCtrlColumns::PAD_SEL, io_row, Bit::ONE);
-        }
-    });
-
-    assert!(
-        detected,
-        "PAD_SEL tampering must be caught by IO/PAD mutual exclusivity"
-    );
-}
-
-// pk data flows through Keccak (H(pk) -> tr)
-// in ExpandSample phase. RATE_REG carries
-// sponge state but is unconstrained.
-// Corrupting it substitutes arbitrary
-// pk data into the verification pipeline.
-#[test]
-#[cfg_attr(debug_assertions, ignore)]
-fn exploit_pk_substitution() {
+fn rate_reg_tamper_in_expand_phase_rejected() {
     let detected = run_tampered_mldsa_65(|traces| {
         let ctrl = &mut traces[0];
         let expand_rows = rows_with_bit(ctrl, MlDsaCtrlColumns::PH_EXPAND_SAMPLE);
@@ -801,20 +757,12 @@ fn exploit_pk_substitution() {
         flip_b64(ctrl, MlDsaCtrlColumns::RATE_REG, *target, 0x1);
     });
 
-    assert!(
-        detected,
-        "pk sponge corruption must be caught by sponge carry constraint"
-    );
+    assert!(detected, "sponge state carry chain");
 }
 
-// Signature coefficients enter the NTT
-// pipeline via RAM. RATE_REG in
-// NttForward phase is unconstrained,
-// corrupting it substitutes arbitrary
-// data without detection.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
-fn exploit_sig_substitution() {
+fn rate_reg_tamper_in_ntt_phase_rejected() {
     let detected = run_tampered_mldsa_65(|traces| {
         let ctrl = &mut traces[0];
         let ntt_fwd = rows_with_bit(ctrl, MlDsaCtrlColumns::PH_NTT_FORWARD);
@@ -828,19 +776,12 @@ fn exploit_sig_substitution() {
         flip_b64(ctrl, MlDsaCtrlColumns::RATE_REG, *target, 0x1);
     });
 
-    assert!(
-        detected,
-        "sig RATE_REG corruption must be caught by sponge carry constraint"
-    );
+    assert!(detected, "sponge state carry chain");
 }
 
-// CTILDE_REF carries c̃ from the signature.
-// Hard equality with RATE_REG (c̃') on
-// the CMP row:
-// CMP * (REF[i] + REG[i]) = 0.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
-fn exploit_ctilde_ref_tamper() {
+fn ctilde_ref_tamper_rejected() {
     let detected = run_tampered_mldsa_65(|traces| {
         let ctrl = &mut traces[0];
         let cmp_row = first_row_with_bit(ctrl, MlDsaCtrlColumns::CMP_SELECTOR);
@@ -848,10 +789,7 @@ fn exploit_ctilde_ref_tamper() {
         flip_b64(ctrl, MlDsaCtrlColumns::CTILDE_REF, cmp_row, 0xDEAD);
     });
 
-    assert!(
-        detected,
-        "CTILDE_REF tampering must be caught by c̃==c̃' hard equality"
-    );
+    assert!(detected, "c̃ == c̃' hard equality on the CMP row");
 }
 
 // HASH_EQ bits are constrained via
@@ -1054,10 +992,19 @@ fn exploit_hint_weight_unconstrained() {
         let hb_rows = rows_with_bit(ctrl, MlDsaCtrlColumns::HB_SELECTOR);
         assert!(hb_rows.len() >= 2);
 
-        set_bit_val(ctrl, MlDsaCtrlColumns::HB_H_BIT, hb_rows[0], Bit::ONE);
+        let row = {
+            let bits = ctrl.columns[MlDsaCtrlColumns::HB_H_BIT]
+                .as_bit_slice()
+                .unwrap();
+
+            hb_rows.iter().copied().find(|&r| bits[r] == Bit::ZERO)
+        }
+        .expect("a cleared hint bit to raise");
+
+        set_bit_val(ctrl, MlDsaCtrlColumns::HB_H_BIT, row, Bit::ONE);
     });
 
-    assert!(detected, "h_bit flip must be caught by UseHint bus");
+    assert!(detected, "raised hint weight must be caught by UseHint bus");
 }
 
 #[test]

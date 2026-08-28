@@ -12,15 +12,18 @@
 
 mod arithmetic;
 mod ctrl;
+mod schedule;
 mod trace;
 mod witness;
 
 pub use ctrl::MlKemCtrlColumns;
+pub use witness::{ntt_forward_traced, ntt_inverse_traced};
 
 use super::basemul::BasemulChiplet;
-use super::ntt::NttChiplet;
+use super::ntt::{NttChiplet, NttRun, NttSchedule};
 use super::twiddle_rom::TwiddleRomChiplet;
 use alloc::vec;
+use alloc::vec::Vec;
 use ctrl::MlKemCtrlChiplet;
 use hekate_core::trace::TraceCompatibleField;
 use hekate_gadgets::chiplets::ram::RamChiplet;
@@ -28,7 +31,8 @@ use hekate_keccak::KeccakChiplet;
 use hekate_math::{Flat, HardwareField, PackableField, TowerField};
 use hekate_program::chiplet::CompositeChiplet;
 use hekate_program::define_columns;
-use hekate_program::permutation::{PermutationCheckSpec, REQUEST_IDX_LABEL, Source};
+use hekate_program::permutation::{BusKind, PermutationCheckSpec, Service, ServiceSlot};
+use schedule::MlKemCtrlSchedule;
 
 // =================================================================
 // Constants
@@ -45,6 +49,14 @@ pub const MLKEM_DATA_BUS_ID: &str = "ml_kem_data";
 
 /// External bus ID for shared secret output.
 pub const MLKEM_SS_BUS_ID: &str = "ml_kem_ss";
+
+#[rustfmt::skip]
+const MLKEM_SS_LABELS: [&[u8]; 8] = [
+    b"kappa_ss_lo0", b"kappa_ss_lo1",
+    b"kappa_ss_lo2", b"kappa_ss_lo3",
+    b"kappa_ss_hi0", b"kappa_ss_hi1",
+    b"kappa_ss_hi2", b"kappa_ss_hi3",
+];
 
 /// Bus ID for Keccak input binding.
 const KEC_INPUT_BIND_BUS_ID: &str = "kec_input_bind";
@@ -116,6 +128,7 @@ impl MlKemLevel {
 pub(crate) struct MlKemParams {
     pub ctrl_rows: usize,
     pub keccak_rows: usize,
+    pub keccak_blocks: usize,
     pub ntt_rows: usize,
     pub twiddle_rows: usize,
     pub basemul_rows: usize,
@@ -123,8 +136,8 @@ pub(crate) struct MlKemParams {
 }
 
 impl MlKemParams {
-    /// Sizes validated against the FIPS 203 KAT vectors.
-    pub(crate) fn for_level(level: MlKemLevel) -> Self {
+    /// Shifts are the FIPS 203 KAT-validated sizes.
+    pub(crate) fn for_level(level: MlKemLevel, schedule: &MlKemCtrlSchedule) -> Self {
         let k = level.k;
         let keccak_shift = if k >= 4 { 12 } else { 11 };
         let ctrl_shift = if k >= 4 { 17 } else { 16 };
@@ -132,6 +145,7 @@ impl MlKemParams {
         Self {
             ctrl_rows: 1 << ctrl_shift,
             keccak_rows: 1 << keccak_shift,
+            keccak_blocks: schedule.keccak_calls(),
             ntt_rows: 1 << (14 + k.div_ceil(3)),
             twiddle_rows: 1 << (14 + k.div_ceil(3)),
             basemul_rows: 1 << (11 + k.div_ceil(2)),
@@ -173,14 +187,18 @@ where
     Flat<F>: Send + Sync,
 {
     pub fn new(level: MlKemLevel) -> Self {
-        let params = MlKemParams::for_level(level);
+        let ctrl_schedule = MlKemCtrlSchedule::for_level(level);
+        let params = MlKemParams::for_level(level, &ctrl_schedule);
 
-        let ctrl = MlKemCtrlChiplet::new(params.ctrl_rows);
-        let keccak = KeccakChiplet::new(params.keccak_rows);
-        let ntt = NttChiplet::new(MLKEM_Q, params.ntt_rows);
-        let twiddle = TwiddleRomChiplet::new(MLKEM_Q, params.twiddle_rows);
-        let basemul = BasemulChiplet::new(MLKEM_Q, params.basemul_rows);
-        let ram = RamChiplet::new(params.ram_rows);
+        let ntt_schedule = ml_kem_ntt_schedule(level.k);
+
+        let basemul =
+            BasemulChiplet::new(MLKEM_Q, params.basemul_rows, ctrl_schedule.basemul_ops());
+        let ram = RamChiplet::new(params.ram_rows, ctrl_schedule.ram_events());
+        let ctrl = MlKemCtrlChiplet::new(params.ctrl_rows, ctrl_schedule);
+        let keccak = KeccakChiplet::new(params.keccak_rows, params.keccak_blocks);
+        let ntt = NttChiplet::new(MLKEM_Q, params.ntt_rows, ntt_schedule.clone());
+        let twiddle = TwiddleRomChiplet::new(MLKEM_Q, params.twiddle_rows, ntt_schedule);
 
         let composite = CompositeChiplet::<F>::builder("mlkem")
             .chiplet(ctrl)
@@ -223,73 +241,6 @@ define_columns! {
     }
 }
 
-/// CPU-side unit for ML-KEM chiplet.
-///
-/// Provides the column schema and linking spec
-/// that the main trace uses to connect to the
-/// ML-KEM composite's external bus.
-pub struct CpuMlKemUnit;
-
-impl CpuMlKemUnit {
-    pub fn num_columns() -> usize {
-        CpuMlKemColumns::NUM_COLUMNS
-    }
-
-    pub fn linking_spec() -> PermutationCheckSpec {
-        PermutationCheckSpec::new(
-            vec![
-                (
-                    Source::Column(CpuMlKemColumns::DATA),
-                    b"kappa_mlkem_d0" as &[u8],
-                ),
-                (Source::RowIndexLeBytes(4), REQUEST_IDX_LABEL),
-            ],
-            Some(CpuMlKemColumns::SELECTOR),
-        )
-    }
-
-    pub fn ss_linking_spec() -> PermutationCheckSpec {
-        PermutationCheckSpec::new(
-            vec![
-                (
-                    Source::Column(CpuMlKemColumns::SS_DATA),
-                    b"kappa_ss_lo0" as &[u8],
-                ),
-                (
-                    Source::Column(CpuMlKemColumns::SS_DATA + 1),
-                    b"kappa_ss_lo1" as &[u8],
-                ),
-                (
-                    Source::Column(CpuMlKemColumns::SS_DATA + 2),
-                    b"kappa_ss_lo2" as &[u8],
-                ),
-                (
-                    Source::Column(CpuMlKemColumns::SS_DATA + 3),
-                    b"kappa_ss_lo3" as &[u8],
-                ),
-                (
-                    Source::Column(CpuMlKemColumns::SS_DATA + 4),
-                    b"kappa_ss_hi0" as &[u8],
-                ),
-                (
-                    Source::Column(CpuMlKemColumns::SS_DATA + 5),
-                    b"kappa_ss_hi1" as &[u8],
-                ),
-                (
-                    Source::Column(CpuMlKemColumns::SS_DATA + 6),
-                    b"kappa_ss_hi2" as &[u8],
-                ),
-                (
-                    Source::Column(CpuMlKemColumns::SS_DATA + 7),
-                    b"kappa_ss_hi3" as &[u8],
-                ),
-                (Source::RowIndexLeBytes(4), REQUEST_IDX_LABEL),
-            ],
-            Some(CpuMlKemColumns::SS_SELECTOR),
-        )
-    }
-}
-
 /// Protocol execution phase for the
 /// ML-KEM control chiplet state machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -313,6 +264,70 @@ pub(crate) enum Phase {
 
     /// Re-encryption hash comparison.
     Compare = 5,
+}
+
+/// Both endpoints derive from this schema:
+/// one ciphertext word and the request-index clock.
+pub fn data_service() -> Service {
+    Service {
+        bus_id: MLKEM_DATA_BUS_ID,
+        kind: BusKind::Permutation,
+        slots: vec![
+            ServiceSlot::Value(b"kappa_mlkem_d0"),
+            ServiceSlot::RequestIdx { num_bytes: 4 },
+        ],
+        clock_waiver: None,
+    }
+}
+
+/// Requester endpoint over `CpuMlKemColumns`.
+pub fn cpu_data_spec() -> PermutationCheckSpec {
+    data_service()
+        .request(&[CpuMlKemColumns::DATA], CpuMlKemColumns::SELECTOR)
+        .expect("data_service slots match the requester columns")
+}
+
+/// Both endpoints derive from this schema: the shared
+/// secret as 4 low and 4 high words, then the clock.
+pub fn ss_service() -> Service {
+    let mut slots: Vec<ServiceSlot> = MLKEM_SS_LABELS
+        .iter()
+        .map(|label| ServiceSlot::Value(label))
+        .collect();
+
+    slots.push(ServiceSlot::RequestIdx { num_bytes: 4 });
+
+    Service {
+        bus_id: MLKEM_SS_BUS_ID,
+        kind: BusKind::Permutation,
+        slots,
+        clock_waiver: None,
+    }
+}
+
+/// Requester endpoint over `CpuMlKemColumns`.
+pub fn cpu_ss_spec() -> PermutationCheckSpec {
+    let values: Vec<usize> = (0..8).map(|i| CpuMlKemColumns::SS_DATA + i).collect();
+
+    ss_service()
+        .request(&values, CpuMlKemColumns::SS_SELECTOR)
+        .expect("ss_service slots match the requester columns")
+}
+
+fn ml_kem_ntt_schedule(k: usize) -> NttSchedule {
+    let mut runs = vec![
+        NttRun::Forward { instances: k },
+        NttRun::Pointwise { calls: k },
+        NttRun::Inverse { instances: 1 },
+        NttRun::Forward { instances: k },
+    ];
+
+    for _ in 0..=k {
+        runs.push(NttRun::Pointwise { calls: k });
+        runs.push(NttRun::Inverse { instances: 1 });
+    }
+
+    NttSchedule::new(7, runs)
 }
 
 // =================================================================
