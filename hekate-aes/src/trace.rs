@@ -4,15 +4,12 @@
 
 //! AES trace generation (128 and 256).
 //!
-//! xtime/mix_column use
-//! FIPS 197 GF(2^8) arithmetic
-//! with polynomial 0x11B.
+//! xtime/mix_column use FIPS 197 GF(2^8) arithmetic with polynomial 0x11B.
 //!
-//! Constant-time by design: the S-box is `ct_sbox`
-//! (GF(2^8) inverse + affine), never a secret-indexed
-//! `SBOX[byte]` lookup. Zero-indicator bits are written
-//! unconditionally, gating a store on a secret byte
-//! leaks which key bytes are zero via cache timing.
+//! Constant-time by design:
+//! the S-box is `ct_sbox` (GF(2^8) inverse + affine), never a secret-indexed
+//! `SBOX[byte]` lookup. Zero-indicator bits are written unconditionally, gating
+//! a store on a secret byte leaks which key bytes are zero via cache timing.
 
 use alloc::vec::Vec;
 use hekate_core::errors::Error;
@@ -646,6 +643,27 @@ mod tests {
         }
     }
 
+    fn assert_pins_match<A>(air: &A, trace: &ColumnTrace, num_rows: usize)
+    where
+        A: hekate_program::Air<hekate_math::Block128> + Send + Sync + 'static,
+    {
+        let num_vars = num_rows.trailing_zeros() as usize;
+        let def = hekate_program::chiplet::ChipletDef::from_air(air).unwrap();
+        let variants = def.expand_variants(trace).unwrap();
+
+        for pin in hekate_program::Air::<hekate_math::Block128>::fixed_columns(air) {
+            for row in 0..num_rows {
+                assert_eq!(
+                    variants[pin.col_idx].get_at(row),
+                    pin.shape.value_at_row(row, num_vars),
+                    "col {} row {}",
+                    pin.col_idx,
+                    row
+                );
+            }
+        }
+    }
+
     #[test]
     fn key_expansion_fips197() {
         let rk = expand_key(&FIPS_KEY);
@@ -789,5 +807,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn generated_trace_matches_cadence_pins_128() {
+        let num_rows = 64;
+        let num_blocks = 4;
+
+        let calls: [Aes128Call; 4] = core::array::from_fn(|_| fips_call());
+        let trace = generate_aes_trace(&calls, None, num_rows).unwrap();
+
+        assert_pins_match(
+            &crate::aes128::AesRound128Air::new(num_blocks),
+            &trace,
+            num_rows,
+        );
+    }
+
+    #[test]
+    fn generated_trace_matches_cadence_pins_256() {
+        let num_rows = 64;
+        let num_blocks = 4;
+
+        let key = [0u8; 32];
+        let calls: [Aes256Call; 4] = core::array::from_fn(|_| AesCall {
+            key,
+            plaintext: [0u8; 16],
+            round_keys: expand_key_256(&key),
+        });
+
+        let trace = generate_aes_trace(&calls, None, num_rows).unwrap();
+
+        assert_pins_match(
+            &crate::aes256::AesRound256Air::new(num_blocks),
+            &trace,
+            num_rows,
+        );
     }
 }

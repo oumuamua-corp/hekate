@@ -2,12 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Oumuamua Labs <info@oumuamua.dev>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! What the CPU-side run-opener root buys.
-//!
-//! Without it a host admits `idle -> response`; two
-//! identical blocks can cancel their own input and
-//! key emits and hand the CPU a ciphertext no row
-//! of its trace ever bound a plaintext or a key to.
+//! Two identical blocks cancel their own input and key emits,
+//! handing the CPU a ciphertext bound to no request row: caught
+//! by the fixed-column compare, or refused before any arithmetic.
 
 mod common;
 
@@ -15,9 +12,7 @@ use common::{
     CPU_ROWS, F, FIPS128_CIPHER, SBOX_ROM_ROWS, assert_air_clean, assert_air_violated,
     fips_call_128, make_program_128, prove_and_verify, set_b32,
 };
-use hekate_aes::{
-    Aes128Chiplet, AesRound128Air, CpuAes128Columns, CpuAes128Unit, PhysAes128Columns,
-};
+use hekate_aes::{Aes128Chiplet, AesRound128Air, CpuAes128Columns, PhysAes128Columns};
 use hekate_core::errors;
 use hekate_core::trace::{ColumnTrace, ColumnType, TraceBuilder};
 use hekate_math::{Bit, Block8, TowerField};
@@ -33,10 +28,32 @@ const ROWS_PER_CALL: usize = 11;
 /// picks; the two input emits collide and cancel.
 const SHARED_IDX: u32 = 7;
 
-/// Every root of `CpuAes128Unit::constrain` except the run opener.
+/// The pre-cadence discipline roots, with
+/// witness selectors and no schedule pins.
 #[derive(Clone)]
 struct UnpinnedHost {
     aes: Aes128Chiplet<F>,
+}
+
+impl UnpinnedHost {
+    fn link_spec() -> PermutationCheckSpec {
+        let values: Vec<usize> = (0..16)
+            .map(|j| CpuAes128Columns::DATA + j)
+            .chain([CpuAes128Columns::KEY_SELECTOR])
+            .collect();
+
+        AesRound128Air::link_service()
+            .request(&values, CpuAes128Columns::SELECTOR)
+            .unwrap()
+    }
+
+    fn key_spec() -> PermutationCheckSpec {
+        let values: Vec<usize> = (0..16).map(|j| CpuAes128Columns::KEY + j).collect();
+
+        AesRound128Air::key_service()
+            .request(&values, CpuAes128Columns::KEY_SELECTOR)
+            .unwrap()
+    }
 }
 
 impl Air<F> for UnpinnedHost {
@@ -47,14 +64,8 @@ impl Air<F> for UnpinnedHost {
 
     fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
         vec![
-            (
-                AesRound128Air::LINK_BUS_ID.into(),
-                CpuAes128Unit::linking_spec(),
-            ),
-            (
-                AesRound128Air::KEY_BUS_ID.into(),
-                CpuAes128Unit::key_linking_spec(),
-            ),
+            (AesRound128Air::LINK_BUS_ID.into(), Self::link_spec()),
+            (AesRound128Air::KEY_BUS_ID.into(), Self::key_spec()),
         ]
     }
 
@@ -146,30 +157,29 @@ fn unbound_ciphertext_witness(aes: &Aes128Chiplet<F>) -> (ColumnTrace, Vec<Colum
 /// the verdict is attributable to the missing root alone.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
-fn unpinned_host_accepts_unbound_ciphertext() {
+fn unpinned_host_is_rejected_at_verify() {
     let air = UnpinnedHost {
-        aes: Aes128Chiplet::new(AES_ROWS, SBOX_ROM_ROWS).unwrap(),
+        aes: Aes128Chiplet::new(AES_ROWS, SBOX_ROM_ROWS, 2).unwrap(),
     };
 
     let (cpu_trace, traces) = unbound_ciphertext_witness(&air.aes);
     assert_air_clean(&air, &cpu_trace, &traces);
 
     match prove_and_verify(&air, cpu_trace, traces) {
-        Ok(true) => {}
-        Ok(false) => panic!("rejected: the run-opener root is not what closes this"),
-        Err(e) => panic!("error: {e}"),
+        Err(_) => {}
+        Ok(accepted) => panic!("witness bus selectors must be rejected, got {accepted}"),
     }
 }
 
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
-fn constrain_rejects_unbound_ciphertext() {
-    let air = make_program_128(AES_ROWS);
+fn cadence_pins_reject_unbound_ciphertext() {
+    let air = make_program_128(AES_ROWS, 2);
     let (cpu_trace, traces) = unbound_ciphertext_witness(&air.aes);
 
-    assert_air_violated(&air, &cpu_trace, &traces);
+    assert_air_violated(&air.program, &cpu_trace, &traces);
 
-    match prove_and_verify(&air, cpu_trace, traces) {
+    match prove_and_verify(&air.program, cpu_trace, traces) {
         Ok(false) | Err(_) => {}
         Ok(true) => panic!("accepted a ciphertext bound to no CPU request row"),
     }

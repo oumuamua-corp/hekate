@@ -19,12 +19,12 @@ use errors::Error;
 use hekate_core::errors;
 use hekate_core::trace::{ColumnTrace, ColumnType, TraceBuilder};
 use hekate_math::{Bit, Block8, Block32, Block64, Block128, TowerField};
-use hekate_program::Air;
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
 use hekate_program::define_columns;
 use hekate_program::expander::VirtualExpander;
-use hekate_program::permutation::{PermutationCheckSpec, REQUEST_IDX_LABEL, Source};
+use hekate_program::permutation::{BusKind, PermutationCheckSpec, Service, ServiceSlot};
+use hekate_program::{Air, FixedColumn};
 use once_cell::race::OnceBox;
 
 /// FIPS 197 §5.1.1 affine transform columns.
@@ -68,12 +68,14 @@ define_columns! {
 pub struct SboxRomChiplet {
     #[allow(dead_code)]
     pub num_rows: usize,
+
+    num_rounds: usize,
 }
 
 impl SboxRomChiplet {
     pub const BUS_ID: &'static str = "aes_sbox";
 
-    pub fn new(num_rows: usize) -> errors::Result<Self> {
+    pub fn new(num_rows: usize, num_rounds: usize) -> errors::Result<Self> {
         if !num_rows.is_power_of_two() {
             return Err(Error::Protocol {
                 protocol: "aes_sbox_rom",
@@ -81,25 +83,52 @@ impl SboxRomChiplet {
             });
         }
 
-        Ok(Self { num_rows })
+        if num_rounds > num_rows {
+            return Err(Error::Protocol {
+                protocol: "aes_sbox_rom",
+                message: "round count exceeds the ROM height",
+            });
+        }
+
+        Ok(Self {
+            num_rows,
+            num_rounds,
+        })
+    }
+
+    /// Both endpoints derive from this schema:
+    /// sixteen in/out byte pairs, then the clock.
+    pub fn service() -> Service {
+        let mut slots = Vec::with_capacity(33);
+
+        for i in 0..16 {
+            slots.push(ServiceSlot::Value(SBOX_IN_LABELS[i]));
+            slots.push(ServiceSlot::Value(SBOX_OUT_LABELS[i]));
+        }
+
+        slots.push(ServiceSlot::RequestIdx { num_bytes: 4 });
+
+        Service {
+            bus_id: Self::BUS_ID,
+            kind: BusKind::Permutation,
+            slots,
+            clock_waiver: None,
+        }
+    }
+
+    /// Byte columns in schema order: in[i], out[i].
+    pub fn byte_columns(input: usize, output: usize) -> Vec<usize> {
+        (0..16).flat_map(|i| [input + i, output + i]).collect()
     }
 
     pub fn linking_spec() -> PermutationCheckSpec {
-        let mut sources = Vec::with_capacity(32);
-        for i in 0..16 {
-            sources.push((Source::Column(SboxRomColumns::INPUT + i), SBOX_IN_LABELS[i]));
-            sources.push((
-                Source::Column(SboxRomColumns::OUTPUT + i),
-                SBOX_OUT_LABELS[i],
-            ));
-        }
-
-        sources.push((
-            Source::Column(SboxRomColumns::REQUEST_IDX),
-            REQUEST_IDX_LABEL,
-        ));
-
-        PermutationCheckSpec::new(sources, Some(SboxRomColumns::SELECTOR))
+        Self::service()
+            .respond(
+                &Self::byte_columns(SboxRomColumns::INPUT, SboxRomColumns::OUTPUT),
+                &[SboxRomColumns::REQUEST_IDX],
+                SboxRomColumns::SELECTOR,
+            )
+            .expect("service slots match the responder columns")
     }
 }
 
@@ -115,6 +144,13 @@ impl<F: TowerField> Air<F> for SboxRomChiplet {
 
     fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
         vec![(Self::BUS_ID.into(), Self::linking_spec())]
+    }
+
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::prefix(
+            SboxRomColumns::SELECTOR,
+            self.num_rounds,
+        )]
     }
 
     fn virtual_expander(&self) -> Option<&VirtualExpander> {
@@ -244,7 +280,11 @@ pub fn generate_sbox_rom_trace(
 
     let num_vars = num_rows.trailing_zeros() as usize;
 
-    let chiplet = SboxRomChiplet { num_rows };
+    let chiplet = SboxRomChiplet {
+        num_rows,
+        num_rounds: rounds.len(),
+    };
+
     let layout = Air::<Block128>::column_layout(&chiplet);
 
     let mut tb = TraceBuilder::new(layout, num_vars)?;
@@ -324,6 +364,7 @@ mod tests {
     use crate::aes128::AesRound128Air;
     use hekate_core::trace::Trace;
     use hekate_math::{Bit, Block128};
+    use hekate_program::permutation::REQUEST_IDX_LABEL;
 
     // FIPS 197 Table 4, oracle to cross-check ct_sbox
     #[rustfmt::skip]
@@ -457,7 +498,7 @@ mod tests {
 
     #[test]
     fn rom_bus_labels_match_aes_chiplet() {
-        let rom = SboxRomChiplet::new(16).unwrap();
+        let rom = SboxRomChiplet::new(16, 10).unwrap();
         let rom_checks: Vec<_> = Air::<Block128>::permutation_checks(&rom);
         let aes_checks = AesRound128Air::sbox_specs();
 

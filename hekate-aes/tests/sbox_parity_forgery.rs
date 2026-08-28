@@ -60,7 +60,7 @@ fn forge_final_round_sbox(aes: &mut ColumnTrace) {
 
 fn two_call_traces() -> Vec<ColumnTrace> {
     let call = fips_call_128();
-    make_program_128(AES_ROWS)
+    make_program_128(AES_ROWS, 2)
         .aes
         .generate_traces(&[call.clone(), call])
         .unwrap()
@@ -69,12 +69,12 @@ fn two_call_traces() -> Vec<ColumnTrace> {
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn two_identical_calls_e2e() {
-    let air = make_program_128(AES_ROWS);
+    let air = make_program_128(AES_ROWS, 2);
     let whitened = whitened_128();
 
     let cpu_trace = build_cpu_trace_128(&[(whitened, FIPS128_CIPHER), (whitened, FIPS128_CIPHER)]);
 
-    match prove_and_verify(&air, cpu_trace, two_call_traces()) {
+    match prove_and_verify(&air.program, cpu_trace, two_call_traces()) {
         Ok(true) => {}
         Ok(false) => panic!("rejected two honest identical calls"),
         Err(e) => panic!("error: {e}"),
@@ -84,7 +84,7 @@ fn two_identical_calls_e2e() {
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn exploit_aes128_sbox_even_multiplicity_rejected() {
-    let air = make_program_128(AES_ROWS);
+    let air = make_program_128(AES_ROWS, 2);
     let mut traces = two_call_traces();
 
     forge_final_round_sbox(&mut traces[0]);
@@ -97,9 +97,9 @@ fn exploit_aes128_sbox_even_multiplicity_rejected() {
     let whitened = whitened_128();
     let cpu_trace = build_cpu_trace_128(&[(whitened, forged), (whitened, forged)]);
 
-    assert_air_clean(&air, &cpu_trace, &traces);
+    assert_air_clean(&air.program, &cpu_trace, &traces);
 
-    match prove_and_verify(&air, cpu_trace, traces) {
+    match prove_and_verify(&air.program, cpu_trace, traces) {
         Ok(false) | Err(_) => {}
         Ok(true) => {
             panic!("accepted a ciphertext with SBOX_OUT[{FORGED_BYTE}] off by {FORGED_DELTA:#04x}")

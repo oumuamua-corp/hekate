@@ -86,11 +86,11 @@ fn move_key_row(cpu: &mut ColumnTrace, from: usize, to: usize) {
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn honest_block_verifies() {
-    let air = make_program_128(AES_ROWS);
+    let air = make_program_128(AES_ROWS, 1);
     let chiplet_traces = air.aes.generate_traces(&[fips_call_128()]).unwrap();
     let cpu_trace = build_cpu_trace_128(&[(whitened_128(), FIPS128_CIPHER)]);
 
-    match prove_and_verify(&air, cpu_trace, chiplet_traces) {
+    match prove_and_verify(&air.program, cpu_trace, chiplet_traces) {
         Ok(true) => {}
         Ok(false) => panic!("rejected"),
         Err(e) => panic!("error: {e}"),
@@ -100,7 +100,7 @@ fn honest_block_verifies() {
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn free_ciphertext_rejected() {
-    let air = make_program_128(AES_ROWS);
+    let air = make_program_128(AES_ROWS, 1);
     let mut traces = air.aes.generate_traces(&[fips_call_128()]).unwrap();
 
     {
@@ -128,9 +128,9 @@ fn free_ciphertext_rejected() {
     assert_ne!(FREE_CIPHER, FIPS128_CIPHER);
 
     let cpu_trace = build_cpu_trace_128(&[(whitened_128(), FREE_CIPHER)]);
-    assert_air_violated(&air, &cpu_trace, &traces);
+    assert_air_violated(&air.program, &cpu_trace, &traces);
 
-    match prove_and_verify(&air, cpu_trace, traces) {
+    match prove_and_verify(&air.program, cpu_trace, traces) {
         Ok(false) | Err(_) => {}
         Ok(true) => panic!("accepted"),
     }
@@ -139,7 +139,7 @@ fn free_ciphertext_rejected() {
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn single_round_block_rejected() {
-    let air = make_program_128(AES_ROWS);
+    let air = make_program_128(AES_ROWS, 1);
     let mut traces = air.aes.generate_traces(&[fips_call_128()]).unwrap();
 
     let after_round_one: [u8; 16] =
@@ -161,9 +161,9 @@ fn single_round_block_rejected() {
     assert_ne!(after_round_one, FIPS128_CIPHER);
 
     let cpu_trace = build_cpu_trace_128(&[(whitened_128(), after_round_one)]);
-    assert_air_violated(&air, &cpu_trace, &traces);
+    assert_air_violated(&air.program, &cpu_trace, &traces);
 
-    match prove_and_verify(&air, cpu_trace, traces) {
+    match prove_and_verify(&air.program, cpu_trace, traces) {
         Ok(false) | Err(_) => {}
         Ok(true) => panic!("accepted"),
     }
@@ -172,7 +172,7 @@ fn single_round_block_rejected() {
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn reversed_pairing_rejected() {
-    let air = make_program_128(AES_ROWS);
+    let air = make_program_128(AES_ROWS, 1);
     let mut traces = air.aes.generate_traces(&[fips_call_128()]).unwrap();
 
     set_b32(
@@ -192,9 +192,9 @@ fn reversed_pairing_rejected() {
     assert_ne!(aes_rounds(&FIPS128_CIPHER), whitened);
 
     let cpu_trace = build_cpu_trace_128(&[(FIPS128_CIPHER, whitened)]);
-    assert_air_clean(&air, &cpu_trace, &traces);
+    assert_air_clean(&air.program, &cpu_trace, &traces);
 
-    match prove_and_verify(&air, cpu_trace, traces) {
+    match prove_and_verify(&air.program, cpu_trace, traces) {
         Ok(false) | Err(_) => {}
         Ok(true) => panic!("accepted"),
     }
@@ -204,7 +204,7 @@ fn reversed_pairing_rejected() {
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn reversed_pairing_with_moved_key_rejected() {
-    let air = make_program_128(AES_ROWS);
+    let air = make_program_128(AES_ROWS, 1);
     let mut traces = air.aes.generate_traces(&[fips_call_128()]).unwrap();
 
     set_b32(
@@ -231,9 +231,9 @@ fn reversed_pairing_with_moved_key_rejected() {
 
     move_key_row(&mut cpu_trace, IN_ROW as usize, OUT_ROW as usize);
 
-    assert_air_violated(&air, &cpu_trace, &traces);
+    assert_air_violated(&air.program, &cpu_trace, &traces);
 
-    match prove_and_verify(&air, cpu_trace, traces) {
+    match prove_and_verify(&air.program, cpu_trace, traces) {
         Ok(false) | Err(_) => {}
         Ok(true) => panic!("accepted"),
     }
