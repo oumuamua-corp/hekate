@@ -6,13 +6,13 @@ use hekate_core::trace::ColumnType;
 use hekate_math::{Block128, TowerField};
 use hekate_program::chiplet::ChipletDef;
 use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
+use hekate_program::constraint::{BoundaryConstraint, BoundaryTarget, ConstraintAst};
+use hekate_program::digest::program_id;
 use hekate_program::expander::VirtualExpander;
 use hekate_program::permutation::{
     BusKind, ChallengeLabel, PermutationCheckSpec, REQUEST_IDX_LABEL, Source,
 };
 use hekate_program::{Air, FixedColumn, FixedShape, InlineKernelHint, Program};
-use hekate_sdk::program_id;
 
 type F = Block128;
 
@@ -102,16 +102,22 @@ struct TestProgram {
 impl TestProgram {
     fn baseline() -> Self {
         let cs = ConstraintSystem::<F>::new();
+
         let a = cs.col(0);
         let b = cs.col(1);
         let next_a = cs.next(0);
+
         cs.constrain(next_a + a + b);
 
         Self {
             name: "test_program".to_string(),
             column_layout: vec![ColumnType::B32, ColumnType::B32, ColumnType::Bit],
             constraint_ast: cs.build(),
-            boundary_constraints: vec![BoundaryConstraint::with_public_input(1, 0, 0)],
+            boundary_constraints: vec![BoundaryConstraint {
+                col_idx: 1,
+                row_idx: 0,
+                target: BoundaryTarget::PublicInput(0),
+            }],
             permutation_checks: vec![("test_bus".to_string(), paired_perm_spec(Some(2), 0, 1))],
             fixed_columns: vec![FixedColumn::last_row(0)],
             expander: None,
@@ -245,7 +251,11 @@ fn mutate_main_boundary_col_idx_changes_hash() {
     let mut p = TestProgram::baseline();
     let h1 = id(&p);
 
-    p.boundary_constraints = vec![BoundaryConstraint::with_public_input(2, 0, 0)];
+    p.boundary_constraints = vec![BoundaryConstraint {
+        col_idx: 2,
+        row_idx: 0,
+        target: BoundaryTarget::PublicInput(0),
+    }];
 
     assert_ne!(h1, id(&p));
 }
@@ -508,9 +518,19 @@ fn mutate_chiplet_perm_changes_hash() {
     let mut p = TestProgram::baseline();
     let h1 = id(&p);
 
-    p.chiplets[0]
-        .permutation_checks
-        .push(("chiplet_bus".to_string(), paired_perm_spec(None, 0, 1)));
+    p.chiplets[0].permutation_checks.push((
+        "chiplet_bus".to_string(),
+        PermutationCheckSpec {
+            kind: BusKind::Permutation,
+            sources: vec![
+                (Source::Column(0), b"col_0" as ChallengeLabel),
+                (Source::RowIndexLeBytes(4), REQUEST_IDX_LABEL),
+            ],
+            selector: None,
+            recv_selector: None,
+            clock_waiver: None,
+        },
+    ));
 
     assert_ne!(h1, id(&p));
 }
