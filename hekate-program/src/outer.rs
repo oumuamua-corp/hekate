@@ -2,12 +2,13 @@
 // SPDX-FileCopyrightText: 2026 Oumuamua Labs <info@oumuamua.dev>
 // SPDX-License-Identifier: AGPL-3.0-only
 
+use crate::chiplet::ChipletDef;
 use crate::constraint::{ConstraintAst, ConstraintExpr, ExprId};
 use crate::expander::{RING_BLIND_BITS, RingSwitchPlan, claim_weights, eq_tensor_b};
 use crate::linearized::{self, RingGadget, linearized_coeffs};
 use crate::permutation::{BusKind, Source, eval_row_idx_byte_mle, eval_row_idx_le_mle};
 use crate::predicate::{AffineRow, ClaimLayout, Form, PredicateRows, Unknown, WireRole, compile};
-use crate::{Air, Program, ProgramInstance};
+use crate::{Air, ProgramInstance};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
@@ -179,14 +180,14 @@ impl OuterStatement {
     }
 
     /// Statement size for a whole proof.
-    pub fn for_program<F: TowerField, P: Program<F>>(
-        program: &P,
+    pub fn for_tables<F: TowerField, A: Air<F>>(
+        main: &A,
         main_num_vars: usize,
+        chiplets: &[ChipletDef<F>],
         chiplet_num_vars: &[usize],
         blinding_columns: usize,
     ) -> errors::Result<Self> {
-        let defs = program.chiplet_defs()?;
-        if defs.len() != chiplet_num_vars.len() {
+        if chiplets.len() != chiplet_num_vars.len() {
             return Err(errors::Error::Protocol {
                 protocol: "outer",
                 message: "one height per chiplet is required",
@@ -194,12 +195,12 @@ impl OuterStatement {
         }
 
         let mut shapes = vec![TableShape::from_air(
-            program,
+            main,
             main_num_vars,
-            &program.constraint_ast(),
+            &main.constraint_ast(),
         )?];
 
-        for (def, &num_vars) in defs.iter().zip(chiplet_num_vars) {
+        for (def, &num_vars) in chiplets.iter().zip(chiplet_num_vars) {
             shapes.push(TableShape::from_air(def, num_vars, &def.constraint_ast())?);
         }
 
