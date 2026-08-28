@@ -22,7 +22,8 @@
 //! via explicit carry chains over GF(2).
 
 use super::utils::{
-    fill_add_carry_packed, fill_sub_borrow_packed, flush_bit_buffer, pack_bits, pack_one,
+    fill_add_carry_packed, fill_sub_borrow_packed, flush_bit_buffer, pack_bits, pack_one, push_seg,
+    segments_shape,
 };
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -36,11 +37,11 @@ use hekate_gadgets::atoms::int_arith::{
     mod_reduction_scratch_count, range_check, schoolbook_mul, schoolbook_mul_layout,
 };
 use hekate_math::{Bit, Block32, TowerField};
-use hekate_program::Air;
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
 use hekate_program::expander::VirtualExpander;
 use hekate_program::permutation::{PermutationCheckSpec, Source};
+use hekate_program::{Air, CadenceSegment, FixedColumn, FixedShape};
 
 // =================================================================
 // Column Layout (computed dynamically per modulus)
@@ -49,6 +50,8 @@ use hekate_program::permutation::{PermutationCheckSpec, Source};
 // Trailing Bit selectors:
 // 9 control bits + aux_flow + aux_bound.
 const NTT_CONTROL_BITS: usize = 11;
+
+const NTT_POLY_N: usize = 256;
 
 /// Column index map for the NTT chiplet.
 /// Computed at construction time from
@@ -435,6 +438,177 @@ impl NttLayout {
     }
 }
 
+#[derive(Clone, Debug)]
+pub enum NttRun {
+    Forward { instances: usize },
+    Inverse { instances: usize },
+    Pointwise { calls: usize },
+}
+
+/// Ordered maximal same-type runs of the ops stream;
+/// drives every bus selector's fixed shape. A trace
+/// with a diverging layout fails the fixed-column check.
+#[derive(Clone, Debug)]
+pub struct NttSchedule {
+    layers: usize,
+    runs: Vec<NttRun>,
+}
+
+struct SelectorSegments<F> {
+    active: Vec<CadenceSegment<F>>,
+    flow_output: Vec<CadenceSegment<F>>,
+    flow_input: Vec<CadenceSegment<F>>,
+    bound_in: Vec<CadenceSegment<F>>,
+    bound_out: Vec<CadenceSegment<F>>,
+    mulonly: Vec<CadenceSegment<F>>,
+}
+
+impl NttSchedule {
+    pub fn new(layers: usize, runs: Vec<NttRun>) -> Self {
+        assert!(
+            runs.is_empty() || layers >= 2,
+            "NTT schedule needs at least 2 layers"
+        );
+
+        for run in &runs {
+            let size = match run {
+                NttRun::Forward { instances } | NttRun::Inverse { instances } => *instances,
+                NttRun::Pointwise { calls } => *calls,
+            };
+
+            assert!(size > 0, "empty NTT schedule run");
+        }
+
+        Self { layers, runs }
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            layers: 0,
+            runs: Vec::new(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    fn forward_rows(&self) -> usize {
+        NTT_POLY_N * self.layers
+    }
+
+    fn inverse_rows(&self) -> usize {
+        2 * NTT_POLY_N + 3 * (NTT_POLY_N / 2) * (self.layers - 1)
+    }
+
+    pub fn total_rows(&self) -> usize {
+        self.runs
+            .iter()
+            .map(|run| match run {
+                NttRun::Forward { instances } => instances * self.forward_rows(),
+                NttRun::Inverse { instances } => instances * self.inverse_rows(),
+                NttRun::Pointwise { calls } => calls * NTT_POLY_N,
+            })
+            .sum()
+    }
+
+    pub fn active_shape<F: TowerField>(&self) -> FixedShape<F> {
+        segments_shape(self.selector_segments::<F>().active)
+    }
+
+    pub fn mulonly_shape<F: TowerField>(&self) -> FixedShape<F> {
+        segments_shape(self.selector_segments::<F>().mulonly)
+    }
+
+    fn selector_segments<F: TowerField>(&self) -> SelectorSegments<F> {
+        let n = NTT_POLY_N;
+        let half = n / 2;
+        let l = self.layers;
+
+        let mut segs = SelectorSegments {
+            active: Vec::new(),
+            flow_output: Vec::new(),
+            flow_input: Vec::new(),
+            bound_in: Vec::new(),
+            bound_out: Vec::new(),
+            mulonly: Vec::new(),
+        };
+
+        let mut origin = 0usize;
+        for run in &self.runs {
+            match run {
+                NttRun::Forward { instances } => {
+                    let ilen = self.forward_rows();
+
+                    push_seg(
+                        &mut segs.active,
+                        origin,
+                        2,
+                        instances * ilen / 2,
+                        &[F::ONE, F::ZERO],
+                    );
+
+                    for i in 0..*instances {
+                        let io = origin + i * ilen;
+
+                        push_seg(&mut segs.flow_output, io, 1, n * (l - 1), &[F::ONE]);
+                        push_seg(&mut segs.flow_input, io + n, 1, n * (l - 1), &[F::ONE]);
+                        push_seg(&mut segs.bound_in, io, 1, n, &[F::ONE]);
+                        push_seg(&mut segs.bound_out, io + n * (l - 1), 1, n, &[F::ONE]);
+                    }
+
+                    origin += instances * ilen;
+                }
+                NttRun::Inverse { instances } => {
+                    let ilen = self.inverse_rows();
+                    let triplets = 3 * half * (l - 1);
+
+                    for i in 0..*instances {
+                        let io = origin + i * ilen;
+
+                        push_seg(&mut segs.active, io, 1, n, &[F::ONE]);
+                        push_seg(
+                            &mut segs.active,
+                            io + n,
+                            3,
+                            half * (l - 1),
+                            &[F::ONE, F::ZERO, F::ONE],
+                        );
+                        push_seg(&mut segs.active, io + n + triplets, 1, n, &[F::ONE]);
+
+                        push_seg(&mut segs.flow_output, io, 1, n, &[F::ONE]);
+                        push_seg(
+                            &mut segs.flow_output,
+                            io + n,
+                            3,
+                            half * (l - 2),
+                            &[F::ONE, F::ZERO, F::ONE],
+                        );
+
+                        push_seg(
+                            &mut segs.flow_input,
+                            io + n,
+                            3,
+                            half * (l - 1),
+                            &[F::ONE, F::ONE, F::ZERO],
+                        );
+                    }
+
+                    origin += instances * ilen;
+                }
+                NttRun::Pointwise { calls } => {
+                    push_seg(&mut segs.active, origin, 1, calls * n, &[F::ONE]);
+                    push_seg(&mut segs.mulonly, origin, 1, calls * n, &[F::ONE]);
+
+                    origin += calls * n;
+                }
+            }
+        }
+
+        segs
+    }
+}
+
 // =================================================================
 // NTT Chiplet
 // =================================================================
@@ -455,6 +629,7 @@ pub struct NttChiplet {
     pub bit_width: usize,
     pub num_rows: usize,
 
+    schedule: NttSchedule,
     layout: NttLayout,
     expander: VirtualExpander,
 }
@@ -466,8 +641,12 @@ impl NttChiplet {
     pub const BOUND_IN_BUS_ID: &'static str = "ntt_bound_in";
     pub const BOUND_OUT_BUS_ID: &'static str = "ntt_bound_out";
 
-    pub fn new(modulus: u32, num_rows: usize) -> Self {
+    pub fn new(modulus: u32, num_rows: usize, schedule: NttSchedule) -> Self {
         assert!(num_rows.is_power_of_two());
+        assert!(
+            schedule.total_rows() <= num_rows,
+            "NTT schedule exceeds num_rows"
+        );
 
         let bit_width = 32 - modulus.leading_zeros() as usize;
         let layout = NttLayout::compute(modulus, bit_width);
@@ -483,6 +662,7 @@ impl NttChiplet {
             modulus,
             bit_width,
             num_rows,
+            schedule,
             layout,
             expander,
         }
@@ -532,20 +712,11 @@ impl NttChiplet {
     /// Linking specification for the twiddle ROM bus.
     /// Carries (layer, butterfly_idx, w).
     pub fn twiddle_linking_spec(&self) -> PermutationCheckSpec {
-        PermutationCheckSpec::new_lookup(
-            vec![
-                (
-                    Source::Column(self.layout.layer),
-                    b"kappa_tw_layer" as &[u8],
-                ),
-                (
-                    Source::Column(self.layout.butterfly_idx),
-                    b"kappa_tw_bfly" as &[u8],
-                ),
-                (Source::Column(self.layout.bus_w), b"kappa_tw_w" as &[u8]),
-            ],
-            Some(self.layout.s_active),
-        )
+        let ly = &self.layout;
+
+        crate::twiddle_rom::TwiddleRomChiplet::service()
+            .request(&[ly.layer, ly.butterfly_idx, ly.bus_w], ly.s_active)
+            .expect("service slots match the requester columns")
     }
 
     /// Flow output spec.
@@ -628,8 +799,8 @@ impl NttChiplet {
         )
         .with_clock_waiver(
             "see pqc/ntt.rs: partner flow_output_spec carries Source::RowIndexByte; \
-             this side stores the matching clock in committed flow_clk[0..4] columns \
-             pinned by AIR transitions",
+             this side commits flow_clk[0..4] as a shape-(a) free responder clock, \
+             sound because partner keys are pairwise distinct by verifier construction",
         )
     }
 
@@ -724,6 +895,41 @@ impl<F: TowerField + TraceCompatibleField> Air<F> for NttChiplet {
 
     fn virtual_expander(&self) -> Option<&VirtualExpander> {
         Some(&self.expander)
+    }
+
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        if self.schedule.is_empty() {
+            return Vec::new();
+        }
+
+        let segs = self.schedule.selector_segments::<F>();
+
+        vec![
+            FixedColumn {
+                col_idx: self.layout.s_active,
+                shape: segments_shape(segs.active.clone()),
+            },
+            FixedColumn {
+                col_idx: self.layout.s_output,
+                shape: segments_shape(segs.active),
+            },
+            FixedColumn {
+                col_idx: self.layout.s_flow_output,
+                shape: segments_shape(segs.flow_output),
+            },
+            FixedColumn {
+                col_idx: self.layout.s_flow_input,
+                shape: segments_shape(segs.flow_input),
+            },
+            FixedColumn {
+                col_idx: self.layout.s_bound_in,
+                shape: segments_shape(segs.bound_in),
+            },
+            FixedColumn {
+                col_idx: self.layout.s_bound_out,
+                shape: segments_shape(segs.bound_out),
+            },
+        ]
     }
 
     fn constraint_ast(&self) -> ConstraintAst<F> {
@@ -1788,7 +1994,7 @@ mod tests {
 
     #[test]
     fn constraint_ast_builds_q3329() {
-        let chiplet = NttChiplet::new(3329, 1024);
+        let chiplet = NttChiplet::new(3329, 1024, NttSchedule::empty());
         let ast: ConstraintAst<F> = chiplet.constraint_ast();
 
         // Sanity:
@@ -1809,7 +2015,7 @@ mod tests {
 
     #[test]
     fn packing_and_selector_constraints_present() {
-        let chiplet = NttChiplet::new(3329, 1024);
+        let chiplet = NttChiplet::new(3329, 1024, NttSchedule::empty());
         let ast: ConstraintAst<F> = chiplet.constraint_ast();
         let count_with = ast.roots.len();
 
@@ -1984,7 +2190,7 @@ mod tests {
             assert_eq!(actual, expected, "a_bit[{k}] mismatch");
         }
 
-        let chiplet = NttChiplet::new(modulus, 4);
+        let chiplet = NttChiplet::new(modulus, 4, NttSchedule::empty());
         let variants = Air::<F>::virtual_expander(&chiplet)
             .unwrap()
             .expand_variants(&trace, 0)

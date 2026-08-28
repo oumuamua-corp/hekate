@@ -26,11 +26,11 @@ use alloc::vec::Vec;
 use hekate_core::trace::{ColumnTrace, ColumnType, TraceBuilder, TraceCompatibleField};
 use hekate_gadgets::atoms::int_arith;
 use hekate_math::{Block32, TowerField};
-use hekate_program::Air;
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
 use hekate_program::expander::VirtualExpander;
-use hekate_program::permutation::{PermutationCheckSpec, Source};
+use hekate_program::permutation::{BusKind, PermutationCheckSpec, Service, ServiceSlot};
+use hekate_program::{Air, FixedColumn};
 
 // =================================================================
 // Column Layout
@@ -180,6 +180,7 @@ pub struct NormCheckChiplet {
     pub bit_width: usize,
     pub bound: u32,
     pub num_rows: usize,
+    pub num_ops: usize,
 
     layout: NormCheckLayout,
     expander: VirtualExpander,
@@ -188,9 +189,10 @@ pub struct NormCheckChiplet {
 impl NormCheckChiplet {
     pub const BUS_ID: &'static str = "norm_check";
 
-    pub fn new(modulus: u32, bound: u32, num_rows: usize) -> Self {
+    pub fn new(modulus: u32, bound: u32, num_rows: usize, num_ops: usize) -> Self {
         assert!(num_rows.is_power_of_two());
         assert!(bound > 0 && bound <= modulus / 2);
+        assert!(num_ops <= num_rows, "op count exceeds num_rows");
 
         let bit_width = 32 - modulus.leading_zeros() as usize;
         let layout = NormCheckLayout::compute(bit_width);
@@ -207,6 +209,7 @@ impl NormCheckChiplet {
             bit_width,
             bound,
             num_rows,
+            num_ops,
             layout,
             expander,
         }
@@ -216,24 +219,29 @@ impl NormCheckChiplet {
         &self.layout
     }
 
-    pub fn linking_spec(&self) -> PermutationCheckSpec {
-        PermutationCheckSpec::new(
-            vec![
-                (
-                    Source::Column(self.layout.bus_value),
-                    b"kappa_nc_value" as &[u8],
-                ),
-                (
-                    Source::Column(self.layout.bus_idx),
-                    b"kappa_nc_idx" as &[u8],
-                ),
+    /// Both endpoints derive from this schema:
+    /// the checked value and its coefficient index.
+    pub fn service() -> Service {
+        Service {
+            bus_id: Self::BUS_ID,
+            kind: BusKind::Permutation,
+            slots: vec![
+                ServiceSlot::Value(b"kappa_nc_value"),
+                ServiceSlot::Value(b"kappa_nc_idx"),
             ],
-            Some(self.layout.s_active),
-        )
-        .with_clock_waiver(
-            "see pqc/norm_check.rs: bus_idx is positional, AIR forces one row per \
-             (idx) value; partner mldsa ctrl side carries the matching idx clock",
-        )
+            clock_waiver: Some(
+                "see pqc/norm_check.rs: bus_idx is positional, both endpoints force \
+                 one row per (idx) value by AIR rather than by a clock slot",
+            ),
+        }
+    }
+
+    pub fn linking_spec(&self) -> PermutationCheckSpec {
+        let ly = &self.layout;
+
+        Self::service()
+            .respond(&[ly.bus_value, ly.bus_idx], &[], ly.s_active)
+            .expect("service slots match the responder columns")
     }
 }
 
@@ -253,6 +261,10 @@ impl<F: TowerField + TraceCompatibleField> Air<F> for NormCheckChiplet {
 
     fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
         vec![(Self::BUS_ID.into(), self.linking_spec())]
+    }
+
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::prefix(self.layout.s_active, self.num_ops)]
     }
 
     fn virtual_expander(&self) -> Option<&VirtualExpander> {
@@ -532,7 +544,7 @@ mod tests {
 
     #[test]
     fn constraint_ast_builds() {
-        let chiplet = NormCheckChiplet::new(Q, BOUND, 1024);
+        let chiplet = NormCheckChiplet::new(Q, BOUND, 1024, 1024);
         let ast = Air::<F>::constraint_ast(&chiplet);
 
         // Non-trivial constraint count
@@ -541,7 +553,7 @@ mod tests {
 
     #[test]
     fn air_declares_one_bus() {
-        let chiplet = NormCheckChiplet::new(Q, BOUND, 1024);
+        let chiplet = NormCheckChiplet::new(Q, BOUND, 1024, 1024);
         let checks = Air::<F>::permutation_checks(&chiplet);
 
         assert_eq!(checks.len(), 1);
@@ -659,7 +671,7 @@ mod tests {
 
     #[test]
     fn bus_labels() {
-        let chiplet = NormCheckChiplet::new(Q, BOUND, 1024);
+        let chiplet = NormCheckChiplet::new(Q, BOUND, 1024, 1024);
         let spec = chiplet.linking_spec();
 
         assert_eq!(spec.sources.len(), 2);
@@ -692,7 +704,7 @@ mod tests {
 
         assert_eq!(trace.columns.len(), ly.num_physical_columns);
 
-        let chiplet = NormCheckChiplet::new(Q, BOUND, 4);
+        let chiplet = NormCheckChiplet::new(Q, BOUND, 4, 4);
         let variants = Air::<F>::virtual_expander(&chiplet)
             .unwrap()
             .expand_variants::<F, _>(&trace, 0)

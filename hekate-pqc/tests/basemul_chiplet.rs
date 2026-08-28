@@ -6,20 +6,17 @@
 //! Basemul chiplet (isolated).
 
 use hekate_core::config::Config;
+use hekate_core::trace::TraceBuilder;
 use hekate_core::trace::TraceColumn;
-use hekate_core::trace::{ColumnType, TraceBuilder};
 use hekate_crypto::DefaultHasher;
 use hekate_crypto::transcript::Transcript;
 use hekate_math::Block128;
 use hekate_math::{Bit, Block32, TowerField};
-use hekate_pqc::basemul::{
-    BasemulChiplet, BasemulOp, CpuBasemulColumns, CpuBasemulUnit, generate_basemul_trace,
-};
+use hekate_pqc::basemul::{BasemulChiplet, BasemulOp, CpuBasemulColumns, generate_basemul_trace};
 use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::ConstraintAst;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::permutation::PermutationCheckSpec;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::circuit::{Circuit, CircuitProgram};
+use hekate_program::digest::program_id;
+use hekate_program::{FixedShape, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_scribble::{MutationKind, ScribbleConfig, assert_all_caught_all_targets};
 use hekate_verifier::HekateVerifier;
@@ -30,57 +27,42 @@ type H = DefaultHasher;
 
 const Q: u32 = 3329;
 
-#[derive(Clone)]
-struct BasemulTestProgram {
-    bm_rows: usize,
-}
+fn basemul_test_program(bm_rows: usize, num_ops: usize) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("BasemulTest", bm_rows).unwrap();
+    let cpu = cx.schema(&CpuBasemulColumns::build_layout());
 
-impl Air<F> for BasemulTestProgram {
-    fn num_columns(&self) -> usize {
-        CpuBasemulColumns::NUM_COLUMNS
-    }
+    cx.fix(
+        cpu.at(CpuBasemulColumns::SELECTOR),
+        FixedShape::Cadence {
+            stride: 1,
+            count: num_ops,
+            origin: 0,
+            values: vec![F::ONE],
+        },
+    );
 
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        LAYOUT.get_or_init(CpuBasemulColumns::build_layout)
-    }
+    cx.bus(BasemulChiplet::BUS_ID, BasemulChiplet::cpu_linking_spec());
 
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![(
-            BasemulChiplet::BUS_ID.into(),
-            CpuBasemulUnit::linking_spec(),
-        )]
-    }
+    let cs = cx.cs();
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
+    let s = cs.col(CpuBasemulColumns::SELECTOR);
+    let not_active = cs.one() - s;
 
-        let s = cs.col(CpuBasemulColumns::SELECTOR);
-        cs.assert_boolean(s);
+    cs.assert_zero_when(not_active, cs.col(CpuBasemulColumns::BM_A));
+    cs.assert_zero_when(not_active, cs.col(CpuBasemulColumns::BM_B));
+    cs.assert_zero_when(not_active, cs.col(CpuBasemulColumns::BM_C));
+    cs.assert_zero_when(not_active, cs.col(CpuBasemulColumns::BM_IDX));
 
-        let not_active = cs.one() - s;
+    cx.attach(ChipletDef::from_air(&BasemulChiplet::new(Q, bm_rows, num_ops)).unwrap());
 
-        cs.assert_zero_when(not_active, cs.col(CpuBasemulColumns::BM_A));
-        cs.assert_zero_when(not_active, cs.col(CpuBasemulColumns::BM_B));
-        cs.assert_zero_when(not_active, cs.col(CpuBasemulColumns::BM_C));
-        cs.assert_zero_when(not_active, cs.col(CpuBasemulColumns::BM_IDX));
-
-        cs.build()
-    }
-}
-
-impl Program<F> for BasemulTestProgram {
-    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        let bm = BasemulChiplet::new(Q, self.bm_rows);
-        Ok(vec![ChipletDef::from_air(&bm)?])
-    }
+    cx.compile().unwrap()
 }
 
 fn prove_and_verify(ops: &[BasemulOp], label: &str) -> bool {
     let cpu_rows = (ops.len() + 1).next_power_of_two().max(4);
     let bm_rows = cpu_rows;
 
-    let air = BasemulTestProgram { bm_rows };
+    let air = basemul_test_program(bm_rows, ops.len());
 
     let layout = CpuBasemulColumns::build_layout();
 
@@ -131,13 +113,16 @@ fn prove_and_verify(ops: &[BasemulOp], label: &str) -> bool {
     };
 
     let mut vt = Transcript::<H>::new(b"Basemul_E2E");
-    match HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config) {
+    let pinned_id = program_id(&air).unwrap();
+
+    match HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config) {
         Ok(valid) => {
             if valid {
                 eprintln!("[{label}] PASS");
             } else {
                 eprintln!("[{label}] FAIL: verifier returned false");
             }
+
             valid
         }
         Err(e) => {
@@ -170,7 +155,7 @@ fn single_overflow() {
     let ops = vec![BasemulOp {
         a: 2000,
         b: 2000,
-        c: (4000 % Q),
+        c: 4000 % Q,
         idx: 0,
         ram_addr: 0,
         request_idx: 0,
@@ -311,7 +296,7 @@ fn adversarial_corrupted_sum_rejected() {
     let cpu_rows = 4usize;
     let bm_rows = 4;
 
-    let air = BasemulTestProgram { bm_rows };
+    let air = basemul_test_program(bm_rows, ops.len());
 
     let layout = CpuBasemulColumns::build_layout();
 
@@ -366,7 +351,11 @@ fn adversarial_corrupted_sum_rejected() {
         Err(_) => {} // prover caught the corruption
         Ok(proof) => {
             let mut vt = Transcript::<H>::new(b"Basemul_E2E");
-            let valid = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
+            let pinned_id = program_id(&air).unwrap();
+
+            let valid = HekateVerifier::<F, H>::verify(
+                &pinned_id, &air, &instance, &proof, &mut vt, &config,
+            );
 
             if let Ok(true) = valid {
                 panic!("corrupted sum accepted — mod-add soundness break")
@@ -394,7 +383,7 @@ fn adversarial_c_out_of_range_rejected() {
     let cpu_rows = 4usize;
     let bm_rows = 4;
 
-    let air = BasemulTestProgram { bm_rows };
+    let air = basemul_test_program(bm_rows, ops.len());
     let layout = CpuBasemulColumns::build_layout();
 
     let mut tb = TraceBuilder::new(&layout, cpu_rows.trailing_zeros() as usize).unwrap();
@@ -446,7 +435,11 @@ fn adversarial_c_out_of_range_rejected() {
         Err(_) => {}
         Ok(proof) => {
             let mut vt = Transcript::<H>::new(b"Basemul_E2E");
-            let valid = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
+            let pinned_id = program_id(&air).unwrap();
+
+            let valid = HekateVerifier::<F, H>::verify(
+                &pinned_id, &air, &instance, &proof, &mut vt, &config,
+            );
 
             if let Ok(true) = valid {
                 panic!("c >= q accepted — range check soundness break")
@@ -480,7 +473,7 @@ fn exploit_basemul_duplicate_cpu_request_rejected() {
     let cpu_rows = 4usize;
     let bm_rows = 4;
 
-    let air = BasemulTestProgram { bm_rows };
+    let air = basemul_test_program(bm_rows, ops.len());
     let layout = CpuBasemulColumns::build_layout();
 
     let mut tb = TraceBuilder::new(&layout, cpu_rows.trailing_zeros() as usize).unwrap();
@@ -532,7 +525,11 @@ fn exploit_basemul_duplicate_cpu_request_rejected() {
         Err(_) => {}
         Ok(proof) => {
             let mut vt = Transcript::<H>::new(b"Basemul_E2E");
-            let valid = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
+            let pinned_id = program_id(&air).unwrap();
+
+            let valid = HekateVerifier::<F, H>::verify(
+                &pinned_id, &air, &instance, &proof, &mut vt, &config,
+            );
 
             if let Ok(true) = valid {
                 panic!("duplicate cpu request accepted — v3 request_idx soundness break")
@@ -565,7 +562,7 @@ fn scribble_basemul_flip_selector_caught() {
     let cpu_rows = (ops.len() + 1).next_power_of_two().max(4);
     let bm_rows = cpu_rows;
 
-    let air = BasemulTestProgram { bm_rows };
+    let air = basemul_test_program(bm_rows, ops.len());
 
     let layout = CpuBasemulColumns::build_layout();
     let mut tb = TraceBuilder::new(&layout, cpu_rows.trailing_zeros() as usize).unwrap();
@@ -631,7 +628,7 @@ fn scribble_basemul_padding_row_attacks_caught() {
     let cpu_rows = (ops.len() + 1).next_power_of_two().max(4);
     let bm_rows = cpu_rows;
 
-    let air = BasemulTestProgram { bm_rows };
+    let air = basemul_test_program(bm_rows, ops.len());
     let layout = CpuBasemulColumns::build_layout();
 
     let mut tb = TraceBuilder::new(&layout, cpu_rows.trailing_zeros() as usize).unwrap();

@@ -7,6 +7,7 @@ use hekate_core::trace::{ColumnTrace, ColumnType, TraceBuilder, TraceColumn};
 use hekate_crypto::DefaultHasher;
 use hekate_crypto::transcript::Transcript;
 use hekate_math::{Bit, Block32, Block128, Flat, TowerField};
+use hekate_pqc::ntt::{NttRun, NttSchedule};
 use hekate_pqc::twiddle_rom::{
     TWIDDLE_W_BINDING_BUS_ID, TwiddleEntry, TwiddleRomChiplet, TwiddleRomColumns,
     generate_twiddle_rom_trace,
@@ -14,8 +15,9 @@ use hekate_pqc::twiddle_rom::{
 use hekate_program::chiplet::ChipletDef;
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
+use hekate_program::digest::program_id;
 use hekate_program::permutation::{PermutationCheckSpec, REQUEST_IDX_LABEL, Source};
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::{Air, FixedColumn, FixedShape, Program, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_scribble::{MutationKind, ScribbleConfig, Target, assert_all_caught};
 use hekate_verifier::HekateVerifier;
@@ -47,25 +49,32 @@ fn cpu_w_binding_spec() -> PermutationCheckSpec {
     )
 }
 
+fn forward_schedule() -> NttSchedule {
+    NttSchedule::new(7, vec![NttRun::Forward { instances: 1 }])
+}
+
 fn honest_entries() -> Vec<TwiddleEntry> {
-    vec![
-        TwiddleEntry {
+    let mut entries = Vec::with_capacity(1792);
+    for k in 0..896usize {
+        entries.push(TwiddleEntry {
+            layer: (k / 128) as u32,
+            butterfly_idx: (k % 128) as u32,
+            w: (k as u32) % Q,
+            is_mulonly: false,
+            active: true,
+            request_idx_tr: 0,
+        });
+        entries.push(TwiddleEntry {
             layer: 0,
             butterfly_idx: 0,
-            w: 1,
+            w: 0,
             is_mulonly: false,
-            active: true,
+            active: false,
             request_idx_tr: 0,
-        },
-        TwiddleEntry {
-            layer: 0,
-            butterfly_idx: 1,
-            w: 2,
-            is_mulonly: false,
-            active: true,
-            request_idx_tr: 0,
-        },
-    ]
+        });
+    }
+
+    entries
 }
 
 fn set_b32(trace: &mut ColumnTrace, col: usize, row: usize, val: u32) {
@@ -103,17 +112,21 @@ impl Air<F> for ShadowExploitProgram {
         vec![(TWIDDLE_W_BINDING_BUS_ID.into(), cpu_w_binding_spec())]
     }
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CPU_SEL));
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn {
+            col_idx: CPU_SEL,
+            shape: FixedShape::Sparse(Vec::new()),
+        }]
+    }
 
-        cs.build()
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        ConstraintSystem::<F>::new().build()
     }
 }
 
 impl Program<F> for ShadowExploitProgram {
     fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        let twiddle = TwiddleRomChiplet::new(Q, self.twiddle_rows);
+        let twiddle = TwiddleRomChiplet::new(Q, self.twiddle_rows, forward_schedule());
         let mut def = ChipletDef::from_air(&twiddle)?;
 
         // No NTT chiplet here, so the
@@ -150,7 +163,7 @@ impl Air<F> for TwiddleRomIsolatedProgram {
 
 impl Program<F> for TwiddleRomIsolatedProgram {
     fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        let twiddle = TwiddleRomChiplet::new(Q, self.twiddle_rows);
+        let twiddle = TwiddleRomChiplet::new(Q, self.twiddle_rows, forward_schedule());
 
         let mut def = ChipletDef::from_air(&twiddle)?;
         def.permutation_checks.clear();
@@ -164,7 +177,7 @@ where
     T: FnOnce(&mut ColumnTrace, &mut ColumnTrace),
 {
     let entries = honest_entries();
-    let twiddle_rows: usize = 4;
+    let twiddle_rows: usize = 2048;
     let cpu_rows: usize = 4;
 
     let mut twiddle_trace = generate_twiddle_rom_trace(&entries, twiddle_rows)
@@ -203,10 +216,14 @@ where
     };
 
     let mut vt = Transcript::<H>::new(b"TwiddleRom_Shadow");
-    HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config).unwrap_or(false)
+    let pinned_id = program_id(&air).unwrap();
+
+    HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config)
+        .unwrap_or(false)
 }
 
 #[test]
+#[cfg_attr(debug_assertions, ignore)]
 fn shadow_honest_baseline_verifies() {
     assert!(
         run_e2e(|_t, _c| {}),
@@ -215,6 +232,7 @@ fn shadow_honest_baseline_verifies() {
 }
 
 #[test]
+#[cfg_attr(debug_assertions, ignore)]
 fn shadow_exploit_must_be_rejected() {
     // Forge MULONLY=1 on a non-basemul
     // row + matching CPU partner.
@@ -229,15 +247,14 @@ fn shadow_exploit_must_be_rejected() {
 
     assert!(
         !accepted,
-        "TwiddleRom MULONLY_SELECTOR shadow let a forged twiddle_w_binding \
-         emission verify: AIR must pin MULONLY_SELECTOR ⇔ LAYER == basemul marker"
+        "forged twiddle_w_binding emission must be rejected"
     );
 }
 
 #[test]
 fn scribble_twiddle_rom_mulonly_selector_focused() {
     let entries = honest_entries();
-    let twiddle_rows: usize = 4;
+    let twiddle_rows: usize = 2048;
     let cpu_rows: usize = 4;
 
     let twiddle_trace = generate_twiddle_rom_trace(&entries, twiddle_rows)
