@@ -63,7 +63,6 @@ hekate-keccak = { workspace = true, features = ["std", "blake3"] }
 hekate-aes = { workspace = true, features = ["std", "blake3"] }
 hekate-pqc = { workspace = true, features = ["std", "blake3"] }
 hekate-scribble = { workspace = true }
-criterion = "0.8"
 proptest = "1.9"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing = { version = "0.1", features = ["attributes"] }
@@ -73,7 +72,3 @@ rand = "0.9"
 keccak = "0.2"
 ml-kem = { version = "0.3", features = ["getrandom"] }
 ml-dsa = "0.1"
-
-[[bench]]
-name = "rom"
-harness = false
