@@ -7,9 +7,11 @@ use hekate_core::trace::{ColumnTrace, ColumnType, Trace, TraceBuilder};
 use hekate_crypto::DefaultHasher;
 use hekate_crypto::transcript::Transcript;
 use hekate_math::{Bit, Block32, Block128, TowerField};
+use hekate_program::FixedColumn;
 use hekate_program::constraint::builder::ConstraintSystem;
 use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
 use hekate_program::define_columns;
+use hekate_program::digest::program_id;
 use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::{CancelToken, Error, ErrorCode, prove};
 use hekate_verifier::HekateVerifier;
@@ -46,15 +48,19 @@ impl Air<F> for FibAir {
     }
 
     fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
-        vec![BoundaryConstraint::with_public_input(
-            FibCols::B,
-            self.num_rows - 1,
-            0,
-        )]
+        vec![
+            BoundaryConstraint::with_constant(FibCols::A, 0, F::ZERO),
+            BoundaryConstraint::with_constant(FibCols::B, 0, F::ONE),
+            BoundaryConstraint::with_public_input(FibCols::B, self.num_rows - 1, 0),
+        ]
     }
 
     fn column_layout(&self) -> &[ColumnType] {
         &self.layout
+    }
+
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::last_row(FibCols::Q)]
     }
 
     fn constraint_ast(&self) -> ConstraintAst<F> {
@@ -78,8 +84,8 @@ impl Program<F> for FibAir {
 
 fn build_fib_trace(num_rows: usize) -> ColumnTrace {
     let num_vars = num_rows.trailing_zeros() as usize;
-    let mut tb = TraceBuilder::new(&FibCols::build_layout(), num_vars).expect("trace builder");
 
+    let mut tb = TraceBuilder::new(&FibCols::build_layout(), num_vars).expect("trace builder");
     let (mut a, mut b) = (Block32::ZERO, Block32::ONE);
 
     for i in 0..num_rows {
@@ -134,8 +140,10 @@ fn shim_prove_verifies_against_hekate_verifier() {
     let proof = prove(label, &air, &instance, &witness, &config, seed, None).expect("prove");
 
     let mut t = Transcript::<H>::new(label);
-    let ok =
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut t, &config).expect("verify");
+    let pinned_id = program_id(&air).unwrap();
+
+    let ok = HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut t, &config)
+        .expect("verify");
 
     assert!(ok, "verifier rejected shim-produced proof");
 }
