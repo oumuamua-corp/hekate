@@ -7,10 +7,10 @@
 extern crate alloc;
 
 mod brakedown;
-mod evaluator;
 mod outer;
 mod sumcheck;
 
+pub mod evaluator;
 pub mod logup;
 
 pub use sumcheck::verify;
