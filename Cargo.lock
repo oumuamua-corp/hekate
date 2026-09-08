@@ -779,9 +779,9 @@ dependencies = [
 
 [[package]]
 name = "hekate-math"
-version = "0.10.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64f583beab8bb2ef3828de75ef758db060c586c9933825f422e914123c50c54b"
+checksum = "652e6cdd78dfcd51b1f4a9b98a783877c2b70e621ddce2be0dd4b125836de5f2"
 dependencies = [
  "rayon",
  "serde",
