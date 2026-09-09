@@ -149,6 +149,25 @@ jobs:
       - name: PMULL enabled
         run: cargo rustc --release -p hekate-core -- --print cfg | grep -qx 'target_feature="aes"'
 
+      - name: License headers
+        run: |
+          bad=$(git ls-files '*.rs' '*.fbs' ':!hekate-sdk/src/generated/*_generated.rs' \
+            | while read -r f; do
+                head -10 "$f" | grep -q 'SPDX-License-Identifier: AGPL-3.0-only' \
+                  && head -10 "$f" | grep -q 'SPDX-FileCopyrightText' || echo "$f"
+              done)
+          [ -z "$bad" ] || { echo "missing SPDX header:"; echo "$bad"; exit 1; }
+
+      - name: License files present
+        run: |
+          bad=$(git ls-files '*/Cargo.toml' | xargs -n1 dirname \
+            | while read -r d; do
+                for n in LICENSE NOTICE LICENSE-EXCEPTION; do
+                  [ -f "$d/$n" ] || echo "$d/$n"
+                done
+              done)
+          [ -z "$bad" ] || { echo "missing license file:"; echo "$bad"; exit 1; }
+
   audit:
     name: Audit + deny
     needs: changes

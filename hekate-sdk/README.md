@@ -31,5 +31,5 @@ over the program's structure (layout, constraints, chiplet defs, bus topology).
 
 ## License
 
-Licensed under Apache 2.0. See the [LICENSE](LICENSE) and [NOTICE](NOTICE) files
-for details.
+AGPL-3.0-only. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Commercial licenses are available from Oumuamua Labs <info@oumuamua.dev>.

@@ -1,28 +1,25 @@
 # Hekate ZK Engine
 
 [![CI](https://github.com/oumuamua-labs/hekate/actions/workflows/ci.yml/badge.svg)](https://github.com/oumuamua-labs/hekate/actions/workflows/ci.yml)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache2-yellow.svg)](./LICENSE)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](./LICENSE)
 
 Zero-knowledge proof system over binary tower fields. Streaming architecture. Bounded memory. Edge-native.
 Hekate proves computations in GF(2^128) using Sumcheck + Brakedown PCS with O(N) prover time and O(N) memory.
-
-> [!CAUTION]
-> **Prover binaries withdrawn**
->
-> The cdylib prover binaries are no longer available from the Oumuamua CDN.
-> Existing installations are unaffected. A substantial update is in preparation.
->
-> From the next release Hekate is AGPL-3.0. Published versions stay Apache-2.0.
-> Commercial licensing: [info@oumuamua.dev](mailto:info@oumuamua.dev)
 
 > [!WARNING]  
 > This workspace is under aggressive development. APIs, ABIs, and cryptographic signatures will break
 > without notice. Do not deploy to mainnet.
 
 > [!NOTE]  
-> The verifier, core SDK, and cryptographic chiplets are open-source. The prover and
-> compression engine stay proprietary, shipped as free, unrestricted binaries for macOS (Apple Silicon),
-> Linux (ARM64, glibc), and Android (ARM64).
+> The verifier, core SDK, and cryptographic chiplets are open-source under AGPL-3.0-only. The prover
+> and compression engine stay proprietary, shipped as free binaries for macOS (Apple Silicon),
+> Linux (ARM64, glibc), and Android (ARM64). Linking the two is covered by the
+> [prover linking exception](LICENSE-EXCEPTION).
+
+> [!IMPORTANT]  
+> [`hekate-mobile`](https://github.com/oumuamua-labs/hekate-mobile) compiles a Rust prover into a signed
+> iOS `.xcframework` and Android `.aar` behind a typed Swift / Kotlin API, one `await` per proof, zero ZK
+> terminology across the boundary. Shipping ZK to edge devices? Start there.
 
 ---
 
@@ -355,4 +352,12 @@ explicit carry chain, virtual-expanded into 32 bit + 32 sum + 32 carry columns.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+AGPL-3.0-only. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+Linking against the proprietary prover shared library is covered by the
+[prover linking exception](LICENSE-EXCEPTION), an additional permission under AGPL section 7.
+
+Releases up to and including 0.33.0 are Apache-2.0. AGPL-3.0-only applies from 0.34.0 onward.
+Commercial licenses are available from Oumuamua Labs <info@oumuamua.dev>.
+
+Hekate does not accept external code contributions. See [CONTRIBUTING](CONTRIBUTING.md).

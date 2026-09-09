@@ -23,6 +23,20 @@ allow = [
     "Zlib",
     "CDLA-Permissive-2.0",
 ]
+exceptions = [
+    { allow = ["AGPL-3.0-only"], crate = "hekate-crypto" },
+    { allow = ["AGPL-3.0-only"], crate = "hekate-core" },
+    { allow = ["AGPL-3.0-only"], crate = "hekate-program" },
+    { allow = ["AGPL-3.0-only"], crate = "hekate-verifier" },
+    { allow = ["AGPL-3.0-only"], crate = "hekate-gadgets" },
+    { allow = ["AGPL-3.0-only"], crate = "hekate-sdk" },
+    { allow = ["AGPL-3.0-only"], crate = "hekate-prover-sys" },
+    { allow = ["AGPL-3.0-only"], crate = "hekate-scribble" },
+    { allow = ["AGPL-3.0-only"], crate = "hekate-keccak" },
+    { allow = ["AGPL-3.0-only"], crate = "hekate-aes" },
+    { allow = ["AGPL-3.0-only"], crate = "hekate-pqc" },
+    { allow = ["AGPL-3.0-only"], crate = "hekate" },
+]
 confidence-threshold = 0.93
 
 [bans]

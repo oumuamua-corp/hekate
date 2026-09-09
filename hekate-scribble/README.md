@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/hekate-scribble.svg)](https://crates.io/crates/hekate-scribble)
 [![Docs.rs](https://docs.rs/hekate-scribble/badge.svg)](https://docs.rs/hekate-scribble)
 [![CI](https://github.com/oumuamua-labs/hekate/actions/workflows/ci.yml/badge.svg)](https://github.com/oumuamua-labs/hekate/actions/workflows/ci.yml)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache2-yellow.svg)](./LICENSE)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](./LICENSE)
 
 Trace mutation fuzzer for [Hekate](https://github.com/oumuamua-labs/hekate) ZK programs and chiplets.
 
@@ -183,4 +183,5 @@ Depends on `hekate-math`, `hekate-sdk`, `hekate-core`, `hekate-program`.
 
 ## License
 
-Apache-2.0
+AGPL-3.0-only. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Commercial licenses are available from Oumuamua Labs <info@oumuamua.dev>.

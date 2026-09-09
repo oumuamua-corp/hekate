@@ -55,5 +55,9 @@ into this crate at build-time; any tamper fails the build.
 
 ## License
 
-Licensed under Apache 2.0. See the [LICENSE](LICENSE) and [NOTICE](NOTICE)
-files for details.
+AGPL-3.0-only. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Commercial licenses are available from Oumuamua Labs <info@oumuamua.dev>.
+
+The prover shared library this crate links is not part of this crate and is
+distributed under its own terms. Linking it into an AGPL work is covered
+by [LICENSE-EXCEPTION](LICENSE-EXCEPTION), an additional permission under AGPL section 7.

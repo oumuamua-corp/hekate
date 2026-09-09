@@ -27,4 +27,5 @@ Exactly one of `blake3` / `sha2` / `sha3` must be enabled.
 
 ## License
 
-Licensed under Apache 2.0. See the [LICENSE](LICENSE) and [NOTICE](NOTICE) files for details.
+AGPL-3.0-only. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Commercial licenses are available from Oumuamua Labs <info@oumuamua.dev>.

@@ -24,4 +24,5 @@ Top-level `HekateVerifier::verify` replays Fiat-Shamir and chains the above into
 
 ## License
 
-Licensed under Apache-2.0. See the [LICENSE](LICENSE) and [NOTICE](NOTICE) files for details.
+AGPL-3.0-only. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Commercial licenses are available from Oumuamua Labs <info@oumuamua.dev>.
