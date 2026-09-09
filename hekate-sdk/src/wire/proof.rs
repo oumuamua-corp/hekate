@@ -282,15 +282,7 @@ fn deserialize_hashes(
                 return Err(wire_err(what));
             }
 
-            Ok(bytes
-                .chunks_exact(32)
-                .map(|c| {
-                    let mut h = [0u8; 32];
-                    h.copy_from_slice(c);
-
-                    h
-                })
-                .collect())
+            Ok(bytes.as_chunks::<32>().0.to_vec())
         }
         None => Ok(Vec::new()),
     }
@@ -709,15 +701,7 @@ fn deserialize_brakedown_proof<F: TowerField>(
                 return Err(wire_err("batch_path length not a multiple of 32"));
             }
 
-            bytes
-                .chunks_exact(32)
-                .map(|c| {
-                    let mut h = [0u8; 32];
-                    h.copy_from_slice(c);
-
-                    h
-                })
-                .collect()
+            bytes.as_chunks::<32>().0.to_vec()
         }
         None => Vec::new(),
     };
