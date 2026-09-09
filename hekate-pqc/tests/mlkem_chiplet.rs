@@ -183,7 +183,7 @@ fn prove_and_verify_mlkem_level(level: MlKemLevel, ct: &[u8], sk: &[u8]) -> Resu
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(chiplet_traces);
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::default()
     };
 
@@ -283,7 +283,7 @@ where
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(chiplet_traces);
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::default()
     };
 
@@ -385,7 +385,7 @@ where
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(chiplet_traces);
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::default()
     };
 
@@ -657,7 +657,7 @@ fn exploit_ntt_ram_binding_mismatch() {
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(chiplet_traces);
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::default()
     };
 
@@ -760,7 +760,7 @@ fn exploit_ntt_flow_connectivity_scramble() {
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(chiplet_traces);
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::default()
     };
 
@@ -979,7 +979,7 @@ fn exploit_keccak_input_unbound() {
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(chiplet_traces);
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::default()
     };
 

@@ -259,7 +259,7 @@ fn run_lookup(reader: &[(Block32, Bit)], table: &[(Block32, Bit)]) -> bool {
     let config = Config {
         num_queries: 4,
         min_security_bits: 0,
-        sumcheck_blinding_factor: 0,
+        zero_knowledge: false,
         ldt_support_size: 4,
         ..Config::default()
     };
@@ -291,7 +291,7 @@ fn run_req_idx(reader: &[(Block32, Bit)], table: &[(Block32, u32, Bit)]) -> bool
     let config = Config {
         num_queries: 4,
         min_security_bits: 0,
-        sumcheck_blinding_factor: 0,
+        zero_knowledge: false,
         ldt_support_size: 4,
         ..Config::default()
     };

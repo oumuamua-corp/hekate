@@ -107,7 +107,7 @@ fn prove_and_verify(ops: &[BasemulOp], label: &str) -> bool {
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(vec![bm_trace]);
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::dev()
     };
 
@@ -345,7 +345,7 @@ fn adversarial_corrupted_sum_rejected() {
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(vec![bm_trace]);
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::dev()
     };
 
@@ -425,7 +425,7 @@ fn adversarial_c_out_of_range_rejected() {
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(vec![bm_trace]);
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::dev()
     };
 
@@ -511,7 +511,7 @@ fn exploit_basemul_duplicate_cpu_request_rejected() {
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(vec![bm_trace]);
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::dev()
     };
 

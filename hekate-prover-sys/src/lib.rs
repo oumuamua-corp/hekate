@@ -48,6 +48,11 @@ pub fn init_tracing() {
     unsafe { ffi::hekate_init_tracing() };
 }
 
+/// Proves `witness` through the linked cdylib.
+///
+/// `seed` must be 32 CSPRNG bytes drawn fresh for
+/// every call; reusing it across two proofs of
+/// different witnesses discloses the witness.
 pub fn prove<P: Program<Block128>>(
     transcript_label: &[u8],
     program: &P,

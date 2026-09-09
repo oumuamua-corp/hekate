@@ -52,7 +52,10 @@ impl Air<F> for TestChiplet {
     }
 
     fn num_columns(&self) -> usize {
-        self.column_layout.len()
+        match &self.expander {
+            Some(e) => e.num_virtual_columns(),
+            None => self.column_layout.len(),
+        }
     }
 
     fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {

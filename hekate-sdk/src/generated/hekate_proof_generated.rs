@@ -1511,6 +1511,461 @@ pub mod hekate {
                 ds.finish()
             }
         }
+        pub enum OuterOpeningOffset {}
+        #[derive(Copy, Clone, PartialEq)]
+
+        pub struct OuterOpening<'a> {
+            pub _tab: ::flatbuffers::Table<'a>,
+        }
+
+        impl<'a> ::flatbuffers::Follow<'a> for OuterOpening<'a> {
+            type Inner = OuterOpening<'a>;
+            #[inline]
+            unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+                Self {
+                    _tab: unsafe { ::flatbuffers::Table::new(buf, loc) },
+                }
+            }
+        }
+
+        impl<'a> OuterOpening<'a> {
+            pub const VT_COLUMNS: ::flatbuffers::VOffsetT = 4;
+            pub const VT_VALUES: ::flatbuffers::VOffsetT = 6;
+            pub const VT_SIBLINGS: ::flatbuffers::VOffsetT = 8;
+
+            #[inline]
+            pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
+                OuterOpening { _tab: table }
+            }
+            #[allow(unused_mut)]
+            pub fn create<
+                'bldr: 'args,
+                'args: 'mut_bldr,
+                'mut_bldr,
+                A: ::flatbuffers::Allocator + 'bldr,
+            >(
+                _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
+                args: &'args OuterOpeningArgs<'args>,
+            ) -> ::flatbuffers::WIPOffset<OuterOpening<'bldr>> {
+                let mut builder = OuterOpeningBuilder::new(_fbb);
+                if let Some(x) = args.siblings {
+                    builder.add_siblings(x);
+                }
+                if let Some(x) = args.values {
+                    builder.add_values(x);
+                }
+                if let Some(x) = args.columns {
+                    builder.add_columns(x);
+                }
+                builder.finish()
+            }
+
+            #[inline]
+            pub fn columns(&self) -> Option<::flatbuffers::Vector<'a, u32>> {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, u32>>>(
+                            OuterOpening::VT_COLUMNS,
+                            None,
+                        )
+                }
+            }
+            #[inline]
+            pub fn values(&self) -> Option<::flatbuffers::Vector<'a, Block128>> {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, Block128>>>(
+                            OuterOpening::VT_VALUES,
+                            None,
+                        )
+                }
+            }
+            #[inline]
+            pub fn siblings(&self) -> Option<::flatbuffers::Vector<'a, u8>> {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, u8>>>(
+                            OuterOpening::VT_SIBLINGS,
+                            None,
+                        )
+                }
+            }
+        }
+
+        impl ::flatbuffers::Verifiable for OuterOpening<'_> {
+            #[inline]
+            fn run_verifier(
+                v: &mut ::flatbuffers::Verifier,
+                pos: usize,
+            ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+                v.visit_table(pos)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u32>>>("columns", Self::VT_COLUMNS, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, Block128>>>("values", Self::VT_VALUES, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u8>>>("siblings", Self::VT_SIBLINGS, false)?
+     .finish();
+                Ok(())
+            }
+        }
+        pub struct OuterOpeningArgs<'a> {
+            pub columns: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u32>>>,
+            pub values: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, Block128>>>,
+            pub siblings: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u8>>>,
+        }
+        impl<'a> Default for OuterOpeningArgs<'a> {
+            #[inline]
+            fn default() -> Self {
+                OuterOpeningArgs {
+                    columns: None,
+                    values: None,
+                    siblings: None,
+                }
+            }
+        }
+
+        pub struct OuterOpeningBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
+            fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+            start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
+        }
+        impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> OuterOpeningBuilder<'a, 'b, A> {
+            #[inline]
+            pub fn add_columns(
+                &mut self,
+                columns: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b, u32>>,
+            ) {
+                self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(
+                    OuterOpening::VT_COLUMNS,
+                    columns,
+                );
+            }
+            #[inline]
+            pub fn add_values(
+                &mut self,
+                values: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b, Block128>>,
+            ) {
+                self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(
+                    OuterOpening::VT_VALUES,
+                    values,
+                );
+            }
+            #[inline]
+            pub fn add_siblings(
+                &mut self,
+                siblings: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b, u8>>,
+            ) {
+                self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(
+                    OuterOpening::VT_SIBLINGS,
+                    siblings,
+                );
+            }
+            #[inline]
+            pub fn new(
+                _fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+            ) -> OuterOpeningBuilder<'a, 'b, A> {
+                let start = _fbb.start_table();
+                OuterOpeningBuilder {
+                    fbb_: _fbb,
+                    start_: start,
+                }
+            }
+            #[inline]
+            pub fn finish(self) -> ::flatbuffers::WIPOffset<OuterOpening<'a>> {
+                let o = self.fbb_.end_table(self.start_);
+                ::flatbuffers::WIPOffset::new(o.value())
+            }
+        }
+
+        impl ::core::fmt::Debug for OuterOpening<'_> {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                let mut ds = f.debug_struct("OuterOpening");
+                ds.field("columns", &self.columns());
+                ds.field("values", &self.values());
+                ds.field("siblings", &self.siblings());
+                ds.finish()
+            }
+        }
+        pub enum OuterProofOffset {}
+        #[derive(Copy, Clone, PartialEq)]
+
+        pub struct OuterProof<'a> {
+            pub _tab: ::flatbuffers::Table<'a>,
+        }
+
+        impl<'a> ::flatbuffers::Follow<'a> for OuterProof<'a> {
+            type Inner = OuterProof<'a>;
+            #[inline]
+            unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+                Self {
+                    _tab: unsafe { ::flatbuffers::Table::new(buf, loc) },
+                }
+            }
+        }
+
+        impl<'a> OuterProof<'a> {
+            pub const VT_AUX_ROOT: ::flatbuffers::VOffsetT = 4;
+            pub const VT_INTERLEAVED: ::flatbuffers::VOffsetT = 6;
+            pub const VT_LINEAR: ::flatbuffers::VOffsetT = 8;
+            pub const VT_QUADRATIC: ::flatbuffers::VOffsetT = 10;
+            pub const VT_PAD_OPENING: ::flatbuffers::VOffsetT = 12;
+            pub const VT_AUX_OPENING: ::flatbuffers::VOffsetT = 14;
+
+            #[inline]
+            pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
+                OuterProof { _tab: table }
+            }
+            #[allow(unused_mut)]
+            pub fn create<
+                'bldr: 'args,
+                'args: 'mut_bldr,
+                'mut_bldr,
+                A: ::flatbuffers::Allocator + 'bldr,
+            >(
+                _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
+                args: &'args OuterProofArgs<'args>,
+            ) -> ::flatbuffers::WIPOffset<OuterProof<'bldr>> {
+                let mut builder = OuterProofBuilder::new(_fbb);
+                if let Some(x) = args.aux_opening {
+                    builder.add_aux_opening(x);
+                }
+                if let Some(x) = args.pad_opening {
+                    builder.add_pad_opening(x);
+                }
+                if let Some(x) = args.quadratic {
+                    builder.add_quadratic(x);
+                }
+                if let Some(x) = args.linear {
+                    builder.add_linear(x);
+                }
+                if let Some(x) = args.interleaved {
+                    builder.add_interleaved(x);
+                }
+                if let Some(x) = args.aux_root {
+                    builder.add_aux_root(x);
+                }
+                builder.finish()
+            }
+
+            #[inline]
+            pub fn aux_root(&self) -> Option<::flatbuffers::Vector<'a, u8>> {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, u8>>>(
+                            OuterProof::VT_AUX_ROOT,
+                            None,
+                        )
+                }
+            }
+            #[inline]
+            pub fn interleaved(&self) -> Option<::flatbuffers::Vector<'a, Block128>> {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, Block128>>>(
+                            OuterProof::VT_INTERLEAVED,
+                            None,
+                        )
+                }
+            }
+            #[inline]
+            pub fn linear(&self) -> Option<::flatbuffers::Vector<'a, Block128>> {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, Block128>>>(
+                            OuterProof::VT_LINEAR,
+                            None,
+                        )
+                }
+            }
+            #[inline]
+            pub fn quadratic(&self) -> Option<::flatbuffers::Vector<'a, Block128>> {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, Block128>>>(
+                            OuterProof::VT_QUADRATIC,
+                            None,
+                        )
+                }
+            }
+            #[inline]
+            pub fn pad_opening(&self) -> Option<OuterOpening<'a>> {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<::flatbuffers::ForwardsUOffset<OuterOpening>>(
+                            OuterProof::VT_PAD_OPENING,
+                            None,
+                        )
+                }
+            }
+            #[inline]
+            pub fn aux_opening(&self) -> Option<OuterOpening<'a>> {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<::flatbuffers::ForwardsUOffset<OuterOpening>>(
+                            OuterProof::VT_AUX_OPENING,
+                            None,
+                        )
+                }
+            }
+        }
+
+        impl ::flatbuffers::Verifiable for OuterProof<'_> {
+            #[inline]
+            fn run_verifier(
+                v: &mut ::flatbuffers::Verifier,
+                pos: usize,
+            ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+                v.visit_table(pos)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u8>>>("aux_root", Self::VT_AUX_ROOT, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, Block128>>>("interleaved", Self::VT_INTERLEAVED, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, Block128>>>("linear", Self::VT_LINEAR, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, Block128>>>("quadratic", Self::VT_QUADRATIC, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<OuterOpening>>("pad_opening", Self::VT_PAD_OPENING, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<OuterOpening>>("aux_opening", Self::VT_AUX_OPENING, false)?
+     .finish();
+                Ok(())
+            }
+        }
+        pub struct OuterProofArgs<'a> {
+            pub aux_root: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u8>>>,
+            pub interleaved: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, Block128>>>,
+            pub linear: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, Block128>>>,
+            pub quadratic: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, Block128>>>,
+            pub pad_opening: Option<::flatbuffers::WIPOffset<OuterOpening<'a>>>,
+            pub aux_opening: Option<::flatbuffers::WIPOffset<OuterOpening<'a>>>,
+        }
+        impl<'a> Default for OuterProofArgs<'a> {
+            #[inline]
+            fn default() -> Self {
+                OuterProofArgs {
+                    aux_root: None,
+                    interleaved: None,
+                    linear: None,
+                    quadratic: None,
+                    pad_opening: None,
+                    aux_opening: None,
+                }
+            }
+        }
+
+        pub struct OuterProofBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
+            fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+            start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
+        }
+        impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> OuterProofBuilder<'a, 'b, A> {
+            #[inline]
+            pub fn add_aux_root(
+                &mut self,
+                aux_root: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b, u8>>,
+            ) {
+                self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(
+                    OuterProof::VT_AUX_ROOT,
+                    aux_root,
+                );
+            }
+            #[inline]
+            pub fn add_interleaved(
+                &mut self,
+                interleaved: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b, Block128>>,
+            ) {
+                self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(
+                    OuterProof::VT_INTERLEAVED,
+                    interleaved,
+                );
+            }
+            #[inline]
+            pub fn add_linear(
+                &mut self,
+                linear: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b, Block128>>,
+            ) {
+                self.fbb_
+                    .push_slot_always::<::flatbuffers::WIPOffset<_>>(OuterProof::VT_LINEAR, linear);
+            }
+            #[inline]
+            pub fn add_quadratic(
+                &mut self,
+                quadratic: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b, Block128>>,
+            ) {
+                self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(
+                    OuterProof::VT_QUADRATIC,
+                    quadratic,
+                );
+            }
+            #[inline]
+            pub fn add_pad_opening(
+                &mut self,
+                pad_opening: ::flatbuffers::WIPOffset<OuterOpening<'b>>,
+            ) {
+                self.fbb_
+                    .push_slot_always::<::flatbuffers::WIPOffset<OuterOpening>>(
+                        OuterProof::VT_PAD_OPENING,
+                        pad_opening,
+                    );
+            }
+            #[inline]
+            pub fn add_aux_opening(
+                &mut self,
+                aux_opening: ::flatbuffers::WIPOffset<OuterOpening<'b>>,
+            ) {
+                self.fbb_
+                    .push_slot_always::<::flatbuffers::WIPOffset<OuterOpening>>(
+                        OuterProof::VT_AUX_OPENING,
+                        aux_opening,
+                    );
+            }
+            #[inline]
+            pub fn new(
+                _fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+            ) -> OuterProofBuilder<'a, 'b, A> {
+                let start = _fbb.start_table();
+                OuterProofBuilder {
+                    fbb_: _fbb,
+                    start_: start,
+                }
+            }
+            #[inline]
+            pub fn finish(self) -> ::flatbuffers::WIPOffset<OuterProof<'a>> {
+                let o = self.fbb_.end_table(self.start_);
+                ::flatbuffers::WIPOffset::new(o.value())
+            }
+        }
+
+        impl ::core::fmt::Debug for OuterProof<'_> {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                let mut ds = f.debug_struct("OuterProof");
+                ds.field("aux_root", &self.aux_root());
+                ds.field("interleaved", &self.interleaved());
+                ds.field("linear", &self.linear());
+                ds.field("quadratic", &self.quadratic());
+                ds.field("pad_opening", &self.pad_opening());
+                ds.field("aux_opening", &self.aux_opening());
+                ds.finish()
+            }
+        }
         pub enum ProofOffset {}
         #[derive(Copy, Clone, PartialEq)]
 
@@ -1538,6 +1993,8 @@ pub mod hekate {
             pub const VT_CHIPLET_ZEROCHECK_PROOFS: ::flatbuffers::VOffsetT = 16;
             pub const VT_CHIPLET_LOGUP_AUX: ::flatbuffers::VOffsetT = 18;
             pub const VT_CHIPLET_EVAL_PROOFS: ::flatbuffers::VOffsetT = 20;
+            pub const VT_PAD_ROOT: ::flatbuffers::VOffsetT = 22;
+            pub const VT_OUTER: ::flatbuffers::VOffsetT = 24;
 
             #[inline]
             pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -1554,6 +2011,12 @@ pub mod hekate {
                 args: &'args ProofArgs<'args>,
             ) -> ::flatbuffers::WIPOffset<Proof<'bldr>> {
                 let mut builder = ProofBuilder::new(_fbb);
+                if let Some(x) = args.outer {
+                    builder.add_outer(x);
+                }
+                if let Some(x) = args.pad_root {
+                    builder.add_pad_root(x);
+                }
                 if let Some(x) = args.chiplet_eval_proofs {
                     builder.add_chiplet_eval_proofs(x);
                 }
@@ -1700,6 +2163,29 @@ pub mod hekate {
                     >>(Proof::VT_CHIPLET_EVAL_PROOFS, None)
                 }
             }
+            #[inline]
+            pub fn pad_root(&self) -> Option<::flatbuffers::Vector<'a, u8>> {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, u8>>>(
+                            Proof::VT_PAD_ROOT,
+                            None,
+                        )
+                }
+            }
+            #[inline]
+            pub fn outer(&self) -> Option<OuterProof<'a>> {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<::flatbuffers::ForwardsUOffset<OuterProof>>(Proof::VT_OUTER, None)
+                }
+            }
         }
 
         impl ::flatbuffers::Verifiable for Proof<'_> {
@@ -1753,6 +2239,16 @@ pub mod hekate {
                     >>(
                         "chiplet_eval_proofs", Self::VT_CHIPLET_EVAL_PROOFS, false
                     )?
+                    .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u8>>>(
+                        "pad_root",
+                        Self::VT_PAD_ROOT,
+                        false,
+                    )?
+                    .visit_field::<::flatbuffers::ForwardsUOffset<OuterProof>>(
+                        "outer",
+                        Self::VT_OUTER,
+                        false,
+                    )?
                     .finish();
                 Ok(())
             }
@@ -1786,6 +2282,8 @@ pub mod hekate {
                     ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<EvalBatchProof<'a>>>,
                 >,
             >,
+            pub pad_root: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u8>>>,
+            pub outer: Option<::flatbuffers::WIPOffset<OuterProof<'a>>>,
         }
         impl<'a> Default for ProofArgs<'a> {
             #[inline]
@@ -1800,6 +2298,8 @@ pub mod hekate {
                     chiplet_zerocheck_proofs: None,
                     chiplet_logup_aux: None,
                     chiplet_eval_proofs: None,
+                    pad_root: None,
+                    outer: None,
                 }
             }
         }
@@ -1909,6 +2409,22 @@ pub mod hekate {
                 );
             }
             #[inline]
+            pub fn add_pad_root(
+                &mut self,
+                pad_root: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b, u8>>,
+            ) {
+                self.fbb_
+                    .push_slot_always::<::flatbuffers::WIPOffset<_>>(Proof::VT_PAD_ROOT, pad_root);
+            }
+            #[inline]
+            pub fn add_outer(&mut self, outer: ::flatbuffers::WIPOffset<OuterProof<'b>>) {
+                self.fbb_
+                    .push_slot_always::<::flatbuffers::WIPOffset<OuterProof>>(
+                        Proof::VT_OUTER,
+                        outer,
+                    );
+            }
+            #[inline]
             pub fn new(
                 _fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
             ) -> ProofBuilder<'a, 'b, A> {
@@ -1937,6 +2453,8 @@ pub mod hekate {
                 ds.field("chiplet_zerocheck_proofs", &self.chiplet_zerocheck_proofs());
                 ds.field("chiplet_logup_aux", &self.chiplet_logup_aux());
                 ds.field("chiplet_eval_proofs", &self.chiplet_eval_proofs());
+                ds.field("pad_root", &self.pad_root());
+                ds.field("outer", &self.outer());
                 ds.finish()
             }
         }

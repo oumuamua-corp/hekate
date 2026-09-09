@@ -6,6 +6,7 @@ use hekate_core::proofs::InnerProof;
 use hekate_math::TowerField;
 use std::time::Instant;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::format::FmtSpan;
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
@@ -16,6 +17,7 @@ pub fn init(name: &str) {
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
         )
+        .with_span_events(FmtSpan::CLOSE)
         .try_init();
 
     hekate_prover_sys::init_tracing();
@@ -100,10 +102,12 @@ where
         bincode::serde::encode_to_vec(proof, bin_cfg).expect("Proof serialization failed");
     let total_sz = total_bytes.len();
 
+    let wire_sz = hekate_sdk::serialize_proof_bytes(proof).len();
+
     println!(
         "   Total Proof size: {:.2} KB ({} bytes)\n",
-        total_sz as f64 / 1024.0,
-        total_sz
+        wire_sz as f64 / 1024.0,
+        wire_sz
     );
 
     // Main components
@@ -119,7 +123,7 @@ where
     let ldt_opened_sz = enc_size(&proof.eval_proof.ldt_proof.opened_columns, bin_cfg);
 
     println!("--------------------------------------------------");
-    println!("  PROOF COMPONENT BREAKDOWN");
+    println!("  PROOF COMPONENT BREAKDOWN (bincode)");
     println!("--------------------------------------------------");
     println!("  Trace Commitment:       {:>8} bytes", trace_comm_sz);
     println!("  Main AIR ZeroCheck:     {:>8} bytes", zcheck_sz);
@@ -154,19 +158,89 @@ where
         let main_logup_sz = enc_size(&proof.main_logup_aux, bin_cfg);
         let chip_logup_sz = enc_size(&proof.chiplet_logup_aux, bin_cfg);
 
+        let h_open_sz = core::iter::once(&proof.main_logup_aux)
+            .chain(&proof.chiplet_logup_aux)
+            .filter_map(|aux| aux.h_eval_proof.as_ref())
+            .map(|p| enc_size(p, bin_cfg))
+            .sum::<usize>();
+
         println!(
             "  LogUp Bus Aux ({} specs):",
             main_bus_count + chip_bus_count
         );
         println!("    Main:                 {:>8} bytes", main_logup_sz);
         println!("    Chiplets:             {:>8} bytes", chip_logup_sz);
+        println!("    of which h openings:  {:>8} bytes", h_open_sz);
     }
+
+    let pad_root_sz = enc_size(&proof.pad_root, bin_cfg);
+
+    if proof.pad_root.is_some() {
+        println!("  PAD Root:               {:>8} bytes", pad_root_sz);
+    }
+
+    let outer_sz = outer_breakdown(proof, bin_cfg);
+
+    let itemized = enc_size(&proof.trace_commitment, bin_cfg)
+        + enc_size(&proof.zerocheck_proof, bin_cfg)
+        + enc_size(&proof.main_logup_aux, bin_cfg)
+        + enc_size(&proof.eval_proof, bin_cfg)
+        + enc_size(&proof.chiplet_commitments, bin_cfg)
+        + enc_size(&proof.chiplet_zerocheck_proofs, bin_cfg)
+        + enc_size(&proof.chiplet_logup_aux, bin_cfg)
+        + enc_size(&proof.chiplet_eval_proofs, bin_cfg)
+        + pad_root_sz
+        + outer_sz;
 
     println!("--------------------------------------------------");
     println!(
-        "  TOTAL:                  {:>8.2} KB",
+        "  Bincode total:          {:>8.2} KB",
         total_sz as f64 / 1024.0
     );
+    println!(
+        "  Unattributed:           {:>8} bytes",
+        total_sz as i64 - itemized as i64
+    );
+}
+
+/// Prints the zk-Ligero segment, returns
+/// the bincode size of `InnerProof::outer`.
+fn outer_breakdown<F>(proof: &InnerProof<F>, cfg: bincode::config::Configuration) -> usize
+where
+    F: TowerField + serde::Serialize,
+{
+    let segment_sz = enc_size(&proof.outer, cfg);
+
+    let Some(outer) = proof.outer.as_ref() else {
+        return segment_sz;
+    };
+
+    let aux_root_sz = enc_size(&outer.aux_root, cfg);
+    let int_sz = enc_size(&outer.interleaved, cfg);
+    let lin_sz = enc_size(&outer.linear, cfg);
+    let quad_sz = enc_size(&outer.quadratic, cfg);
+
+    let columns_sz =
+        enc_size(&outer.pad_opening.columns, cfg) + enc_size(&outer.aux_opening.columns, cfg);
+
+    let pad_values_sz = enc_size(&outer.pad_opening.values, cfg);
+    let pad_path_sz = enc_size(&outer.pad_opening.siblings, cfg);
+    let aux_values_sz = enc_size(&outer.aux_opening.values, cfg);
+    let aux_path_sz = enc_size(&outer.aux_opening.siblings, cfg);
+
+    println!("  Outer Argument (zk-Ligero):");
+    println!("    AUX Root:             {:>8} bytes", aux_root_sz);
+    println!("    Interleaved Response: {:>8} bytes", int_sz);
+    println!("    Linear Response:      {:>8} bytes", lin_sz);
+    println!("    Quadratic Response:   {:>8} bytes", quad_sz);
+    println!("    Query Columns:        {:>8} bytes", columns_sz);
+    println!("    PAD Opened Values:    {:>8} bytes", pad_values_sz);
+    println!("    PAD Merkle Path:      {:>8} bytes", pad_path_sz);
+    println!("    AUX Opened Values:    {:>8} bytes", aux_values_sz);
+    println!("    AUX Merkle Path:      {:>8} bytes", aux_path_sz);
+    println!("    Segment total:        {:>8} bytes", segment_sz);
+
+    segment_sz
 }
 
 pub fn result(is_valid: bool) {
@@ -177,6 +251,25 @@ pub fn result(is_valid: bool) {
     } else {
         println!("FAILURE");
     }
+}
+
+/// `HEKATE_ZK=0` proves in the clear,
+/// anything else in zero knowledge.
+pub fn zero_knowledge() -> bool {
+    std::env::var("HEKATE_ZK").as_deref() != Ok("0")
+}
+
+#[allow(dead_code)]
+pub fn num_vars(default: usize) -> usize {
+    std::env::var("HEKATE_NUM_VARS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+#[allow(dead_code)]
+pub fn level(default: &str) -> String {
+    std::env::var("HEKATE_LEVEL").unwrap_or_else(|_| default.to_string())
 }
 
 fn enc_size<T: serde::Serialize>(val: &T, cfg: bincode::config::Configuration) -> usize {

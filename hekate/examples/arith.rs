@@ -134,7 +134,7 @@ fn main() {
     let num_ops: usize = num_rows;
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: common::zero_knowledge(),
         ..Config::default()
     };
 
@@ -146,10 +146,7 @@ fn main() {
         num_ops
     );
     println!("Trace: 2^{} rows (single AIR)", num_vars);
-    println!(
-        "ZK Blinding: {} virtual columns",
-        config.sumcheck_blinding_factor
-    );
+    println!("Zero-knowledge: {}", config.zero_knowledge);
 
     let trace = common::phase("Trace Generation", || {
         generate_arith_trace(num_ops, num_rows).expect("arith trace")

@@ -146,10 +146,8 @@ fn main() {
     let num_vars = 20;
     let num_rows = 1 << num_vars;
 
-    // Use ZK mode with 2 blinding columns
-    // to see maximum memory pressure.
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: common::zero_knowledge(),
         ..Config::default()
     };
 

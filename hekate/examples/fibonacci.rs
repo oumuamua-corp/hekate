@@ -176,7 +176,7 @@ fn main() {
     let num_rows: usize = 1 << num_vars;
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: common::zero_knowledge(),
         ..Config::default()
     };
 
@@ -188,10 +188,7 @@ fn main() {
         num_vars,
         num_rows - 1
     );
-    println!(
-        "ZK Blinding: {} virtual columns",
-        config.sumcheck_blinding_factor
-    );
+    println!("Zero-knowledge: {}", config.zero_knowledge);
 
     let (trace, final_b) = common::phase("Trace Generation", || {
         generate_fib_trace(num_rows).expect("trace gen")

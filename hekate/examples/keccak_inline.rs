@@ -251,15 +251,11 @@ fn main() {
     hekate_prover_sys::init_tracing();
 
     // Setup parameters
-    let num_vars: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20);
-
+    let num_vars = common::num_vars(20);
     let num_rows = 1 << num_vars;
 
     let config = Config {
-        sumcheck_blinding_factor: 2, // Enable ZK
+        zero_knowledge: common::zero_knowledge(),
         ..Config::default()
     };
 

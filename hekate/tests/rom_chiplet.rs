@@ -189,7 +189,7 @@ fn rom_cpu_linking() {
     let config = Config {
         num_queries: 4,
         min_security_bits: 0,
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ldt_support_size: 4,
         ..Config::default()
     };
@@ -241,7 +241,7 @@ fn rom_gpa_large_trace() {
     let config = Config {
         num_queries: 2,
         min_security_bits: 0,
-        sumcheck_blinding_factor: 0, // Disable ZK for speed in this large test
+        zero_knowledge: false, // Disable ZK for speed in this large test
         ..Config::default()
     };
 
@@ -275,9 +275,11 @@ fn rom_padding_transparency() {
     let empty_trace = generate_combined_trace(&empty_instructions, num_rows);
     let empty_witness = ProgramWitness::new(empty_trace);
 
+    // Reads plaintext claimed sums
     let config = Config {
         ldt_support_size: 4,
         min_security_bits: 0,
+        zero_knowledge: false,
         ..Config::default()
     };
 

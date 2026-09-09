@@ -3,6 +3,8 @@
 [![CI](https://github.com/oumuamua-labs/hekate/actions/workflows/ci.yml/badge.svg)](https://github.com/oumuamua-labs/hekate/actions/workflows/ci.yml)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](./LICENSE)
 
+*Copyright (c) 2026 Andrei Kochergin and Oumuamua Labs.*
+
 Zero-knowledge proof system over binary tower fields. Streaming architecture. Bounded memory. Edge-native.
 Hekate proves computations in GF(2^128) using Sumcheck + Brakedown PCS with O(N) prover time and O(N) memory.
 
@@ -284,29 +286,35 @@ binary you can run with `cargo run --release --example <name>`.
 ## Performance
 
 All numbers on Apple M3 Max (16 cores, 48 GB RAM), `--release`, features
-`std parallel blake3 table-math`. Measured with the example binaries in `hekate/examples/`
-on an otherwise idle machine; every figure is the mean of three runs. Peak memory is
-the process peak physical footprint, which equals resident set size for any run that fits in RAM.
+`std parallel blake3 table-math`, `Config::prod()`. Cells read zero-knowledge / base,
+the second value being the same run under `HEKATE_ZK=0`. Measured with the example
+binaries in `hekate/examples/` on an otherwise idle machine; every figure is the
+mean of at least three runs. Peak memory is the process peak physical footprint, which
+equals resident set size for any run that fits in RAM.
 
 Reproduce:
 
 ```bash
-just example mlkem "" public
-just example mldsa 65 public           # 44 | 65 | 87
-just example aes 256 public            # 128 | 256
-just example keccak_inline 20 public   # num_vars
-just example fibonacci_raw 26 public   # num_vars
+just example mlkem public
+HEKATE_LEVEL=65 just example mldsa public         # 44 | 65 | 87
+HEKATE_LEVEL=256 just example aes public          # 128 | 256
+HEKATE_NUM_VARS=20 just example keccak_inline public
+HEKATE_NUM_VARS=26 just example fibonacci_raw public
+
+HEKATE_ZK=0 just example keccak_inline public     # base protocol, no hiding
 ```
 
 ### Post-Quantum Crypto and AES
 
-|              | ML-KEM-768 | ML-DSA-44 | ML-DSA-65 | ML-DSA-87 | AES-128   | AES-256   |
-|:-------------|:-----------|:----------|:----------|:----------|:----------|:----------|
-| Proving      | 626 ms     | 926 ms    | 969 ms    | 1.50 s    | 1.44 s    | 1.55 s    |
-| Verification | 23.2 ms    | 30.1 ms   | 30.5 ms   | 32.0 ms   | 18.8 ms   | 18.9 ms   |
-| Proof Size   | 3,576 KiB  | 4,403 KiB | 4,436 KiB | 5,922 KiB | 5,628 KiB | 5,962 KiB |
-| Peak memory  | 459 MiB    | 459 MiB   | 478 MiB   | 869 MiB   | 1,182 MiB | 1,480 MiB |
-| Chiplets     | 6          | 7         | 7         | 7         | 2         | 2         |
+Cells: ZK / base.
+
+|              | ML-KEM-768        | ML-DSA-44         | ML-DSA-65         | ML-DSA-87         | AES-128           | AES-256           |
+|:-------------|:------------------|:------------------|:------------------|:------------------|:------------------|:------------------|
+| Proving      | 686 / 608 ms      | 982 / 889 ms      | 1.04 / 0.95 s     | 1.55 / 1.44 s     | 1.42 / 1.35 s     | 1.54 / 1.53 s     |
+| Verification | 46.0 / 22.0 ms    | 65.2 / 27.5 ms    | 66.1 / 28.7 ms    | 69.4 / 30.5 ms    | 23.1 / 17.9 ms    | 23.7 / 18.6 ms    |
+| Proof Size   | 3,948 / 3,335 KiB | 4,878 / 4,139 KiB | 4,897 / 4,148 KiB | 6,390 / 5,508 KiB | 5,901 / 5,242 KiB | 6,237 / 5,594 KiB |
+| Peak memory  | 426 / 415 MiB     | 497 / 474 MiB     | 503 / 457 MiB     | 848 / 852 MiB     | 1,190 / 1,130 MiB | 1,484 / 1,425 MiB |
+| Chiplets     | 6                 | 7                 | 7                 | 7                 | 2                 | 2                 |
 
 AES note: both AES-128 and AES-256 prove **31,250 blocks** (~500 KB plaintext) per run.
 CPU trace 2^16 rows; Round-AIR and S-box ROM chiplets at 2^19. Per-block proving cost:
@@ -314,23 +322,23 @@ CPU trace 2^16 rows; Round-AIR and S-box ROM chiplets at 2^19. Per-block proving
 
 ### Keccak-f[1600], scaling
 
-`hekate/examples/keccak_inline.rs <num_vars>`, default 20.
+`hekate/examples/keccak_inline.rs`, `HEKATE_NUM_VARS` default 20. Cells: ZK / base.
 
-| Scale (rows) | Permutations | Hashed  | Proving | Verify  | Proof Size | Peak memory |
-|:-------------|:-------------|:--------|:--------|:--------|:-----------|:------------|
-| 2^15         | 1,310        | ~178 KB | 203 ms  | 5.9 ms  | 793 KiB    | 143 MiB     |
-| 2^20         | 41,943       | ~5.4 MB | 4.08 s  | 13.5 ms | 4,220 KiB  | 2,486 MiB   |
+| Scale (rows) | Permutations | Hashed  | Proving       | Verify         | Proof Size        | Peak memory       |
+|:-------------|:-------------|:--------|:--------------|:---------------|:------------------|:------------------|
+| 2^15         | 1,310        | ~178 KB | 227 / 195 ms  | 16.8 / 5.3 ms  | 1,081 / 778 KiB   | 140 / 123 MiB     |
+| 2^20         | 41,943       | ~5.4 MB | 4.09 / 3.99 s | 25.3 / 12.9 ms | 4,507 / 3,986 KiB | 2,516 / 2,484 MiB |
 
 ### Fibonacci (32-bit integer add), scaling
 
-`hekate/examples/fibonacci_raw.rs <num_vars>`, default 24. Each row: bit-sliced 32-bit add with
-explicit carry chain, virtual-expanded into 32 bit + 32 sum + 32 carry columns.
+`hekate/examples/fibonacci_raw.rs`, `HEKATE_NUM_VARS` default 24. Each row: bit-sliced 32-bit add with
+explicit carry chain, virtual-expanded into 32 bit + 32 sum + 32 carry columns. Cells: ZK / base.
 
-| Scale (rows) | Proving | Verify  | Proof Size | Peak memory |
-|:-------------|:--------|:--------|:-----------|:------------|
-| 2^20         | 391 ms  | 3.4 ms  | 756 KiB    | 156 MiB     |
-| 2^24         | 6.11 s  | 7.3 ms  | 2,901 KiB  | 2,029 MiB   |
-| 2^26         | 26.10 s | 11.8 ms | 5,757 KiB  | 7,841 MiB   |
+| Scale (rows) | Proving         | Verify         | Proof Size        | Peak memory        |
+|:-------------|:----------------|:---------------|:------------------|:-------------------|
+| 2^20         | 441 / 388 ms    | 7.0 / 3.4 ms   | 1,297 / 739 KiB   | 228 / 144 MiB      |
+| 2^24         | 6.66 / 6.17 s   | 12.6 / 7.0 ms  | 4,555 / 2,834 KiB | 3,318 / 2,018 MiB  |
+| 2^26         | 29.24 / 24.45 s | 21.6 / 10.8 ms | 8,901 / 5,624 KiB | 13,312 / 7,840 MiB |
 
 ---
 

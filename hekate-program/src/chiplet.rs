@@ -57,6 +57,7 @@ impl<F: TowerField> ChipletDef<F> {
         validate_chiplet_boundaries(&boundary_constraints, p.num_columns())?;
         validate_fixed_columns(&fixed_columns, p.virtual_column_layout(), None)?;
         validate_expander_coverage(p.virtual_expander(), p.column_layout())?;
+        validate_column_count(p.num_columns(), p.virtual_column_layout().len())?;
 
         Ok(Self {
             name: p.name(),
@@ -127,6 +128,7 @@ impl<F: TowerField> ChipletDef<F> {
         };
 
         validate_fixed_columns(&fixed_columns, virt_layout, None)?;
+        validate_column_count(num_columns, virt_layout.len())?;
 
         Ok(Self {
             name,
@@ -551,6 +553,17 @@ fn validate_expander_coverage(
         return Err(errors::Error::Protocol {
             protocol: "chiplet",
             message: "virtual_expander does not tile column_layout",
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_column_count(num_columns: usize, virtual_columns: usize) -> errors::Result<()> {
+    if num_columns != virtual_columns {
+        return Err(errors::Error::Protocol {
+            protocol: "chiplet",
+            message: "num_columns does not match the virtual column layout",
         });
     }
 

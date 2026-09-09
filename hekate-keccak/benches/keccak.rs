@@ -236,7 +236,7 @@ fn bench_keccak_prove(c: &mut Criterion) {
         let witness = ProgramWitness::new(trace);
 
         let config = Config {
-            sumcheck_blinding_factor: 2,
+            zero_knowledge: true,
             ..Config::default()
         };
 

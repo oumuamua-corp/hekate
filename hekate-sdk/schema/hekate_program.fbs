@@ -173,11 +173,11 @@ table ColumnTrace {
 // ===== Config =====
 
 table Config {
-  inv_rate: uint32;
   num_queries: uint32;
-  sumcheck_blinding_factor: uint32;
   ldt_support_size: uint32;
   min_security_bits: uint32;
+  outer_queries: uint32;
+  zero_knowledge: bool;
 }
 
 // ===== Top-Level Bundle =====

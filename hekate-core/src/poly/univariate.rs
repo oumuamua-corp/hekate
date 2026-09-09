@@ -6,9 +6,11 @@ use alloc::vec::Vec;
 use hekate_math::{Flat, HardwareField, TowerField};
 use serde::{Deserialize, Serialize};
 
-/// Round polynomial `g(X)` sent by the prover
-/// in Sumcheck, carried as evaluations
-/// at `{0, 1, …, degree}`.
+/// Stack-buffer width of the barycentric interpolation.
+pub const MAX_POINTS: usize = 16;
+
+/// Round polynomial `g(X)` sent by the prover in Sumcheck,
+/// carried as evaluations at `{0, 1, …, degree}`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UnivariatePoly<F: TowerField> {
     pub evals: Vec<F>,
@@ -30,8 +32,6 @@ impl<F: TowerField> UnivariatePoly<F> {
         if k == 1 {
             return self.evals[0];
         }
-
-        const MAX_POINTS: usize = 16;
 
         assert!(k <= MAX_POINTS, "Degree too large for stack buffer");
 
@@ -93,8 +93,6 @@ impl<F: HardwareField> UnivariatePoly<F> {
         if k == 1 {
             return self.evals[0].to_hardware();
         }
-
-        const MAX_POINTS: usize = 16;
 
         assert!(k <= MAX_POINTS, "Degree too large for stack buffer");
 

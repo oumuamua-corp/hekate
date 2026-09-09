@@ -236,7 +236,7 @@ fn valid_halt_trace_passes() {
     let config = Config {
         num_queries: 4,
         min_security_bits: 0,
-        sumcheck_blinding_factor: 0,
+        zero_knowledge: false,
         ldt_support_size: 4,
         ..Config::default()
     };
@@ -284,7 +284,7 @@ fn wakeup_after_halt_rejected() {
     let config = Config {
         num_queries: 4,
         min_security_bits: 0,
-        sumcheck_blinding_factor: 0,
+        zero_knowledge: false,
         ..Config::default()
     };
 
@@ -346,7 +346,7 @@ fn event_while_halted_rejected() {
     let config = Config {
         num_queries: 4,
         min_security_bits: 0,
-        sumcheck_blinding_factor: 0,
+        zero_knowledge: false,
         ..Config::default()
     };
 
@@ -408,7 +408,7 @@ fn boolean_constraint_enforced() {
     let config = Config {
         num_queries: 4,
         min_security_bits: 0,
-        sumcheck_blinding_factor: 0,
+        zero_knowledge: false,
         ldt_support_size: 4,
         ..Config::default()
     };

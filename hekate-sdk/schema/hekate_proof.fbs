@@ -66,6 +66,23 @@ table LogUpAux {
   h_eval_proof: EvalBatchProof;
 }
 
+// ===== Outer Argument =====
+
+table OuterOpening {
+  columns: [uint32];
+  values: [Block128];
+  siblings: [ubyte];
+}
+
+table OuterProof {
+  aux_root: [ubyte];
+  interleaved: [Block128];
+  linear: [Block128];
+  quadratic: [Block128];
+  pad_opening: OuterOpening;
+  aux_opening: OuterOpening;
+}
+
 // ===== Top-Level Proof =====
 
 table Proof {
@@ -82,6 +99,10 @@ table Proof {
   chiplet_zerocheck_proofs: [SumcheckProof];
   chiplet_logup_aux: [LogUpAux];
   chiplet_eval_proofs: [EvalBatchProof];
+
+  // Eval-claim hiding
+  pad_root: [ubyte];
+  outer: OuterProof;
 }
 
 root_type Proof;

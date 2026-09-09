@@ -17,7 +17,7 @@ crate-type = ["rlib"]
 [features]
 default = ["std", "parallel", "blake3"]
 std = ["hekate-crypto/std", "hekate-math/std"]
-parallel = ["hekate-crypto/parallel", "hekate-math/parallel"]
+parallel = ["dep:rayon", "hekate-crypto/parallel", "hekate-math/parallel"]
 blake3 = ["hekate-crypto/blake3"]
 sha2 = ["hekate-crypto/sha2"]
 sha3 = ["hekate-crypto/sha3"]
@@ -29,6 +29,7 @@ hekate-crypto = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 zeroize = { workspace = true }
+rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = "0.8"

@@ -6,7 +6,7 @@
 //! proof (FIPS 204).
 //!
 //! Usage:
-//! mldsa [44|65|87]
+//! HEKATE_LEVEL=[44|65|87] mldsa
 //!
 //! Proof existence IS the verdict:
 //! an honest transcript requires
@@ -174,7 +174,7 @@ fn run_mldsa(label: &str, level: MlDsaLevel, pk_bytes: &[u8], sig_bytes: &[u8], 
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(chiplet_traces);
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: common::zero_knowledge(),
         ..Config::default()
     };
 
@@ -208,7 +208,7 @@ fn run_mldsa(label: &str, level: MlDsaLevel, pk_bytes: &[u8], sig_bytes: &[u8], 
 }
 
 fn main() {
-    let level_arg = std::env::args().nth(1).unwrap_or_else(|| "65".to_string());
+    let level_arg = common::level("65");
 
     let mut seed = [0u8; 32];
     OsRng.try_fill_bytes(&mut seed).unwrap();
@@ -259,7 +259,7 @@ fn main() {
             );
         }
         other => {
-            eprintln!("Usage: mldsa [44|65|87] (got {:?})", other);
+            eprintln!("Usage: HEKATE_LEVEL=[44|65|87] mldsa (got {:?})", other);
             std::process::exit(1);
         }
     }

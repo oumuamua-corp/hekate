@@ -7,7 +7,7 @@ use crate::sumcheck::verify;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-use hekate_core::config::Config;
+use hekate_core::config::{Config, INV_RATE};
 use hekate_core::errors;
 use hekate_core::proofs::{BrakedownCommitment, EvalBatchProof};
 use hekate_core::tensor::TensorProduct;
@@ -17,7 +17,7 @@ use hekate_crypto::transcript::Transcript;
 use hekate_math::{
     AdditiveFft, BinaryFieldExtras, Block128, Flat, HardwareField, PackableField, TowerField,
 };
-use hekate_program::expander::RingSwitchPlan;
+use hekate_program::expander::{RingSwitchPlan, eq_tensor_b, ring_target};
 use tracing::{debug, instrument, warn};
 
 #[cfg(feature = "parallel")]
@@ -38,6 +38,20 @@ pub struct EvalVerifyContext<'a, F: HardwareField> {
     /// `true` when the claims carry a next-row half,
     /// proven through the K_P / A_next weights.
     pub shifted_claims: bool,
+
+    /// Masked claims: the ring-switch final
+    /// check is left to the outer argument.
+    pub masked: bool,
+}
+
+/// What the outer argument needs from an accepted
+/// eval sumcheck: `claim_n = fin` on plaintext values.
+pub struct EvalOutcome<F: HardwareField> {
+    pub eta: F,
+    pub r_mix: Vec<Block128>,
+    pub challenges: Vec<Flat<F>>,
+    pub claim_masked: Flat<F>,
+    pub fin: Flat<F>,
 }
 
 impl<F, H: Hasher> EvaluatorVerifier<F, H>
@@ -58,7 +72,7 @@ where
         transcript: &mut Transcript<H>,
         ctx: EvalVerifyContext<'_, F>,
         config: &Config,
-    ) -> errors::Result<bool>
+    ) -> errors::Result<Option<EvalOutcome<F>>>
     where
         F: BinaryFieldExtras + Into<Block128> + From<u128>,
     {
@@ -118,7 +132,7 @@ where
             Some(res) => res,
             None => {
                 warn!("Sumcheck failed");
-                return Ok(false);
+                return Ok(None);
             }
         };
 
@@ -146,13 +160,13 @@ where
             encoded_width,
             support = geom.support_size,
             row_bytes = phys_row_bytes,
-            fractional = encoded_width == grid_cols * config.inv_rate,
+            fractional = encoded_width == grid_cols * INV_RATE,
             "table geometry"
         );
 
         if grid_cols + geom.support_size > encoded_width {
             warn!("support + data message exceeds the codeword width");
-            return Ok(false);
+            return Ok(None);
         }
 
         config.check_security(size_of::<F>() * 8, grid_cols)?;
@@ -162,7 +176,7 @@ where
 
         if q_whole.len() != expected_len || q_ring.len() != expected_ring_len {
             warn!("tensor_q length mismatch");
-            return Ok(false);
+            return Ok(None);
         }
 
         let q_whole_flat: Vec<Flat<F>> = q_whole.iter().map(|v| v.to_hardware()).collect();
@@ -224,11 +238,11 @@ where
         let (whole_weight_at_r, ring_weight_at_r) =
             master_weights_at::<F>(point, &r_row, &r_mix, eta_shift, has_ring, shifted_claims);
 
-        if sumcheck_final_eval
-            != ring_weight_at_r * master_bit_eval + whole_weight_at_r * master_whole_eval
-        {
+        let fin = ring_weight_at_r * master_bit_eval + whole_weight_at_r * master_whole_eval;
+
+        if !ctx.masked && sumcheck_final_eval != fin {
             warn!("ring-switch final check failed");
-            return Ok(false);
+            return Ok(None);
         }
 
         // Fork transcript to reproduce
@@ -358,10 +372,16 @@ where
         let all_matched = run_sequential(&random_indices)?;
 
         if !all_matched {
-            return Ok(false);
+            return Ok(None);
         }
 
-        Ok(true)
+        Ok(Some(EvalOutcome {
+            eta: eta_tower,
+            r_mix,
+            challenges: r_row,
+            claim_masked: sumcheck_final_eval,
+            fin,
+        }))
     }
 }
 
@@ -414,26 +434,6 @@ fn build_tensor_table<F: HardwareField>(r: &[Flat<F>]) -> Vec<Flat<F>> {
     }
 
     table
-}
-
-fn eq_tensor_b(r: &[Block128]) -> Vec<Block128> {
-    let mut t = vec![Block128::ONE];
-    for &ri in r {
-        let len = t.len();
-        let mut nt = Vec::with_capacity(len * 2);
-
-        for &v in &t {
-            nt.push(v * (Block128::ONE + ri));
-        }
-
-        for &v in &t {
-            nt.push(v * ri);
-        }
-
-        t = nt;
-    }
-
-    t
 }
 
 fn transpose128(cols: &[Block128; NBITS]) -> [Block128; NBITS] {
@@ -593,83 +593,6 @@ fn ring_switch_a_pair(
     (a, a_next)
 }
 
-/// Σ_u eq(r'',u)·ŝ_u for one ring unit, ŝ_u = Σ_v bit_u(c_v)·2^v.
-fn ring_batch_b(bit_claims: &[Block128], eq_mix: &[Block128]) -> Block128 {
-    let mut acc = Block128::ZERO;
-    for (u, &m) in eq_mix.iter().enumerate() {
-        let mut shat = 0u128;
-        for (v, cv) in bit_claims.iter().enumerate() {
-            shat |= ((cv.0 >> u) & 1) << v;
-        }
-
-        acc += m * Block128(shat);
-    }
-
-    acc
-}
-
-/// Reconstructs the sumcheck's initial claim from the claimed
-/// virtual evals, in the tower basis. Ring units contribute
-/// `eta·Σ_u eq(r'',u) ŝ_u`; whole units contribute `eta·c'`.
-fn ring_target<F>(
-    plan: &RingSwitchPlan,
-    claims: &[Flat<F>],
-    eta_tower: F,
-    r_mix: &[Block128],
-    shifted_claims: bool,
-) -> Block128
-where
-    F: HardwareField + Into<Block128>,
-{
-    let claim_halves = if shifted_claims { 2 } else { 1 };
-    let half = claims.len() / claim_halves;
-    let eq_mix = eq_tensor_b(r_mix);
-    let eta: Block128 = eta_tower.into();
-
-    let mut eta_pows = Vec::with_capacity(plan.num_units + 1);
-    let mut e = Block128::ONE;
-
-    for _ in 0..=plan.num_units {
-        eta_pows.push(e);
-        e *= eta;
-    }
-
-    let eta_shift = eta_pows[plan.num_units];
-
-    let base = [(0usize, Block128::ONE)];
-    let base_and_shift = [(0usize, Block128::ONE), (half, eta_shift)];
-    let offsets: &[(usize, Block128)] = if shifted_claims {
-        &base_and_shift
-    } else {
-        &base
-    };
-
-    let mut target = Block128::ZERO;
-    for &(offset, shift_mul) in offsets {
-        let half_claims = &claims[offset..offset + half];
-
-        let mut ci = 0usize;
-        for (unit_idx, &(is_ring, num_claims)) in plan.units.iter().enumerate() {
-            let weight = eta_pows[unit_idx] * shift_mul;
-            if is_ring {
-                let bits: Vec<Block128> = half_claims[ci..ci + num_claims]
-                    .iter()
-                    .map(|f| f.to_tower().into())
-                    .collect();
-
-                target += weight * ring_batch_b(&bits, &eq_mix);
-            } else {
-                let c: Block128 = half_claims[ci].to_tower().into();
-                target += weight * c;
-            }
-
-            ci += num_claims;
-        }
-    }
-
-    target
-}
-
 /// Parses one opened grid-row: one symbol per committed column
 /// at its `rs_field` width (sub-B32 columns are B32-wide).
 fn parse_physical_row<F: TraceCompatibleField>(
@@ -715,6 +638,8 @@ mod tests {
     use hekate_core::poly::PolyVariant;
     use hekate_math::TowerField;
 
+    const GRID_COLS: usize = 1024;
+
     fn elems(seed: u128, n: usize) -> Vec<Block128> {
         let g = Block128(0x2545F4914F6CDD1D_517CC1B727220A95);
 
@@ -727,6 +652,10 @@ mod tests {
         }
 
         out
+    }
+
+    fn rs_row(seed: u128, len: usize) -> Vec<Flat<Block128>> {
+        elems(seed, len).iter().map(|v| v.to_hardware()).collect()
     }
 
     fn k_p_on_cube(point: &[Block128]) -> Vec<Block128> {
@@ -848,5 +777,41 @@ mod tests {
 
         assert_eq!(rows, expected);
         assert_eq!(transpose128(&rows), cols);
+    }
+
+    /// The proximity fold commutes with the encode
+    /// only while `rs_encode_row` stays linear
+    /// over its own support / data split.
+    #[test]
+    fn rs_encode_row_is_linear() {
+        let config = Config::prod();
+        let len = GRID_COLS + config.table_geom(GRID_COLS).support_size;
+
+        let a = rs_row(0x11, len);
+        let b = rs_row(0x22, len);
+        let sum: Vec<Flat<Block128>> = a.iter().zip(&b).map(|(x, y)| *x + *y).collect();
+
+        let ea = rs_encode_row::<Block128>(&a, GRID_COLS, &config).unwrap();
+        let eb = rs_encode_row::<Block128>(&b, GRID_COLS, &config).unwrap();
+        let es = rs_encode_row::<Block128>(&sum, GRID_COLS, &config).unwrap();
+
+        for ((x, y), s) in ea.iter().zip(&eb).zip(&es) {
+            assert_eq!(*x + *y, *s);
+        }
+    }
+
+    #[test]
+    fn rs_encode_row_meets_singleton_bound() {
+        let config = Config::prod();
+        let len = GRID_COLS + config.table_geom(GRID_COLS).support_size;
+
+        let code = rs_encode_row::<Block128>(&rs_row(0x33, len), GRID_COLS, &config).unwrap();
+
+        let zeros = code
+            .iter()
+            .filter(|v| **v == Flat::from_raw(Block128::ZERO))
+            .count();
+
+        assert!(zeros < len);
     }
 }

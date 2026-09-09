@@ -10,7 +10,11 @@ use hekate_core::errors::Error;
 use hekate_core::poly::PolyVariant;
 use hekate_core::trace::{ColumnType, Trace, TraceColumn, TraceCompatibleField};
 use hekate_core::utils::compute_split_vars;
-use hekate_math::{Bit, Block8, Block16, Block32, Block64, Flat, HardwareField};
+use hekate_math::{
+    Bit, Block8, Block16, Block32, Block64, Block128, Flat, HardwareField, TowerField,
+};
+
+pub const RING_BLIND_BITS: usize = 128;
 
 /// Serializable expansion step descriptor.
 #[derive(Clone, Copy, Debug)]
@@ -501,6 +505,8 @@ pub struct RingSwitchPlan {
     pub num_units: usize,
     pub units: Vec<(bool, usize)>,
     pub phys_rs: Vec<ColumnType>,
+    pub blind_slots: usize,
+
     phys_bit: Vec<Vec<usize>>,
     phys_whole: Vec<Vec<usize>>,
 }
@@ -604,9 +610,22 @@ impl RingSwitchPlan {
             }
         }
 
+        let has_ring = units.iter().any(|(is_ring, _)| *is_ring);
+
         for b in 0..num_blind {
             phys_whole[num_phys + b].push(units.len());
             units.push((false, 1));
+        }
+
+        let mut blind_slots = num_blind;
+
+        // A uniform L-valued unit
+        if has_ring && num_blind > 0 {
+            phys_bit.push(vec![units.len()]);
+            phys_whole.push(Vec::new());
+            phys_rs.push(ColumnType::B128);
+            units.push((true, RING_BLIND_BITS));
+            blind_slots += 1;
         }
 
         let num_units = units.len();
@@ -616,12 +635,17 @@ impl RingSwitchPlan {
             phys_bit,
             phys_whole,
             phys_rs,
+            blind_slots,
             num_units,
         })
     }
 
     pub fn has_ring(&self) -> bool {
         self.units.iter().any(|(is_ring, _)| *is_ring)
+    }
+
+    pub fn has_ring_blind(&self) -> bool {
+        self.blind_slots > 0 && self.has_ring()
     }
 
     pub fn total_claims(&self) -> usize {
@@ -817,6 +841,149 @@ fn expand_pass_through<F: TraceCompatibleField + 'static>(
     }
 }
 
+pub fn eq_tensor_b(r: &[Block128]) -> Vec<Block128> {
+    let mut t = vec![Block128::ONE];
+    for &ri in r {
+        let len = t.len();
+        let mut nt = Vec::with_capacity(len * 2);
+
+        for &v in &t {
+            nt.push(v * (Block128::ONE + ri));
+        }
+
+        for &v in &t {
+            nt.push(v * ri);
+        }
+
+        t = nt;
+    }
+
+    t
+}
+
+/// Σ_u eq(r'',u)·ŝ_u for one ring unit, ŝ_u = Σ_v bit_u(c_v)·2^v.
+pub fn ring_batch_b(bit_claims: &[Block128], eq_mix: &[Block128]) -> Block128 {
+    let mut acc = Block128::ZERO;
+    for (u, &m) in eq_mix.iter().enumerate() {
+        let mut shat = 0u128;
+        for (v, cv) in bit_claims.iter().enumerate() {
+            shat |= ((cv.0 >> u) & 1) << v;
+        }
+
+        acc += m * Block128(shat);
+    }
+
+    acc
+}
+
+/// Reconstructs the sumcheck's initial claim from the claimed
+/// virtual evals, in the tower basis. Ring units contribute
+/// `eta·Σ_u eq(r'',u) ŝ_u`; whole units contribute `eta·c'`.
+pub fn ring_target<F>(
+    plan: &RingSwitchPlan,
+    claims: &[Flat<F>],
+    eta_tower: F,
+    r_mix: &[Block128],
+    shifted_claims: bool,
+) -> Block128
+where
+    F: HardwareField + Into<Block128>,
+{
+    let claim_halves = if shifted_claims { 2 } else { 1 };
+    let half = claims.len() / claim_halves;
+    let eq_mix = eq_tensor_b(r_mix);
+    let eta: Block128 = eta_tower.into();
+
+    let mut eta_pows = Vec::with_capacity(plan.num_units + 1);
+    let mut e = Block128::ONE;
+
+    for _ in 0..=plan.num_units {
+        eta_pows.push(e);
+        e *= eta;
+    }
+
+    let eta_shift = eta_pows[plan.num_units];
+
+    let base = [(0usize, Block128::ONE)];
+    let base_and_shift = [(0usize, Block128::ONE), (half, eta_shift)];
+    let offsets: &[(usize, Block128)] = if shifted_claims {
+        &base_and_shift
+    } else {
+        &base
+    };
+
+    let mut target = Block128::ZERO;
+    for &(offset, shift_mul) in offsets {
+        let half_claims = &claims[offset..offset + half];
+
+        let mut ci = 0usize;
+        for (unit_idx, &(is_ring, num_claims)) in plan.units.iter().enumerate() {
+            let weight = eta_pows[unit_idx] * shift_mul;
+            if is_ring {
+                let bits: Vec<Block128> = half_claims[ci..ci + num_claims]
+                    .iter()
+                    .map(|f| f.to_tower().into())
+                    .collect();
+
+                target += weight * ring_batch_b(&bits, &eq_mix);
+            } else {
+                let c: Block128 = half_claims[ci].to_tower().into();
+                target += weight * c;
+            }
+
+            ci += num_claims;
+        }
+    }
+
+    target
+}
+
+/// Per-claim weight `a_c` such that
+/// `ring_target = Σ_c a_c · (ring ? φ_{r''}(c_c) : c_c)`,
+/// with `φ_{r''}(x) = Σ_u eq(r'',u)·bit_u(x)`.
+pub fn claim_weights<F>(
+    plan: &RingSwitchPlan,
+    eta_tower: F,
+    shifted_claims: bool,
+) -> Vec<(bool, Block128)>
+where
+    F: HardwareField + Into<Block128>,
+{
+    let eta: Block128 = eta_tower.into();
+
+    let mut eta_pows = Vec::with_capacity(plan.num_units + 1);
+    let mut e = Block128::ONE;
+
+    for _ in 0..=plan.num_units {
+        eta_pows.push(e);
+        e *= eta;
+    }
+
+    let shifts: &[Block128] = if shifted_claims {
+        &[Block128::ONE, eta_pows[plan.num_units]]
+    } else {
+        &[Block128::ONE]
+    };
+
+    let mut weights = Vec::with_capacity(plan.total_claims() * shifts.len());
+    for &shift_mul in shifts {
+        for (unit_idx, &(is_ring, num_claims)) in plan.units.iter().enumerate() {
+            let weight = eta_pows[unit_idx] * shift_mul;
+            for v in 0..num_claims {
+                let basis = if is_ring {
+                    Block128(1u128 << v)
+                } else {
+                    Block128::ONE
+                };
+
+                weights.push((is_ring, weight * basis));
+            }
+        }
+    }
+
+    weights
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -918,6 +1085,37 @@ mod tests {
                 "committed column {p} enters no master fold"
             );
         }
+    }
+
+    #[test]
+    fn blinded_ring_plan_ends_in_ring_blind_unit() {
+        let entries = keccak_expander().expansion_entries();
+        let layout = keccak_physical_layout();
+
+        let raw = RingSwitchPlan::new(&layout, Some(&entries), 0).unwrap();
+        let blinded = RingSwitchPlan::new(&layout, Some(&entries), 2).unwrap();
+        let whole_only = RingSwitchPlan::new(&[ColumnType::B32; 3], None, 2).unwrap();
+
+        assert_eq!(raw.blind_slots, 0);
+        assert_eq!(raw.phys_rs.len(), layout.len());
+
+        assert_eq!(blinded.blind_slots, 3);
+        assert_eq!(blinded.phys_rs.len(), layout.len() + 3);
+        assert_eq!(blinded.units.last(), Some(&(true, RING_BLIND_BITS)));
+        assert_eq!(
+            blinded.total_claims(),
+            raw.total_claims() + 2 + RING_BLIND_BITS
+        );
+
+        assert_eq!(whole_only.blind_slots, 2);
+        assert_eq!(whole_only.units.last(), Some(&(false, 1)));
+
+        let eta = Block128(0x2545F4914F6CDD1D_517CC1B727220A95).to_hardware();
+        let (coeff_bit, coeff_whole, _) = blinded.column_coeffs::<Block128>(eta);
+        let last = blinded.phys_rs.len() - 1;
+
+        assert_ne!(coeff_bit[last], Flat::from_raw(Block128::ZERO));
+        assert_eq!(coeff_whole[last], Flat::from_raw(Block128::ZERO));
     }
 
     #[test]
@@ -1082,5 +1280,57 @@ mod tests {
 
         assert!(matches!(variants[32], PolyVariant::B32Slice(_)));
         assert!(matches!(variants[33], PolyVariant::BitSlice(_)));
+    }
+
+    #[test]
+    fn claim_weights_reproduce_ring_target() {
+        let layout = [
+            ColumnType::B32,
+            ColumnType::B32,
+            ColumnType::B64,
+            ColumnType::Bit,
+        ];
+
+        let expander = VirtualExpander::new()
+            .expand_bits(2, ColumnType::B32)
+            .pass_through(1, ColumnType::B64)
+            .control_bits(1)
+            .build()
+            .unwrap();
+
+        let entries = expander.expansion_entries();
+        let plan = RingSwitchPlan::new(&layout, Some(&entries), 2).unwrap();
+
+        let mut state = 0x9e37_79b9_7f4a_7c15_0123_4567_89ab_cdefu128;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+
+            Block128(state)
+        };
+
+        let claims: Vec<Block128> = (0..2 * plan.total_claims()).map(|_| next()).collect();
+        let eta = next();
+        let r_mix: Vec<Block128> = (0..7).map(|_| next()).collect();
+        let eq_mix = eq_tensor_b(&r_mix);
+
+        let flat: Vec<Flat<Block128>> = claims.iter().map(|c| c.to_hardware()).collect();
+        let target = ring_target::<Block128>(&plan, &flat, eta, &r_mix, true);
+
+        let mut sum = Block128::ZERO;
+        for ((is_ring, weight), claim) in claim_weights::<Block128>(&plan, eta, true)
+            .into_iter()
+            .zip(&claims)
+        {
+            let value = match is_ring {
+                true => ring_batch_b(&[*claim], &eq_mix),
+                false => *claim,
+            };
+
+            sum += weight * value;
+        }
+
+        assert_eq!(sum, target);
     }
 }

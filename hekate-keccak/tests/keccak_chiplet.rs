@@ -170,7 +170,7 @@ fn prove_and_verify(
     }
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::dev()
     };
 
@@ -217,7 +217,7 @@ where
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(vec![chiplet_trace]);
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::dev()
     };
 

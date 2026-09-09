@@ -23,7 +23,12 @@ blake3 = ["hekate-core/blake3"]
 sha2 = ["hekate-core/sha2"]
 sha3 = ["hekate-core/sha3"]
 transcript-trace = ["hekate-crypto/transcript-trace"]
-parallel = ["dep:rayon", "std"]
+parallel = [
+    "dep:rayon",
+    "std",
+    "hekate-core/parallel",
+    "hekate-program/parallel",
+]
 table-math = ["hekate-math/table-math"]
 
 [dependencies]

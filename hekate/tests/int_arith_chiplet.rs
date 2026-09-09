@@ -271,7 +271,7 @@ fn test_config() -> Config {
     Config {
         num_queries: 4,
         min_security_bits: 0,
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ldt_support_size: 4,
         ..Config::default()
     }
@@ -707,7 +707,7 @@ fn arithmetic_chiplet_mixed_widths_isolated() {
     let config = Config {
         num_queries: 4,
         min_security_bits: 0,
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ldt_support_size: 2,
         ..Config::default()
     };

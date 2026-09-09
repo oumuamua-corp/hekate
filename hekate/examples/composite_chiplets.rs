@@ -407,7 +407,7 @@ fn main() {
     let audit = Audit::new(dummy_num_rows);
 
     let config = Config {
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: common::zero_knowledge(),
         ..Config::default()
     };
 

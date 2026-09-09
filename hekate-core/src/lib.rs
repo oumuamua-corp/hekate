@@ -8,6 +8,8 @@ extern crate alloc;
 
 pub mod config;
 pub mod errors;
+pub mod ligero;
+pub mod outer;
 pub mod poly;
 pub mod proofs;
 pub mod protocol;

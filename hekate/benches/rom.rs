@@ -156,7 +156,7 @@ fn bench_rom_e2e(c: &mut Criterion) {
     let config = Config {
         num_queries: 4,
         min_security_bits: 0,
-        sumcheck_blinding_factor: 0,
+        zero_knowledge: false,
         ..Config::default()
     };
 

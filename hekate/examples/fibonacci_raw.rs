@@ -186,15 +186,11 @@ fn generate_fib_trace(num_vars: usize) -> errors::Result<ColumnTrace> {
 fn main() {
     common::init("Fibonacci (integer, 32-bit)");
 
-    let num_vars: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(24);
-
+    let num_vars = common::num_vars(24);
     let num_rows = 1 << num_vars;
 
     let config = Config {
-        sumcheck_blinding_factor: 0,
+        zero_knowledge: common::zero_knowledge(),
         ..Config::default()
     };
 
@@ -202,10 +198,7 @@ fn main() {
     OsRng.try_fill_bytes(&mut blinding_seed).unwrap();
 
     println!("Rows: 2^{} (~{} million)", num_vars, num_rows / 1_000_000);
-    println!(
-        "ZK Blinding: {} virtual columns",
-        config.sumcheck_blinding_factor
-    );
+    println!("Zero-knowledge: {}", config.zero_knowledge);
 
     let trace = common::phase("Trace Generation", || generate_fib_trace(num_vars).unwrap());
 

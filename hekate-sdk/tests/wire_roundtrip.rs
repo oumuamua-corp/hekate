@@ -12,7 +12,8 @@
 use hekate_core::config::Config;
 use hekate_core::errors;
 use hekate_core::proofs::{
-    BrakedownCommitment, BrakedownProof, EvalBatchProof, InnerProof, LogUpAux, SumcheckProof,
+    BrakedownCommitment, BrakedownProof, EvalBatchProof, InnerProof, LogUpAux, OuterOpening,
+    OuterProof, SumcheckProof,
 };
 use hekate_core::trace::ColumnTrace;
 use hekate_core::trace::{ColumnType, Trace, TraceBuilder, TraceColumn};
@@ -820,21 +821,21 @@ fn config_roundtrip() {
     let witness = ProgramWitness::new(trace);
 
     let config = Config {
-        inv_rate: 4,
         num_queries: 200,
-        sumcheck_blinding_factor: 4,
         ldt_support_size: 250,
         min_security_bits: 120,
+        outer_queries: 300,
+        zero_knowledge: false,
     };
 
     let bytes = serialize_bundle(&program, &instance, &witness, &config).unwrap();
     let restored: DeserializedBundle<F> = deserialize_bundle(&bytes).unwrap();
 
-    assert_eq!(restored.config.inv_rate, 4);
     assert_eq!(restored.config.num_queries, 200);
-    assert_eq!(restored.config.sumcheck_blinding_factor, 4);
     assert_eq!(restored.config.ldt_support_size, 250);
     assert_eq!(restored.config.min_security_bits, 120);
+    assert_eq!(restored.config.outer_queries, 300);
+    assert!(!restored.config.zero_knowledge);
 }
 
 #[test]
@@ -1434,6 +1435,8 @@ fn proof_tensor_vec_ring_round_trips() {
         vec![empty_sumcheck()],
         vec![LogUpAux::new(vec![], vec![])],
         vec![chiplet_eval],
+        None,
+        None,
     );
 
     let bytes = serialize_proof_bytes(&proof);
@@ -1489,6 +1492,8 @@ fn proof_logup_h_binding_round_trips() {
         vec![],
         vec![],
         vec![],
+        None,
+        None,
     );
 
     let bytes = serialize_proof_bytes(&proof);
@@ -1529,6 +1534,8 @@ fn proof_absent_h_binding_stays_none() {
         vec![],
         vec![],
         vec![],
+        None,
+        None,
     );
 
     let bytes = serialize_proof_bytes(&proof);
@@ -1536,4 +1543,65 @@ fn proof_absent_h_binding_stays_none() {
 
     assert!(restored.main_logup_aux.h_commitment.is_none());
     assert!(restored.main_logup_aux.h_eval_proof.is_none());
+    assert!(restored.pad_root.is_none());
+    assert!(restored.outer.is_none());
+}
+
+#[test]
+fn proof_outer_segment_round_trips() {
+    let opening = |seed: u128| OuterOpening {
+        columns: vec![3, 17, 40],
+        values: (0..6).map(|i| wide(seed + i)).collect(),
+        siblings: vec![[9u8; 32], [10u8; 32]],
+    };
+
+    let outer = OuterProof {
+        aux_root: [4u8; 32],
+        interleaved: vec![wide(100), wide(101)],
+        linear: vec![wide(200)],
+        quadratic: vec![wide(300), wide(301), wide(302)],
+        pad_opening: opening(1_000),
+        aux_opening: opening(2_000),
+    };
+
+    let proof = InnerProof::new(
+        dummy_commitment(),
+        empty_sumcheck(),
+        LogUpAux::new(vec![], vec![]),
+        eval_proof_with(vec![wide(1)], vec![]),
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        Some([5u8; 32]),
+        Some(outer),
+    );
+
+    let bytes = serialize_proof_bytes(&proof);
+    let restored: InnerProof<F> = deserialize_proof(&bytes).unwrap();
+
+    assert_eq!(restored.pad_root, Some([5u8; 32]));
+
+    let outer = restored.outer.expect("outer segment must survive the wire");
+    let bytes_of = |v: &[F]| v.iter().map(|f| f.to_bytes()).collect::<Vec<_>>();
+
+    assert_eq!(outer.aux_root, [4u8; 32]);
+    assert_eq!(
+        bytes_of(&outer.interleaved),
+        bytes_of(&[wide(100), wide(101)])
+    );
+    assert_eq!(bytes_of(&outer.linear), bytes_of(&[wide(200)]));
+    assert_eq!(
+        bytes_of(&outer.quadratic),
+        bytes_of(&[wide(300), wide(301), wide(302)])
+    );
+
+    for (opening, seed) in [(&outer.pad_opening, 1_000), (&outer.aux_opening, 2_000)] {
+        assert_eq!(opening.columns, vec![3, 17, 40]);
+        assert_eq!(
+            bytes_of(&opening.values),
+            bytes_of(&(0..6).map(|i| wide(seed + i)).collect::<Vec<_>>())
+        );
+        assert_eq!(opening.siblings, vec![[9u8; 32], [10u8; 32]]);
+    }
 }

@@ -111,7 +111,7 @@ fn logup_bus_happy_path() {
     let config = Config {
         num_queries: 4,
         min_security_bits: 0,
-        sumcheck_blinding_factor: 2,
+        zero_knowledge: true,
         ..Config::default()
     };
 
@@ -177,7 +177,7 @@ fn logup_bus_divergence_rejected() {
         HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut verifier_transcript, &config);
 
     assert!(
-        result.is_err(),
-        "Verifier must reject a non-permutation (bus sums do not cancel)",
+        matches!(result, Ok(false)),
+        "outer linear test must reject a non-permutation (bus sums do not cancel)",
     );
 }
