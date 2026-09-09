@@ -11,10 +11,10 @@ use hekate::crypto::DefaultHasher;
 use hekate::crypto::transcript::Transcript;
 use hekate::math::{Bit, Block32, Block128, Flat};
 use hekate_math::TowerField;
-use hekate_program::constraint::ConstraintAst;
-use hekate_program::constraint::builder::ConstraintSystem;
+use hekate_program::circuit::{Circuit, CircuitProgram};
+use hekate_program::digest::program_id;
 use hekate_program::permutation::{PermutationCheckSpec, Source};
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::{FixedShape, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 
@@ -26,48 +26,38 @@ type H = DefaultHasher;
 /// column 0, the other reading column 1. Endpoint
 /// sums cancel iff the two columns carry the same
 /// multiset under the shared selector.
-#[derive(Clone)]
-struct SameBusPermutationAir {
-    num_cols: usize,
+fn same_bus_permutation_air(num_rows: usize) -> CircuitProgram<F> {
+    let waiver = "see hekate/tests/gpa.rs: synthetic intra-table reverse-permutation \
+                  test, both endpoints positional on same trace; not a production \
+                  bus shape, exercises LogUp algebra only";
+
+    let mut cx = Circuit::<F>::new("SameBusPermutation", num_rows).unwrap();
+
+    let data = cx.columns(2, ColumnType::B32);
+    let selector = cx.column(ColumnType::Bit);
+
+    cx.fix(
+        selector,
+        FixedShape::Cadence {
+            stride: 1,
+            count: num_rows,
+            origin: 0,
+            values: vec![F::ONE],
+        },
+    );
+
+    for col in data.iter() {
+        let spec = PermutationCheckSpec::new(
+            vec![(Source::Column(col.index()), b"kappa_data" as &[u8])],
+            Some(selector.index()),
+        )
+        .with_clock_waiver(waiver);
+
+        cx.bus("same_bus", spec);
+    }
+
+    cx.compile().unwrap()
 }
-
-impl Air<F> for SameBusPermutationAir {
-    fn num_columns(&self) -> usize {
-        self.num_cols
-    }
-
-    fn column_layout(&self) -> &'static [ColumnType] {
-        &[ColumnType::B32, ColumnType::B32, ColumnType::Bit]
-    }
-
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        let waiver = "see hekate/tests/gpa.rs: synthetic intra-table reverse-permutation \
-                      test, both endpoints positional on same trace; not a production \
-                      bus shape, exercises LogUp algebra only";
-
-        let spec_a =
-            PermutationCheckSpec::new(vec![(Source::Column(0), b"kappa_data" as &[u8])], Some(2))
-                .with_clock_waiver(waiver);
-
-        let spec_b =
-            PermutationCheckSpec::new(vec![(Source::Column(1), b"kappa_data" as &[u8])], Some(2))
-                .with_clock_waiver(waiver);
-
-        vec![
-            ("same_bus".to_string(), spec_a),
-            ("same_bus".to_string(), spec_b),
-        ]
-    }
-
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(2));
-
-        cs.build()
-    }
-}
-
-impl Program<F> for SameBusPermutationAir {}
 
 fn generate_permutation_trace(num_vars: usize) -> ColumnTrace {
     let num_rows = 1 << num_vars;
@@ -103,7 +93,7 @@ fn logup_bus_happy_path() {
     let num_rows = 1 << num_vars;
     let seed = [0xAAu8; 32];
 
-    let air = SameBusPermutationAir { num_cols: 3 };
+    let air = same_bus_permutation_air(num_rows);
     let trace = generate_permutation_trace(num_vars);
     let witness = ProgramWitness::new(trace);
     let instance = ProgramInstance::new(num_rows, vec![]);
@@ -129,9 +119,17 @@ fn logup_bus_happy_path() {
     assert_eq!(proof.main_logup_aux.claimed_sums.len(), 2);
 
     let mut verifier_transcript = Transcript::<H>::new(b"LogUp_Happy");
-    let ok =
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut verifier_transcript, &config)
-            .expect("Verifier returned error");
+    let pinned_id = program_id(&air).unwrap();
+
+    let ok = HekateVerifier::<F, H>::verify(
+        &pinned_id,
+        &air,
+        &instance,
+        &proof,
+        &mut verifier_transcript,
+        &config,
+    )
+    .expect("Verifier returned error");
 
     assert!(ok, "Verifier rejected a valid permutation proof");
 }
@@ -144,7 +142,7 @@ fn logup_bus_divergence_rejected() {
     let num_rows = 1 << num_vars;
     let seed = [0xAAu8; 32];
 
-    let air = SameBusPermutationAir { num_cols: 3 };
+    let air = same_bus_permutation_air(num_rows);
 
     // Corrupt column B so its
     // multiset differs from column A.
@@ -173,8 +171,16 @@ fn logup_bus_divergence_rejected() {
     .expect("Prover generates an honest proof of a non-permutation");
 
     let mut verifier_transcript = Transcript::<H>::new(b"LogUp_Divergence");
-    let result =
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut verifier_transcript, &config);
+    let pinned_id = program_id(&air).unwrap();
+
+    let result = HekateVerifier::<F, H>::verify(
+        &pinned_id,
+        &air,
+        &instance,
+        &proof,
+        &mut verifier_transcript,
+        &config,
+    );
 
     assert!(
         matches!(result, Ok(false)),

@@ -2,22 +2,59 @@
 // SPDX-FileCopyrightText: 2026 Oumuamua Labs <info@oumuamua.dev>
 // SPDX-License-Identifier: AGPL-3.0-only
 
+use crate::chiplet::ChipletDef;
+use crate::constraint::{BoundaryTarget, ConstraintAst, ConstraintExpr, ExprId};
+use crate::expander::ExpansionEntry;
+use crate::permutation::{BusKind, PermutationCheckSpec, Source};
+use crate::{Air, FixedColumn, FixedShape, InlineKernelHint, Program};
 use alloc::string::String;
 use alloc::vec::Vec;
 use hekate_core::errors;
 use hekate_core::trace::ColumnType;
 use hekate_crypto::{DefaultHasher, Hasher};
 use hekate_math::TowerField;
-use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::{BoundaryTarget, ConstraintAst, ConstraintExpr, ExprId};
-use hekate_program::expander::ExpansionEntry;
-use hekate_program::permutation::{BusKind, PermutationCheckSpec, Source};
-use hekate_program::{Air, FixedColumn, FixedShape, InlineKernelHint, Program};
+
+/// Chunk size only:
+/// the byte stream, hence the digest, is independent of it.
+const FLUSH_BYTES: usize = 64 * 1024;
+
+struct Absorb {
+    hasher: DefaultHasher,
+    buf: Vec<u8>,
+}
+
+impl Absorb {
+    fn new() -> Self {
+        Self {
+            hasher: DefaultHasher::new(),
+            buf: Vec::with_capacity(FLUSH_BYTES + 64),
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+
+        if self.buf.len() >= FLUSH_BYTES {
+            self.hasher.update(&self.buf);
+            self.buf.clear();
+        }
+    }
+
+    fn finalize(mut self) -> [u8; 32] {
+        self.hasher.update(&self.buf);
+
+        self.hasher.finalize()
+    }
+}
 
 /// Deterministic 32-byte structural ID. Witness-independent,
 /// num_rows-independent. Same program shape -> same ID.
 pub fn program_id<F: TowerField, P: Program<F>>(program: &P) -> errors::Result<[u8; 32]> {
-    program_structural_hash::<F, P>(program)
+    Ok(program_id_of(
+        program,
+        &program.chiplet_defs()?,
+        &program.inline_chiplets()?,
+    ))
 }
 
 /// Hex-encoded `program_id` (64 lowercase chars, no prefix).
@@ -35,29 +72,26 @@ pub fn program_id_hex<F: TowerField, P: Program<F>>(program: &P) -> errors::Resu
     Ok(s)
 }
 
-/// Pure shape-only hash.
-pub(crate) fn program_structural_hash<F: TowerField, P: Program<F>>(
+pub fn program_id_of<F: TowerField, P: Program<F>>(
     program: &P,
-) -> errors::Result<[u8; 32]> {
-    let mut h = DefaultHasher::new();
-    h.update(b"hekate-program-id-v1");
+    chiplet_defs: &[ChipletDef<F>],
+    inline_chiplets: &[ChipletDef<F>],
+) -> [u8; 32] {
+    let mut h = Absorb::new();
+    h.update(b"hekate-program-id-v2");
 
     let main_name = program.name();
     h.update(&(main_name.len() as u64).to_le_bytes());
     h.update(main_name.as_bytes());
 
     absorb_layout(&mut h, program.column_layout());
-
-    let ast = program.constraint_ast();
-    absorb_ast::<F>(&mut h, &ast);
-
+    absorb_ast::<F>(&mut h, &program.constraint_ast());
     absorb_boundaries(&mut h, &program.boundary_constraints());
     absorb_permutation_checks(&mut h, &program.permutation_checks());
 
-    let chiplet_defs: Vec<ChipletDef<F>> = program.chiplet_defs()?;
     h.update(&(chiplet_defs.len() as u64).to_le_bytes());
 
-    for cd in &chiplet_defs {
+    for cd in chiplet_defs {
         absorb_chiplet_def::<F>(&mut h, cd);
     }
 
@@ -74,13 +108,12 @@ pub(crate) fn program_structural_hash<F: TowerField, P: Program<F>>(
     h.update(&(program.num_columns() as u64).to_le_bytes());
     h.update(&(program.num_public_inputs() as u64).to_le_bytes());
 
-    let inline_chiplets = program.inline_chiplets()?;
-    absorb_inline_chiplets::<F>(&mut h, &inline_chiplets, &program.inline_chiplet_kernels());
+    absorb_inline_chiplets::<F>(&mut h, inline_chiplets, &program.inline_chiplet_kernels());
 
-    Ok(h.finalize())
+    h.finalize()
 }
 
-fn absorb_chiplet_def<F: TowerField>(h: &mut DefaultHasher, cd: &ChipletDef<F>) {
+fn absorb_chiplet_def<F: TowerField>(h: &mut Absorb, cd: &ChipletDef<F>) {
     let name = Air::<F>::name(cd);
 
     h.update(&(name.len() as u64).to_le_bytes());
@@ -105,7 +138,7 @@ fn absorb_chiplet_def<F: TowerField>(h: &mut DefaultHasher, cd: &ChipletDef<F>) 
 }
 
 fn absorb_inline_chiplets<F: TowerField>(
-    h: &mut DefaultHasher,
+    h: &mut Absorb,
     inline_chiplets: &[ChipletDef<F>],
     inline_kernel_hints: &[InlineKernelHint],
 ) {
@@ -124,7 +157,7 @@ fn absorb_inline_chiplets<F: TowerField>(
     }
 }
 
-fn absorb_layout(h: &mut DefaultHasher, layout: &[ColumnType]) {
+fn absorb_layout(h: &mut Absorb, layout: &[ColumnType]) {
     h.update(&(layout.len() as u64).to_le_bytes());
 
     for ct in layout {
@@ -132,7 +165,7 @@ fn absorb_layout(h: &mut DefaultHasher, layout: &[ColumnType]) {
     }
 }
 
-fn absorb_ast<F: TowerField>(h: &mut DefaultHasher, ast: &ConstraintAst<F>) {
+fn absorb_ast<F: TowerField>(h: &mut Absorb, ast: &ConstraintAst<F>) {
     h.update(&(ast.arena.len() as u64).to_le_bytes());
 
     for i in 0..ast.arena.len() {
@@ -146,7 +179,7 @@ fn absorb_ast<F: TowerField>(h: &mut DefaultHasher, ast: &ConstraintAst<F>) {
     }
 }
 
-fn absorb_expr<F: TowerField>(h: &mut DefaultHasher, expr: &ConstraintExpr<F>) {
+fn absorb_expr<F: TowerField>(h: &mut Absorb, expr: &ConstraintExpr<F>) {
     match expr {
         ConstraintExpr::Cell(cell) => {
             h.update(&[0]);
@@ -184,8 +217,8 @@ fn absorb_expr<F: TowerField>(h: &mut DefaultHasher, expr: &ConstraintExpr<F>) {
 }
 
 fn absorb_boundaries<F: TowerField>(
-    h: &mut DefaultHasher,
-    boundaries: &[hekate_program::constraint::BoundaryConstraint<F>],
+    h: &mut Absorb,
+    boundaries: &[crate::constraint::BoundaryConstraint<F>],
 ) {
     h.update(&(boundaries.len() as u64).to_le_bytes());
 
@@ -206,7 +239,7 @@ fn absorb_boundaries<F: TowerField>(
     }
 }
 
-fn absorb_fixed_columns<F: TowerField>(h: &mut DefaultHasher, fixed: &[FixedColumn<F>]) {
+fn absorb_fixed_columns<F: TowerField>(h: &mut Absorb, fixed: &[FixedColumn<F>]) {
     h.update(&(fixed.len() as u64).to_le_bytes());
 
     for fc in fixed {
@@ -249,11 +282,42 @@ fn absorb_fixed_columns<F: TowerField>(h: &mut DefaultHasher, fixed: &[FixedColu
                     h.update(&v.to_bytes());
                 }
             }
+            FixedShape::Cadence {
+                stride,
+                count,
+                origin,
+                values,
+            } => {
+                h.update(&[6]);
+                h.update(&(*stride as u64).to_le_bytes());
+                h.update(&(*count as u64).to_le_bytes());
+                h.update(&(*origin as u64).to_le_bytes());
+                h.update(&(values.len() as u64).to_le_bytes());
+
+                for v in values {
+                    h.update(&v.to_bytes());
+                }
+            }
+            FixedShape::Segments(segments) => {
+                h.update(&[7]);
+                h.update(&(segments.len() as u64).to_le_bytes());
+
+                for seg in segments {
+                    h.update(&(seg.stride as u64).to_le_bytes());
+                    h.update(&(seg.count as u64).to_le_bytes());
+                    h.update(&(seg.origin as u64).to_le_bytes());
+                    h.update(&(seg.values.len() as u64).to_le_bytes());
+
+                    for v in &seg.values {
+                        h.update(&v.to_bytes());
+                    }
+                }
+            }
         }
     }
 }
 
-fn absorb_permutation_checks(h: &mut DefaultHasher, checks: &[(String, PermutationCheckSpec)]) {
+fn absorb_permutation_checks(h: &mut Absorb, checks: &[(String, PermutationCheckSpec)]) {
     h.update(&(checks.len() as u64).to_le_bytes());
 
     for (bus_id, spec) in checks {
@@ -264,7 +328,7 @@ fn absorb_permutation_checks(h: &mut DefaultHasher, checks: &[(String, Permutati
     }
 }
 
-fn absorb_perm_spec(h: &mut DefaultHasher, spec: &PermutationCheckSpec) {
+fn absorb_perm_spec(h: &mut Absorb, spec: &PermutationCheckSpec) {
     h.update(&[match spec.kind {
         BusKind::Permutation => 0,
         BusKind::Lookup => 1,
@@ -305,7 +369,7 @@ fn absorb_perm_spec(h: &mut DefaultHasher, spec: &PermutationCheckSpec) {
     }
 }
 
-fn absorb_source(h: &mut DefaultHasher, source: &Source) {
+fn absorb_source(h: &mut Absorb, source: &Source) {
     match source {
         Source::Column(idx) => {
             h.update(&[0]);
@@ -334,7 +398,7 @@ fn absorb_source(h: &mut DefaultHasher, source: &Source) {
     }
 }
 
-fn absorb_expander(h: &mut DefaultHasher, exp: &hekate_program::expander::VirtualExpander) {
+fn absorb_expander(h: &mut Absorb, exp: &crate::expander::VirtualExpander) {
     let entries = exp.expansion_entries();
     h.update(&(entries.len() as u64).to_le_bytes());
 
@@ -386,5 +450,27 @@ fn column_type_tag(ct: ColumnType) -> u8 {
         ColumnType::B32 => 3,
         ColumnType::B64 => 4,
         ColumnType::B128 => 5,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffering_does_not_move_digest() {
+        let fields: Vec<Vec<u8>> = (0..FLUSH_BYTES / 4 + 17)
+            .map(|i| (i as u32).to_le_bytes().to_vec())
+            .collect();
+
+        let mut buffered = Absorb::new();
+        let mut direct = DefaultHasher::new();
+
+        for field in &fields {
+            buffered.update(field);
+            direct.update(field);
+        }
+
+        assert_eq!(buffered.finalize(), direct.finalize());
     }
 }

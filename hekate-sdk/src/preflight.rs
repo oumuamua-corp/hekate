@@ -25,7 +25,6 @@ const MAX_REPORTED_MISMATCH_ROWS: usize = 32;
 
 const FMT_MAX_ROW_PREVIEW: usize = 8;
 const FMT_MAX_MISMATCH_PREVIEW: usize = 16;
-const FMT_MAX_MUTEX_PREVIEW: usize = 8;
 
 type AirViolations<F> = (Vec<ConstraintViolation<F>>, Vec<FixedColumnViolation<F>>);
 
@@ -72,27 +71,30 @@ pub struct BusDiagnostic<F> {
     pub bus_imbalance: bool,
 
     /// Lookup-only:
-    /// row indices where endpoint `h` values
-    /// fail the pointwise XOR-to-zero check.
-    /// Permutation buses leave this empty
+    /// row indices where endpoint `h` values fail the pointwise
+    /// XOR-to-zero check. Permutation buses leave this empty
     /// and signal via `bus_imbalance` instead.
     pub mismatching_rows: Vec<usize>,
 
-    /// Endpoints on this bus_id
-    /// disagree on `BusKind`.
+    /// Endpoints on this bus_id disagree on `BusKind`.
     pub kind_conflict: bool,
 
-    /// Paired-spec rows where `s_send · s_recv = 1`;
-    /// the AIR mutex constraint must reject these.
-    pub selector_mutex_violations: Vec<(TableId, usize)>,
+    /// Emit rows whose row-index clock sources fold to
+    /// one value. The rest of the key is witness-derived.
+    pub clock_collisions: Vec<(TableId, usize, usize)>,
+
+    /// No endpoint emits:
+    /// balanced, and enforcing nothing.
+    pub inert: bool,
 }
 
 impl<F> BusDiagnostic<F> {
     pub fn has_failures(&self) -> bool {
         self.bus_imbalance
             || self.kind_conflict
+            || self.inert
             || !self.mismatching_rows.is_empty()
-            || !self.selector_mutex_violations.is_empty()
+            || !self.clock_collisions.is_empty()
     }
 }
 
@@ -539,9 +541,7 @@ struct BusEndpointAccum<F> {
     /// Empty unless `kind == Lookup`.
     h_rows: Vec<Flat<F>>,
 
-    /// Paired-spec rows with both selectors high
-    /// (capped at `MAX_REPORTED_MISMATCH_ROWS`).
-    mutex_violations: Vec<usize>,
+    clock_collision: Option<(usize, usize)>,
 }
 
 struct EndpointStats<F> {
@@ -550,7 +550,7 @@ struct EndpointStats<F> {
     row_count: usize,
     active_rows: usize,
     h_rows: Vec<Flat<F>>,
-    mutex_violations: Vec<usize>,
+    clock_collision: Option<(usize, usize)>,
 }
 
 /// Fixed γ, β for char-2 bus closure check;
@@ -642,6 +642,11 @@ where
     let mut claimed_sum = zero;
     let mut active_rows = 0usize;
 
+    let clock_mask = separating_clock_mask(spec, num_rows.trailing_zeros() as usize);
+
+    let mut clock_seen: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut clock_collision: Option<(usize, usize)> = None;
+
     let mut row_vec: Vec<Flat<F>> = Vec::with_capacity(num_virtual);
     let mut row_bytes: Vec<u8> = Vec::new();
 
@@ -650,8 +655,6 @@ where
     } else {
         Vec::new()
     };
-
-    let mut mutex_violations: Vec<usize> = Vec::new();
 
     if has_expansion {
         let phys_row_bytes: usize = air.column_layout().iter().map(|c| c.byte_size()).sum();
@@ -682,14 +685,6 @@ where
             None => zero,
         };
 
-        if spec.recv_selector.is_some()
-            && s_send == one
-            && s_recv == one
-            && mutex_violations.len() < MAX_REPORTED_MISMATCH_ROWS
-        {
-            mutex_violations.push(row_idx);
-        }
-
         let selector_val = s_send + s_recv;
 
         if selector_val == zero {
@@ -701,6 +696,13 @@ where
         }
 
         active_rows += 1;
+
+        if let Some(mask) = clock_mask
+            && let Some(prev) = clock_seen.insert(row_idx & mask, row_idx)
+            && clock_collision.is_none()
+        {
+            clock_collision = Some((prev, row_idx));
+        }
 
         let mut key = gamma;
         let mut current_beta = one;
@@ -736,31 +738,31 @@ where
         row_count: num_rows,
         active_rows,
         h_rows,
-        mutex_violations,
+        clock_collision,
     })
 }
 
-pub fn check_bus_multisets<F, P, T>(
-    program: &P,
+pub fn check_bus_multisets<F, A, T>(
+    main: &A,
+    chiplet_defs: &[ChipletDef<F>],
     witness: &ProgramWitness<F, T>,
     report: &mut PreflightReport<F>,
 ) -> errors::Result<()>
 where
     F: TraceCompatibleField,
-    P: Program<F>,
+    A: Air<F> + Sync,
     T: Trace,
 {
     let gamma = fixed_gamma::<F>();
     let beta = fixed_beta::<F>();
 
-    let main_perm_checks = program.permutation_checks();
-    let chiplet_defs = program.chiplet_defs()?;
+    let main_perm_checks = main.permutation_checks();
 
     #[cfg(not(feature = "parallel"))]
     let main_endpoints: Vec<(String, BusEndpointAccum<F>)> = main_perm_checks
         .iter()
         .map(|(bus_id, spec)| {
-            let stats = compute_endpoint_product(spec, program, &witness.trace, gamma, beta)?;
+            let stats = compute_endpoint_product(spec, main, &witness.trace, gamma, beta)?;
 
             Ok((
                 bus_id.clone(),
@@ -772,7 +774,7 @@ where
                     product: stats.product,
                     claimed_sum: stats.claimed_sum,
                     h_rows: stats.h_rows,
-                    mutex_violations: stats.mutex_violations,
+                    clock_collision: stats.clock_collision,
                 },
             ))
         })
@@ -782,7 +784,7 @@ where
     let main_endpoints: Vec<(String, BusEndpointAccum<F>)> = main_perm_checks
         .par_iter()
         .map(|(bus_id, spec)| {
-            let stats = compute_endpoint_product(spec, program, &witness.trace, gamma, beta)?;
+            let stats = compute_endpoint_product(spec, main, &witness.trace, gamma, beta)?;
             Ok((
                 bus_id.clone(),
                 BusEndpointAccum {
@@ -793,7 +795,7 @@ where
                     product: stats.product,
                     claimed_sum: stats.claimed_sum,
                     h_rows: stats.h_rows,
-                    mutex_violations: stats.mutex_violations,
+                    clock_collision: stats.clock_collision,
                 },
             ))
         })
@@ -817,7 +819,7 @@ where
                         product: stats.product,
                         claimed_sum: stats.claimed_sum,
                         h_rows: stats.h_rows,
-                        mutex_violations: stats.mutex_violations,
+                        clock_collision: stats.clock_collision,
                     },
                 ))
             })
@@ -842,7 +844,7 @@ where
                         product: stats.product,
                         claimed_sum: stats.claimed_sum,
                         h_rows: stats.h_rows,
-                        mutex_violations: stats.mutex_violations,
+                        clock_collision: stats.clock_collision,
                     },
                 ))
             })
@@ -879,11 +881,12 @@ where
             Vec::new()
         };
 
-        let selector_mutex_violations: Vec<(TableId, usize)> = endpoints
+        let clock_collisions: Vec<(TableId, usize, usize)> = endpoints
             .iter()
-            .flat_map(|e| e.mutex_violations.iter().map(|row| (e.source, *row)))
-            .take(MAX_REPORTED_MISMATCH_ROWS)
+            .filter_map(|e| e.clock_collision.map(|(a, b)| (e.source, a, b)))
             .collect();
+
+        let inert = endpoints.iter().all(|e| e.active_rows == 0);
 
         let diag = BusDiagnostic {
             bus_id: bus_id.clone(),
@@ -901,7 +904,8 @@ where
             bus_imbalance,
             mismatching_rows,
             kind_conflict,
-            selector_mutex_violations,
+            clock_collisions,
+            inert,
         };
 
         if diag.has_failures() {
@@ -959,6 +963,8 @@ where
 {
     let mut report = PreflightReport::new();
 
+    let chiplet_defs = program.chiplet_defs()?;
+
     check_air_constraints(program, &witness.trace, TableId::Main, &mut report)?;
     check_boundary_constraints(
         program,
@@ -967,12 +973,8 @@ where
         TableId::Main,
         &mut report,
     )?;
-    check_chiplet_constraints(
-        &program.chiplet_defs()?,
-        &witness.chiplet_traces,
-        &mut report,
-    )?;
-    check_bus_multisets(program, witness, &mut report)?;
+    check_chiplet_constraints(&chiplet_defs, &witness.chiplet_traces, &mut report)?;
+    check_bus_multisets(program, &chiplet_defs, witness, &mut report)?;
 
     Ok(report)
 }
@@ -1039,11 +1041,12 @@ impl<F: TraceCompatibleField> fmt::Display for BusDiagnostic<F> {
             failures.push(format!("mismatching_rows={}", self.mismatching_rows.len()));
         }
 
-        if !self.selector_mutex_violations.is_empty() {
-            failures.push(format!(
-                "selector_mutex_violations={}",
-                self.selector_mutex_violations.len()
-            ));
+        if !self.clock_collisions.is_empty() {
+            failures.push(format!("clock_collisions={}", self.clock_collisions.len()));
+        }
+
+        if self.inert {
+            failures.push("inert".to_string());
         }
 
         writeln!(
@@ -1076,15 +1079,20 @@ impl<F: TraceCompatibleField> fmt::Display for BusDiagnostic<F> {
             )?;
         }
 
-        for (table, row) in self
-            .selector_mutex_violations
-            .iter()
-            .take(FMT_MAX_MUTEX_PREVIEW)
-        {
+        for (table, a, b) in &self.clock_collisions {
             writeln!(
                 f,
-                "    [{}] paired-bus mutex violation: row {} has s_send · s_recv = 1",
-                table, row,
+                "    [{}] emit rows {} and {} share a clock value; \
+                 widen the row-index source or make the keys differ",
+                table, a, b,
+            )?;
+        }
+
+        if self.inert {
+            writeln!(
+                f,
+                "    every endpoint is switched off on every row; \
+                 the selector shapes pin no emit; this bus binds nothing",
             )?;
         }
 
@@ -1121,4 +1129,35 @@ fn write_grouped_constraint_violations<F>(
     }
 
     Ok(())
+}
+
+/// Row-index bits the spec's clock sources actually
+/// fold, `None` when they already cover every row bit.
+fn separating_clock_mask(spec: &PermutationCheckSpec, num_vars: usize) -> Option<usize> {
+    let all = match num_vars >= usize::BITS as usize {
+        true => usize::MAX,
+        false => (1usize << num_vars) - 1,
+    };
+
+    let mut mask = 0usize;
+    let mut has_clock = false;
+
+    for (source, _) in &spec.sources {
+        let (lo, hi) = match source {
+            Source::RowIndexLeBytes(n) => (0, 8 * (*n).min(8)),
+            Source::RowIndexByte(k) => (8 * *k, 8 * *k + 8),
+            Source::Column(_) | Source::Columns(_) | Source::Const(_) => continue,
+        };
+
+        has_clock = true;
+
+        for bit in lo..hi.min(num_vars) {
+            mask |= 1usize << bit;
+        }
+    }
+
+    match has_clock && mask != all {
+        true => Some(mask),
+        false => None,
+    }
 }

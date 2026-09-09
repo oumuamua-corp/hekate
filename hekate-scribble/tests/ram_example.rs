@@ -11,14 +11,12 @@
 //! shadow columns, and the committed Q_LAST
 //! row-position selector.
 
-use hekate_core::trace::{ColumnTrace, ColumnType, TraceBuilder};
-use hekate_gadgets::{CpuMemColumns, CpuMemoryUnit, MemoryEvent, RamChiplet, generate_ram_trace};
+use hekate_core::trace::{ColumnTrace, TraceBuilder};
+use hekate_gadgets::{CpuMemColumns, MemoryEvent, RamChiplet, generate_ram_trace};
 use hekate_math::{Bit, Block32, Block128, TowerField};
 use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::ConstraintAst;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::permutation::PermutationCheckSpec;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::circuit::{Circuit, CircuitProgram};
+use hekate_program::{FixedShape, ProgramInstance, ProgramWitness};
 use hekate_scribble::{
     Mutation, MutationKind, ScribbleConfig, Target, assert_all_caught, check_single_mutation,
 };
@@ -30,44 +28,33 @@ const PHY_AUX_INV: usize = 15;
 
 type F = Block128;
 
-#[derive(Clone)]
-struct RamTestProgram {
-    num_rows: usize,
-}
+fn ram_test_program(num_rows: usize, num_events: usize) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("RamScribble", num_rows).unwrap();
+    let cpu = cx.schema(&CpuMemColumns::build_layout());
 
-impl Air<F> for RamTestProgram {
-    fn num_columns(&self) -> usize {
-        CpuMemColumns::NUM_COLUMNS
-    }
+    cx.fix(
+        cpu.at(CpuMemColumns::SELECTOR),
+        FixedShape::Cadence {
+            stride: 1,
+            count: num_events,
+            origin: 0,
+            values: vec![F::ONE],
+        },
+    );
 
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        LAYOUT.get_or_init(CpuMemColumns::build_layout)
-    }
+    cx.bus(RamChiplet::BUS_ID, RamChiplet::cpu_linking_spec());
 
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![(RamChiplet::BUS_ID.into(), CpuMemoryUnit::linking_spec())]
-    }
+    let cs = cx.cs();
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
+    let s = cs.col(CpuMemColumns::SELECTOR);
+    cs.assert_boolean(cs.col(CpuMemColumns::IS_WRITE));
 
-        let s = cs.col(CpuMemColumns::SELECTOR);
-        cs.assert_boolean(s);
-        cs.assert_boolean(cs.col(CpuMemColumns::IS_WRITE));
+    let not_active = cs.one() - s;
+    cs.assert_zero_when(not_active, cs.col(CpuMemColumns::IS_WRITE));
 
-        let not_active = cs.one() - s;
-        cs.assert_zero_when(not_active, cs.col(CpuMemColumns::IS_WRITE));
+    cx.attach(ChipletDef::from_air(&RamChiplet::new(num_rows, num_events)).unwrap());
 
-        cs.build()
-    }
-}
-
-impl Program<F> for RamTestProgram {
-    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        let ram = RamChiplet::new(self.num_rows);
-        Ok(vec![ChipletDef::from_air(&ram)?])
-    }
+    cx.compile().unwrap()
 }
 
 fn generate_cpu_trace(events: &[MemoryEvent], num_rows: usize) -> ColumnTrace {
@@ -109,11 +96,11 @@ fn build_fixture(
     events: &[MemoryEvent],
     num_rows: usize,
 ) -> (
-    RamTestProgram,
+    CircuitProgram<F>,
     ProgramInstance<F>,
     ProgramWitness<F, ColumnTrace>,
 ) {
-    let air = RamTestProgram { num_rows };
+    let air = ram_test_program(num_rows, events.len());
     let cpu_trace = generate_cpu_trace(events, num_rows);
     let ram_trace = generate_ram_trace(events, num_rows).expect("ram trace gen");
 
@@ -124,7 +111,7 @@ fn build_fixture(
 }
 
 fn setup_dense_fixture() -> (
-    RamTestProgram,
+    CircuitProgram<F>,
     ProgramInstance<F>,
     ProgramWitness<F, ColumnTrace>,
 ) {
@@ -139,7 +126,7 @@ fn setup_dense_fixture() -> (
 }
 
 fn setup_consistency_window_fixture() -> (
-    RamTestProgram,
+    CircuitProgram<F>,
     ProgramInstance<F>,
     ProgramWitness<F, ColumnTrace>,
 ) {
@@ -157,7 +144,7 @@ fn setup_consistency_window_fixture() -> (
 }
 
 fn setup_padding_fixture() -> (
-    RamTestProgram,
+    CircuitProgram<F>,
     ProgramInstance<F>,
     ProgramWitness<F, ColumnTrace>,
 ) {

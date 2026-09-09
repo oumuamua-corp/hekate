@@ -34,12 +34,12 @@ use alloc::vec::Vec;
 use hekate_core::trace::{ColumnTrace, ColumnType, TraceBuilder, TraceCompatibleField};
 use hekate_gadgets::atoms::int_arith;
 use hekate_math::{Block32, TowerField};
-use hekate_program::Air;
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
 use hekate_program::define_columns;
 use hekate_program::expander::VirtualExpander;
-use hekate_program::permutation::{PermutationCheckSpec, REQUEST_IDX_LABEL, Source};
+use hekate_program::permutation::{BusKind, PermutationCheckSpec, Service, ServiceSlot};
+use hekate_program::{Air, FixedColumn};
 
 // =================================================================
 // CPU-side Columns (for main trace linking)
@@ -55,38 +55,6 @@ define_columns! {
         BM_C: B32,
         BM_IDX: B32,
         SELECTOR: Bit,
-    }
-}
-
-/// CPU-side basemul linking unit.
-pub struct CpuBasemulUnit;
-
-impl CpuBasemulUnit {
-    /// Linking spec matching BasemulChiplet.
-    /// Challenge labels must be identical.
-    pub fn linking_spec() -> PermutationCheckSpec {
-        PermutationCheckSpec::new(
-            vec![
-                (
-                    Source::Column(CpuBasemulColumns::BM_A),
-                    b"kappa_bm_a" as &[u8],
-                ),
-                (
-                    Source::Column(CpuBasemulColumns::BM_B),
-                    b"kappa_bm_b" as &[u8],
-                ),
-                (
-                    Source::Column(CpuBasemulColumns::BM_C),
-                    b"kappa_bm_c" as &[u8],
-                ),
-                (
-                    Source::Column(CpuBasemulColumns::BM_IDX),
-                    b"kappa_bm_idx" as &[u8],
-                ),
-                (Source::RowIndexLeBytes(4), REQUEST_IDX_LABEL),
-            ],
-            Some(CpuBasemulColumns::SELECTOR),
-        )
     }
 }
 
@@ -255,6 +223,7 @@ pub struct BasemulChiplet {
     pub modulus: u32,
     pub bit_width: usize,
     pub num_rows: usize,
+    pub num_ops: usize,
 
     layout: BasemulLayout,
     expander: VirtualExpander,
@@ -263,8 +232,9 @@ pub struct BasemulChiplet {
 impl BasemulChiplet {
     pub const BUS_ID: &'static str = "basemul";
 
-    pub fn new(modulus: u32, num_rows: usize) -> Self {
+    pub fn new(modulus: u32, num_rows: usize, num_ops: usize) -> Self {
         assert!(num_rows.is_power_of_two());
+        assert!(num_ops <= num_rows, "op count exceeds num_rows");
 
         let bit_width = 32 - modulus.leading_zeros() as usize;
         let layout = BasemulLayout::compute(bit_width);
@@ -280,6 +250,7 @@ impl BasemulChiplet {
             modulus,
             bit_width,
             num_rows,
+            num_ops,
             layout,
             expander,
         }
@@ -289,20 +260,48 @@ impl BasemulChiplet {
         &self.layout
     }
 
-    pub fn linking_spec(&self) -> PermutationCheckSpec {
-        PermutationCheckSpec::new(
-            vec![
-                (Source::Column(self.layout.bus_a), b"kappa_bm_a" as &[u8]),
-                (Source::Column(self.layout.bus_b), b"kappa_bm_b" as &[u8]),
-                (Source::Column(self.layout.bus_c), b"kappa_bm_c" as &[u8]),
-                (
-                    Source::Column(self.layout.bus_idx),
-                    b"kappa_bm_idx" as &[u8],
-                ),
-                (Source::Column(self.layout.request_idx), REQUEST_IDX_LABEL),
+    /// Both endpoints derive from this schema:
+    /// the operand triple, the coefficient index, the clock.
+    pub fn service() -> Service {
+        Service {
+            bus_id: Self::BUS_ID,
+            kind: BusKind::Permutation,
+            slots: vec![
+                ServiceSlot::Value(b"kappa_bm_a"),
+                ServiceSlot::Value(b"kappa_bm_b"),
+                ServiceSlot::Value(b"kappa_bm_c"),
+                ServiceSlot::Value(b"kappa_bm_idx"),
+                ServiceSlot::RequestIdx { num_bytes: 4 },
             ],
-            Some(self.layout.s_active),
-        )
+            clock_waiver: None,
+        }
+    }
+
+    pub fn linking_spec(&self) -> PermutationCheckSpec {
+        let ly = &self.layout;
+
+        Self::service()
+            .respond(
+                &[ly.bus_a, ly.bus_b, ly.bus_c, ly.bus_idx],
+                &[ly.request_idx],
+                ly.s_active,
+            )
+            .expect("service slots match the responder columns")
+    }
+
+    /// Requester endpoint over `CpuBasemulColumns`.
+    pub fn cpu_linking_spec() -> PermutationCheckSpec {
+        Self::service()
+            .request(
+                &[
+                    CpuBasemulColumns::BM_A,
+                    CpuBasemulColumns::BM_B,
+                    CpuBasemulColumns::BM_C,
+                    CpuBasemulColumns::BM_IDX,
+                ],
+                CpuBasemulColumns::SELECTOR,
+            )
+            .expect("service slots match the requester columns")
     }
 }
 
@@ -322,6 +321,10 @@ impl<F: TowerField + TraceCompatibleField> Air<F> for BasemulChiplet {
 
     fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
         vec![(Self::BUS_ID.into(), self.linking_spec())]
+    }
+
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::prefix(self.layout.s_active, self.num_ops)]
     }
 
     fn virtual_expander(&self) -> Option<&VirtualExpander> {
@@ -345,7 +348,6 @@ fn build_basemul_constraints<F: TowerField>(
     let cs = ConstraintSystem::<F>::new();
 
     let s_active = cs.col(ly.s_active);
-    cs.assert_boolean(s_active);
 
     let a: Vec<_> = (0..bit_width).map(|k| cs.col(ly.a_bits + k)).collect();
     let b: Vec<_> = (0..bit_width).map(|k| cs.col(ly.b_bits + k)).collect();
@@ -584,6 +586,7 @@ mod tests {
     use super::*;
     use hekate_core::trace::Trace;
     use hekate_math::{Bit, Block128, Flat};
+    use hekate_program::permutation::REQUEST_IDX_LABEL;
 
     type F = Block128;
 
@@ -621,14 +624,14 @@ mod tests {
 
     #[test]
     fn constraint_ast_builds() {
-        let chiplet = BasemulChiplet::new(Q, 4);
+        let chiplet = BasemulChiplet::new(Q, 4, 4);
         let ast = Air::<F>::constraint_ast(&chiplet);
         assert!(ast.roots.len() > 30);
     }
 
     #[test]
     fn air_declares_one_bus() {
-        let chiplet = BasemulChiplet::new(Q, 4);
+        let chiplet = BasemulChiplet::new(Q, 4, 4);
         let checks = Air::<F>::permutation_checks(&chiplet);
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].0, "basemul");
@@ -805,8 +808,9 @@ mod tests {
 
     #[test]
     fn bus_labels() {
-        let chiplet = BasemulChiplet::new(Q, 4);
+        let chiplet = BasemulChiplet::new(Q, 4, 4);
         let spec = chiplet.linking_spec();
+
         assert_eq!(spec.sources.len(), 5);
         assert_eq!(spec.sources[0].1, b"kappa_bm_a");
         assert_eq!(spec.sources[1].1, b"kappa_bm_b");
@@ -825,7 +829,7 @@ mod tests {
         // A malicious prover could transmit arbitrary
         // values through the bus while proving correct
         // arithmetic on different values.
-        let chiplet = BasemulChiplet::new(Q, 4);
+        let chiplet = BasemulChiplet::new(Q, 4, 4);
         let ast = Air::<F>::constraint_ast(&chiplet);
 
         // Build constraints WITHOUT packing for comparison.
@@ -833,8 +837,6 @@ mod tests {
         let ly = BasemulLayout::compute(BW);
         let cs_no_pack = ConstraintSystem::<F>::new();
         let s_active = cs_no_pack.col(ly.s_active);
-
-        cs_no_pack.assert_boolean(s_active);
 
         let a: Vec<_> = (0..BW).map(|k| cs_no_pack.col(ly.a_bits + k)).collect();
         let b: Vec<_> = (0..BW).map(|k| cs_no_pack.col(ly.b_bits + k)).collect();
@@ -887,6 +889,7 @@ mod tests {
         // + 2 padding-row pins (bus_idx, request_idx).
         let pad_bits = ly.num_expanded_bits - ly.num_bit_cols;
         let expected_delta = 3 + pad_bits + 2;
+
         assert_eq!(
             ast.roots.len() - ast_no_pack.roots.len(),
             expected_delta,
@@ -934,7 +937,7 @@ mod tests {
         let trace = generate_basemul_trace(Q, &ops, 2).unwrap();
         let layout = BasemulLayout::compute(BW);
 
-        let chiplet = BasemulChiplet::new(Q, 2);
+        let chiplet = BasemulChiplet::new(Q, 2, 2);
         let variants = Air::<F>::virtual_expander(&chiplet)
             .unwrap()
             .expand_variants(&trace, 0)

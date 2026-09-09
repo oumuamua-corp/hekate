@@ -10,18 +10,17 @@
 //! and evaluation argument integrity.
 
 use hekate::core::config::Config;
-use hekate::core::trace::{ColumnTrace, ColumnType, TraceColumn};
+use hekate::core::trace::{ColumnTrace, TraceColumn};
 use hekate::crypto::DefaultHasher;
 use hekate::crypto::transcript::Transcript;
 use hekate::math::{Block128, TowerField};
 use hekate_core::trace::IntoTraceColumn;
-use hekate_gadgets::{CpuFetchColumns, CpuFetchUnit, Instruction, RomChiplet, generate_rom_trace};
+use hekate_gadgets::{CpuFetchColumns, Instruction, RomChiplet, generate_rom_trace};
 use hekate_math::{Bit, Block32};
 use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::ConstraintAst;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::permutation::PermutationCheckSpec;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::circuit::{Circuit, CircuitProgram};
+use hekate_program::digest::program_id;
+use hekate_program::{FixedShape, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 
@@ -34,38 +33,25 @@ type H = DefaultHasher;
 // ROM is an independent chiplet via chiplet_defs().
 // ==========================================================
 
-#[derive(Clone)]
-struct ChipletTestAir {
-    rom_num_rows: usize,
-}
+fn chiplet_test_air(num_rows: usize) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("ChipletTest", num_rows).unwrap();
+    let cpu = cx.schema(&CpuFetchColumns::build_layout());
 
-impl Air<F> for ChipletTestAir {
-    fn num_columns(&self) -> usize {
-        CpuFetchColumns::NUM_COLUMNS
-    }
+    cx.fix(
+        cpu.at(CpuFetchColumns::SELECTOR),
+        FixedShape::Cadence {
+            stride: 1,
+            count: num_rows,
+            origin: 0,
+            values: vec![F::ONE],
+        },
+    );
 
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        LAYOUT.get_or_init(CpuFetchColumns::build_layout)
-    }
+    cx.bus(RomChiplet::BUS_ID, RomChiplet::cpu_linking_spec());
 
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![(RomChiplet::BUS_ID.into(), CpuFetchUnit::linking_spec())]
-    }
+    cx.attach(ChipletDef::from_air(&RomChiplet::new(num_rows, num_rows)).unwrap());
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CpuFetchColumns::SELECTOR));
-
-        cs.build()
-    }
-}
-
-impl Program<F> for ChipletTestAir {
-    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        let rom = RomChiplet::new(self.rom_num_rows);
-        Ok(vec![ChipletDef::from_air(&rom)?])
-    }
+    cx.compile().unwrap()
 }
 
 // ==========================================================
@@ -75,7 +61,7 @@ impl Program<F> for ChipletTestAir {
 fn build_test_system(
     num_vars: usize,
 ) -> (
-    ChipletTestAir,
+    CircuitProgram<F>,
     ProgramInstance<F>,
     ProgramWitness<F, ColumnTrace>,
     Config,
@@ -124,9 +110,7 @@ fn build_test_system(
     // ROM chiplet trace
     let rom_trace = generate_rom_trace(&instructions, num_rows).unwrap();
 
-    let air = ChipletTestAir {
-        rom_num_rows: num_rows,
-    };
+    let air = chiplet_test_air(num_rows);
     let instance = ProgramInstance::new(num_rows, vec![]);
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(vec![rom_trace]);
 
@@ -142,7 +126,7 @@ fn build_test_system(
 }
 
 fn prove_and_verify(
-    air: &ChipletTestAir,
+    air: &CircuitProgram<F>,
     instance: &ProgramInstance<F>,
     witness: &ProgramWitness<F, ColumnTrace>,
     config: &Config,
@@ -160,8 +144,10 @@ fn prove_and_verify(
     .expect("proving failed");
 
     let mut vt = Transcript::<H>::new(b"ChipletSecurity");
-    let ok =
-        HekateVerifier::<F, H>::verify(air, instance, &proof, &mut vt, config).unwrap_or(false);
+    let pinned_id = program_id(air).unwrap();
+
+    let ok = HekateVerifier::<F, H>::verify(&pinned_id, air, instance, &proof, &mut vt, config)
+        .unwrap_or(false);
 
     (proof, ok)
 }
@@ -186,7 +172,10 @@ fn extra_chiplet_commitments_rejected() {
     proof.chiplet_commitments.push(extra_comm);
 
     let mut vt = Transcript::<H>::new(b"ChipletSecurity");
-    let result = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
+    let pinned_id = program_id(&air).unwrap();
+
+    let result =
+        HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config);
 
     assert!(
         result.is_err() || !result.unwrap(),
@@ -212,7 +201,10 @@ fn missing_chiplet_commitments_rejected() {
     proof.chiplet_commitments.clear();
 
     let mut vt = Transcript::<H>::new(b"ChipletSecurity");
-    let result = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
+    let pinned_id = program_id(&air).unwrap();
+
+    let result =
+        HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config);
 
     assert!(
         result.is_err(),
@@ -243,7 +235,10 @@ fn chiplet_eval_values_forgery() {
     c_eval.point_evaluation.1[0] += F::ONE;
 
     let mut vt = Transcript::<H>::new(b"ChipletSecurity");
-    let result = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
+    let pinned_id = program_id(&air).unwrap();
+
+    let result =
+        HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config);
 
     assert!(
         result.is_err() || !result.unwrap(),
@@ -271,7 +266,10 @@ fn chiplet_root_swap_rejected() {
     proof.chiplet_commitments[0].root = [0u8; 32];
 
     let mut vt = Transcript::<H>::new(b"ChipletSecurity");
-    let result = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
+    let pinned_id = program_id(&air).unwrap();
+
+    let result =
+        HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config);
 
     assert!(
         result.is_err() || !result.unwrap(),
@@ -300,7 +298,10 @@ fn chiplet_eval_values_truncated() {
     proof.chiplet_eval_proofs[0].point_evaluation.1.truncate(1);
 
     let mut vt = Transcript::<H>::new(b"ChipletSecurity");
-    let result = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
+    let pinned_id = program_id(&air).unwrap();
+
+    let result =
+        HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config);
 
     assert!(
         result.is_err(),
@@ -331,7 +332,10 @@ fn chiplet_logup_sum_mismatch() {
     proof.chiplet_logup_aux[0].claimed_sums[0].1 += F::ONE;
 
     let mut vt = Transcript::<H>::new(b"ChipletSecurity");
-    let result = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
+    let pinned_id = program_id(&air).unwrap();
+
+    let result =
+        HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config);
 
     assert!(
         result.is_err() || !result.unwrap(),
@@ -351,42 +355,29 @@ fn chiplet_logup_sum_mismatch() {
 /// AIR with an extra phantom bus_id that
 /// no chiplet provides. Used only for
 /// verification (not proving).
-#[derive(Clone)]
-struct PhantomBusAir {
-    rom_num_rows: usize,
-}
+fn phantom_bus_air(num_rows: usize) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("PhantomBus", num_rows).unwrap();
+    let cpu = cx.schema(&CpuFetchColumns::build_layout());
 
-impl Air<F> for PhantomBusAir {
-    fn num_columns(&self) -> usize {
-        CpuFetchColumns::NUM_COLUMNS
-    }
+    cx.fix(
+        cpu.at(CpuFetchColumns::SELECTOR),
+        FixedShape::Cadence {
+            stride: 1,
+            count: num_rows,
+            origin: 0,
+            values: vec![F::ONE],
+        },
+    );
 
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        LAYOUT.get_or_init(CpuFetchColumns::build_layout)
-    }
+    cx.bus(RomChiplet::BUS_ID, RomChiplet::cpu_linking_spec());
 
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![
-            (RomChiplet::BUS_ID.into(), CpuFetchUnit::linking_spec()),
-            // Phantom bus:
-            // no chiplet supplies this.
-            ("phantom_bus".into(), CpuFetchUnit::linking_spec()),
-        ]
-    }
+    // Phantom bus:
+    // no chiplet supplies this.
+    cx.bus("phantom_bus", RomChiplet::cpu_linking_spec());
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CpuFetchColumns::SELECTOR));
-        cs.build()
-    }
-}
+    cx.attach(ChipletDef::from_air(&RomChiplet::new(num_rows, num_rows)).unwrap());
 
-impl Program<F> for PhantomBusAir {
-    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        let rom = RomChiplet::new(self.rom_num_rows);
-        Ok(vec![ChipletDef::from_air(&rom)?])
-    }
+    cx.compile().unwrap()
 }
 
 #[test]
@@ -413,12 +404,19 @@ fn unmatched_main_bus_rejected() {
     // an extra bus_id no chiplet supplies.
     // The verifier must reject: "phantom_bus"
     // has no chiplet/gadget counterpart.
-    let phantom_air = PhantomBusAir {
-        rom_num_rows: num_rows,
-    };
+    let phantom_air = phantom_bus_air(num_rows);
 
     let mut vt = Transcript::<H>::new(b"ChipletSecurity");
-    let result = HekateVerifier::<F, H>::verify(&phantom_air, &instance, &proof, &mut vt, &config);
+    let pinned_id = program_id(&phantom_air).unwrap();
+
+    let result = HekateVerifier::<F, H>::verify(
+        &pinned_id,
+        &phantom_air,
+        &instance,
+        &proof,
+        &mut vt,
+        &config,
+    );
 
     assert!(
         result.is_err(),
@@ -443,7 +441,10 @@ fn chiplet_sumcheck_degree_inflation_rejected() {
         .push(pad);
 
     let mut vt = Transcript::<H>::new(b"ChipletSecurity");
-    let result = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
+    let pinned_id = program_id(&air).unwrap();
+
+    let result =
+        HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config);
 
     assert!(
         result.is_err() || !result.unwrap(),
@@ -466,7 +467,10 @@ fn chiplet_commitment_num_rows_non_power_of_two_rejected() {
     proof.chiplet_commitments[0].num_rows = 5;
 
     let mut vt = Transcript::<H>::new(b"ChipletSecurity");
-    let result = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
+    let pinned_id = program_id(&air).unwrap();
+
+    let result =
+        HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config);
 
     assert!(
         result.is_err() || !result.unwrap(),
@@ -484,7 +488,10 @@ fn chiplet_commitment_num_rows_zero_rejected() {
     proof.chiplet_commitments[0].num_rows = 0;
 
     let mut vt = Transcript::<H>::new(b"ChipletSecurity");
-    let result = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
+    let pinned_id = program_id(&air).unwrap();
+
+    let result =
+        HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config);
 
     assert!(
         result.is_err() || !result.unwrap(),

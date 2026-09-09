@@ -6,7 +6,7 @@ use hekate_gadgets::{IntArithmeticChiplet, RamChiplet};
 use hekate_keccak::KeccakChiplet;
 use hekate_math::{Block128, Flat, HardwareField, TowerField};
 use hekate_pqc::norm_check::NormCheckChiplet;
-use hekate_pqc::ntt::NttChiplet;
+use hekate_pqc::ntt::{NttChiplet, NttSchedule};
 use hekate_program::Air;
 use hekate_program::predicate::{ClaimLayout, compile, wire_values};
 
@@ -84,15 +84,18 @@ fn check<A: Air<F>>(name: &str, air: &A) {
 
 #[test]
 fn compiler_reproduces_evaluation_on_real_chiplets() {
-    check("keccak", &KeccakChiplet::new(1 << 15));
-    check("ntt", &NttChiplet::new(8380417, 1 << 12));
+    check("keccak", &KeccakChiplet::new(1 << 15, (1 << 15) / 25));
+    check(
+        "ntt",
+        &NttChiplet::new(8380417, 1 << 12, NttSchedule::empty()),
+    );
     check(
         "norm_check",
-        &NormCheckChiplet::new(8380417, 1 << 17, 1 << 12),
+        &NormCheckChiplet::new(8380417, 1 << 17, 1 << 12, 1 << 12),
     );
-    check("ram", &RamChiplet::new(1 << 12));
+    check("ram", &RamChiplet::new(1 << 12, 1 << 12));
     check(
         "int_arith",
-        &IntArithmeticChiplet::new(32, 1 << 12).unwrap(),
+        &IntArithmeticChiplet::new(32, 1 << 12, 1 << 12).unwrap(),
     );
 }

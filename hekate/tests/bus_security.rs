@@ -11,10 +11,11 @@ use hekate_math::{Bit, Block32, TowerField};
 use hekate_program::chiplet::ChipletDef;
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
+use hekate_program::digest::program_id;
 use hekate_program::permutation::{
     ChallengeLabel, PermutationCheckSpec, REQUEST_IDX_LABEL, Source,
 };
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::{Air, FixedColumn, Program, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_sdk::preflight;
 use hekate_verifier::HekateVerifier;
@@ -69,11 +70,12 @@ impl Air<F> for Endpoint {
         vec![(BUS_ID.into(), self.spec())]
     }
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(COL_SELECTOR));
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::prefix(COL_SELECTOR, 2)]
+    }
 
-        cs.build()
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        ConstraintSystem::<F>::new().build()
     }
 }
 
@@ -94,6 +96,10 @@ impl Air<F> for GhostProgram {
 
     fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
         self.cpu.permutation_checks()
+    }
+
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        self.cpu.fixed_columns()
     }
 
     fn constraint_ast(&self) -> ConstraintAst<F> {
@@ -154,8 +160,17 @@ fn run(program: &GhostProgram, cpu: &[(Block32, Bit)], table: &[(Block32, Bit)])
     };
 
     let mut verifier_ts = Transcript::<H>::new(b"GHOST_ACTIVATION");
-    HekateVerifier::<F, H>::verify(program, &instance, &proof, &mut verifier_ts, &config)
-        .unwrap_or(false)
+    let pinned_id = program_id(program).unwrap();
+
+    HekateVerifier::<F, H>::verify(
+        &pinned_id,
+        program,
+        &instance,
+        &proof,
+        &mut verifier_ts,
+        &config,
+    )
+    .unwrap_or(false)
 }
 
 const ZERO_KEY: Block32 = Block32(0);
@@ -303,11 +318,12 @@ impl Air<F> for MultiTableLookupAir {
         )]
     }
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(1));
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::prefix(1, 1)]
+    }
 
-        cs.build()
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        ConstraintSystem::<F>::new().build()
     }
 }
 
@@ -356,7 +372,9 @@ fn lookup_bus_two_tables_mismatched_content_rejected() {
     let accepted = match proof_res {
         Ok(proof) => {
             let mut vt = Transcript::<H>::new(b"BUS_MT");
-            HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config)
+            let pinned_id = program_id(&air).unwrap();
+
+            HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config)
                 .unwrap_or(false)
         }
         Err(_) => false,
@@ -377,7 +395,9 @@ const MULTI_BUS_1: &str = "audit_bus_1";
 const MULTI_BUS_2: &str = "audit_bus_2";
 
 #[derive(Clone)]
-struct MultiBusChiplet;
+struct MultiBusChiplet {
+    num_rows: usize,
+}
 
 impl Air<F> for MultiBusChiplet {
     fn name(&self) -> String {
@@ -410,11 +430,12 @@ impl Air<F> for MultiBusChiplet {
         ]
     }
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(1));
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::prefix(1, self.num_rows - 1)]
+    }
 
-        cs.build()
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        ConstraintSystem::<F>::new().build()
     }
 }
 
@@ -445,8 +466,8 @@ impl Air<F> for MultiBusProgram {
 impl Program<F> for MultiBusProgram {
     fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
         Ok(vec![
-            ChipletDef::from_air(&MultiBusChiplet)?,
-            ChipletDef::from_air(&MultiBusChiplet)?,
+            ChipletDef::from_air(&MultiBusChiplet { num_rows: 16 })?,
+            ChipletDef::from_air(&MultiBusChiplet { num_rows: 16 })?,
         ])
     }
 }
@@ -497,8 +518,11 @@ fn multibus_proof() -> (
     .expect("multibus baseline prove");
 
     let mut vt = Transcript::<H>::new(b"AuditP0");
+    let pinned_id = program_id(&air).unwrap();
+
     assert!(
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config).unwrap(),
+        HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config)
+            .unwrap(),
         "multibus baseline must verify"
     );
 
@@ -512,7 +536,9 @@ fn verify_rejects(
     proof: &hekate_core::proofs::InnerProof<F>,
 ) -> bool {
     let mut vt = Transcript::<H>::new(b"AuditP0");
-    match HekateVerifier::<F, H>::verify(air, instance, proof, &mut vt, config) {
+    let pinned_id = program_id(air).unwrap();
+
+    match HekateVerifier::<F, H>::verify(&pinned_id, air, instance, proof, &mut vt, config) {
         Ok(true) => false,
         Ok(false) | Err(_) => true,
     }
@@ -635,11 +661,12 @@ impl Air<F> for LabelFlipChiplet {
         )]
     }
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(1));
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::prefix(1, 1)]
+    }
 
-        cs.build()
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        ConstraintSystem::<F>::new().build()
     }
 }
 
@@ -728,7 +755,9 @@ fn logup_bus_id_proof_label_diverged_from_program_specs_rejected() {
     mode_honest.store(true, Ordering::SeqCst);
 
     let mut vt = Transcript::<H>::new(b"BusLabelFlip");
-    let res = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
+    let pinned_id = program_id(&air).unwrap();
+
+    let res = HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config);
 
     assert!(
         res.is_err() || !res.unwrap(),
@@ -771,8 +800,9 @@ fn zero_bus_main_injected_claimed_sum_rejected() {
         .push((MULTI_BUS_0.into(), F::ONE));
 
     let mut vt = Transcript::<H>::new(b"AuditP0");
+    let pinned_id = program_id(&air).unwrap();
 
-    match HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config) {
+    match HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config) {
         Err(e) => {
             let msg = format!("{e:?}");
             assert!(

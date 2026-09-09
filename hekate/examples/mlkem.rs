@@ -17,18 +17,16 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use hekate::core::trace::{ColumnType, TraceBuilder};
+use hekate::core::trace::TraceBuilder;
 use hekate::crypto::DefaultHasher;
 use hekate::crypto::transcript::Transcript;
 use hekate::math::{Bit, Block32, Block128};
 use hekate_core::config::Config;
+use hekate_core::errors;
 use hekate_math::TowerField;
-use hekate_pqc::mlkem::{self, CpuMlKemColumns, CpuMlKemUnit, MlKemChiplet, MlKemLevel};
-use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
-use hekate_program::permutation::PermutationCheckSpec;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_pqc::mlkem::{self, CpuMlKemColumns, MlKemChiplet, MlKemLevel};
+use hekate_program::circuit::{Circuit, CircuitProgram};
+use hekate_program::{FixedShape, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 #[allow(deprecated)]
@@ -45,61 +43,44 @@ type H = DefaultHasher;
 // ML-KEM Decapsulation Program
 // =================================================================
 
-#[derive(Clone)]
-struct MlKemDecapsProgram {
-    mlkem: MlKemChiplet<F>,
+/// The ciphertext words are read on the rows the
+/// pinned `SELECTOR` forces onto the data bus.
+fn build_program(
+    cpu_rows: usize,
     num_public: usize,
-}
+    mlkem: &MlKemChiplet<F>,
+) -> errors::Result<CircuitProgram<F>> {
+    let mut cx = Circuit::<F>::new("MlKemDecapsProgram", cpu_rows)?;
+    let cpu = cx.schema(&CpuMlKemColumns::build_layout());
 
-impl Air<F> for MlKemDecapsProgram {
-    fn name(&self) -> String {
-        "MlKemDecapsProgram".into()
+    let data = cpu.at(CpuMlKemColumns::DATA);
+    let selector = cpu.at(CpuMlKemColumns::SELECTOR);
+    let ss_selector = cpu.at(CpuMlKemColumns::SS_SELECTOR);
+
+    cx.bus(mlkem::MLKEM_DATA_BUS_ID, mlkem::cpu_data_spec());
+    cx.bus(mlkem::MLKEM_SS_BUS_ID, mlkem::cpu_ss_spec());
+
+    cx.fix(
+        selector,
+        FixedShape::Cadence {
+            stride: 1,
+            count: num_public,
+            origin: 0,
+            values: vec![F::ONE],
+        },
+    );
+
+    cx.fix(ss_selector, FixedShape::Sparse(vec![(num_public, F::ONE)]));
+
+    for row in 0..num_public {
+        cx.publish(data, row);
     }
 
-    fn num_columns(&self) -> usize {
-        CpuMlKemUnit::num_columns()
+    for def in mlkem.composite().flatten_defs()? {
+        cx.attach(def);
     }
 
-    fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
-        (0..self.num_public)
-            .map(|k| BoundaryConstraint::with_public_input(CpuMlKemColumns::DATA, k, k))
-            .collect()
-    }
-
-    fn column_layout(&self) -> &[ColumnType] {
-        Box::leak(CpuMlKemColumns::build_layout().into_boxed_slice())
-    }
-
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![
-            (
-                mlkem::MLKEM_DATA_BUS_ID.into(),
-                CpuMlKemUnit::linking_spec(),
-            ),
-            (
-                mlkem::MLKEM_SS_BUS_ID.into(),
-                CpuMlKemUnit::ss_linking_spec(),
-            ),
-        ]
-    }
-
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CpuMlKemColumns::SELECTOR));
-        cs.assert_boolean(cs.col(CpuMlKemColumns::SS_SELECTOR));
-
-        cs.build()
-    }
-}
-
-impl Program<F> for MlKemDecapsProgram {
-    fn num_public_inputs(&self) -> usize {
-        self.num_public
-    }
-
-    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        self.mlkem.composite().flatten_defs()
-    }
+    cx.compile()
 }
 
 // =================================================================
@@ -216,10 +197,7 @@ fn main() {
 
     // Phase 5:
     // Prove
-    let air = MlKemDecapsProgram {
-        mlkem: mlkem_chiplet,
-        num_public: ct_public.len(),
-    };
+    let air = build_program(cpu_num_rows, ct_public.len(), &mlkem_chiplet).unwrap();
 
     let instance = ProgramInstance::new(cpu_num_rows, ct_public);
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(chiplet_traces);
@@ -250,10 +228,18 @@ fn main() {
     // Phase 6:
     // Verify
     let mut verifier_transcript = Transcript::<H>::new(b"ML-KEM-768_Decaps");
+    let pinned_id = common::audited_id(&air);
 
     let is_valid = common::phase_with_mem("Verifying", || {
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut verifier_transcript, &config)
-            .expect("Verifier failed")
+        HekateVerifier::<F, H>::verify(
+            &pinned_id,
+            &air,
+            &instance,
+            &proof,
+            &mut verifier_transcript,
+            &config,
+        )
+        .expect("Verifier failed")
     });
 
     common::result(is_valid);

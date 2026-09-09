@@ -28,11 +28,11 @@ use hekate_gadgets::atoms::int_arith::{
     MulConstLayout, add_carry_chain, mul_const, mul_const_scratch_widths, range_check,
 };
 use hekate_math::{Block32, TowerField};
-use hekate_program::Air;
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
 use hekate_program::expander::VirtualExpander;
-use hekate_program::permutation::{PermutationCheckSpec, Source};
+use hekate_program::permutation::{BusKind, PermutationCheckSpec, Service, ServiceSlot};
+use hekate_program::{Air, FixedColumn};
 
 // =================================================================
 // Column Layout
@@ -298,6 +298,7 @@ pub struct HighBitsChiplet {
     pub bit_width: usize,
     pub divisor: u32,
     pub num_rows: usize,
+    pub num_ops: usize,
 
     layout: HighBitsLayout,
     expander: VirtualExpander,
@@ -306,9 +307,10 @@ pub struct HighBitsChiplet {
 impl HighBitsChiplet {
     pub const BUS_ID: &'static str = "highbits";
 
-    pub fn new(modulus: u32, divisor: u32, num_rows: usize) -> Self {
+    pub fn new(modulus: u32, divisor: u32, num_rows: usize, num_ops: usize) -> Self {
         assert!(num_rows.is_power_of_two());
         assert!(divisor > 0 && divisor < modulus);
+        assert!(num_ops <= num_rows, "op count exceeds num_rows");
 
         let bit_width = 32 - modulus.leading_zeros() as usize;
         let layout = HighBitsLayout::compute(modulus, bit_width, divisor);
@@ -325,6 +327,7 @@ impl HighBitsChiplet {
             bit_width,
             divisor,
             num_rows,
+            num_ops,
             layout,
             expander,
         }
@@ -334,33 +337,45 @@ impl HighBitsChiplet {
         &self.layout
     }
 
+    /// Both endpoints derive from this schema.
+    pub fn service() -> Service {
+        Service {
+            bus_id: Self::BUS_ID,
+            kind: BusKind::Permutation,
+            slots: vec![
+                ServiceSlot::Value(b"kappa_hb_r"),
+                ServiceSlot::Value(b"kappa_hb_r1"),
+                ServiceSlot::Value(b"kappa_hb_r0"),
+                ServiceSlot::Value(b"kappa_hb_idx"),
+                ServiceSlot::Value(b"kappa_hb_h"),
+                ServiceSlot::Value(b"kappa_hb_w1"),
+            ],
+            clock_waiver: Some(
+                "see pqc/high_bits.rs: bus_idx is positional, both endpoints force \
+                 one row per (idx) value by AIR rather than by a clock slot",
+            ),
+        }
+    }
+
     /// Linking specification for the highbits bus.
     /// Carries (r, r1, r0, index).
     pub fn linking_spec(&self) -> PermutationCheckSpec {
-        PermutationCheckSpec::new(
-            vec![
-                (Source::Column(self.layout.bus_r), b"kappa_hb_r" as &[u8]),
-                (Source::Column(self.layout.bus_r1), b"kappa_hb_r1" as &[u8]),
-                (Source::Column(self.layout.bus_r0), b"kappa_hb_r0" as &[u8]),
-                (
-                    Source::Column(self.layout.bus_idx),
-                    b"kappa_hb_idx" as &[u8],
-                ),
-                (
-                    Source::Column(self.layout.bus_h_bit),
-                    b"kappa_hb_h" as &[u8],
-                ),
-                (
-                    Source::Column(self.layout.bus_w1_prime),
-                    b"kappa_hb_w1" as &[u8],
-                ),
-            ],
-            Some(self.layout.s_active),
-        )
-        .with_clock_waiver(
-            "see pqc/high_bits.rs: bus_idx is positional, AIR forces one row per \
-             (idx) value; partner mldsa ctrl side carries the matching idx clock",
-        )
+        let ly = &self.layout;
+
+        Self::service()
+            .respond(
+                &[
+                    ly.bus_r,
+                    ly.bus_r1,
+                    ly.bus_r0,
+                    ly.bus_idx,
+                    ly.bus_h_bit,
+                    ly.bus_w1_prime,
+                ],
+                &[],
+                ly.s_active,
+            )
+            .expect("service slots match the responder columns")
     }
 }
 
@@ -380,6 +395,10 @@ impl<F: TowerField + TraceCompatibleField> Air<F> for HighBitsChiplet {
 
     fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
         vec![(Self::BUS_ID.into(), self.linking_spec())]
+    }
+
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::prefix(self.layout.s_active, self.num_ops)]
     }
 
     fn virtual_expander(&self) -> Option<&VirtualExpander> {
@@ -1023,7 +1042,7 @@ mod tests {
 
     #[test]
     fn constraint_ast_builds() {
-        let chiplet = HighBitsChiplet::new(Q, DIVISOR, 1024);
+        let chiplet = HighBitsChiplet::new(Q, DIVISOR, 1024, 1024);
         let ast = Air::<F>::constraint_ast(&chiplet);
 
         // Non-trivial constraint count
@@ -1032,7 +1051,7 @@ mod tests {
 
     #[test]
     fn air_declares_one_bus() {
-        let chiplet = HighBitsChiplet::new(Q, DIVISOR, 1024);
+        let chiplet = HighBitsChiplet::new(Q, DIVISOR, 1024, 1024);
         let checks = Air::<F>::permutation_checks(&chiplet);
 
         assert_eq!(checks.len(), 1);
@@ -1125,7 +1144,7 @@ mod tests {
 
     #[test]
     fn bus_labels() {
-        let chiplet = HighBitsChiplet::new(Q, DIVISOR, 1024);
+        let chiplet = HighBitsChiplet::new(Q, DIVISOR, 1024, 1024);
         let spec = chiplet.linking_spec();
 
         assert_eq!(spec.sources.len(), 6);
@@ -1172,7 +1191,7 @@ mod tests {
 
         assert_eq!(trace.columns.len(), ly.num_physical_columns);
 
-        let chiplet = HighBitsChiplet::new(Q, DIVISOR, 4);
+        let chiplet = HighBitsChiplet::new(Q, DIVISOR, 4, 4);
         let variants = Air::<F>::virtual_expander(&chiplet)
             .unwrap()
             .expand_variants::<F, _>(&trace, 0)

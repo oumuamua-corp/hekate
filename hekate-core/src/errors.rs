@@ -9,7 +9,7 @@ use hekate_crypto::{merkle, transcript};
 
 pub type Result<T> = core::result::Result<T, Error>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub enum Error {
     Config(config::Error),
     Trace(trace::Error),
@@ -24,11 +24,25 @@ pub enum Error {
         message: &'static str,
     },
 
+    /// The program the verifier holds is not
+    /// the audited artifact the caller pinned.
+    ProgramIdMismatch {
+        actual: [u8; 32],
+    },
+
     /// Internal invariant breach; a bug,
     /// not a verifier-observable soundness failure.
     InvariantViolation {
         message: &'static str,
     },
+}
+
+/// Not `#[derive(Debug)]`: `unwrap` and `{:?}` render a
+/// `[u8; 32]` id as decimal integers nobody can paste back.
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
 }
 
 impl fmt::Display for Error {
@@ -42,12 +56,18 @@ impl fmt::Display for Error {
             Self::Protocol { protocol, message } => {
                 write!(f, "Protocol error ({protocol}): {message}")
             }
+            Self::ProgramIdMismatch { actual } => {
+                write!(f, "program_id mismatch: this build computes ")?;
+                write_hex(f, actual)
+            }
             Self::InvariantViolation { message } => {
                 write!(f, "Invariant violation: {message}")
             }
         }
     }
 }
+
+impl core::error::Error for Error {}
 
 impl From<config::Error> for Error {
     fn from(value: config::Error) -> Self {
@@ -77,4 +97,12 @@ impl From<variant::Error> for Error {
     fn from(value: variant::Error) -> Self {
         Self::VirtualPoly(value)
     }
+}
+
+fn write_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8; 32]) -> fmt::Result {
+    for byte in bytes {
+        write!(f, "{byte:02x}")?;
+    }
+
+    Ok(())
 }

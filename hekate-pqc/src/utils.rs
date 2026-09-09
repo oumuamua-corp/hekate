@@ -4,9 +4,34 @@
 
 //! Shared witness helpers for PQC chiplets.
 
+use alloc::vec;
+use alloc::vec::Vec;
 use hekate_core::errors::Result;
 use hekate_core::trace::TraceBuilder;
-use hekate_math::{Bit, Block32};
+use hekate_math::{Bit, Block32, TowerField};
+use hekate_program::{CadenceSegment, FixedShape};
+
+#[derive(Default)]
+pub(crate) struct SolidRun {
+    origin: usize,
+    rows: usize,
+}
+
+impl SolidRun {
+    pub(crate) fn extend(&mut self, origin: usize, rows: usize) {
+        if self.rows == 0 {
+            self.origin = origin;
+        }
+
+        self.rows += rows;
+    }
+
+    pub(crate) fn flush<F: TowerField>(&mut self, segs: &mut Vec<CadenceSegment<F>>) {
+        push_seg(segs, self.origin, 1, self.rows, &[F::ONE]);
+
+        self.rows = 0;
+    }
+}
 
 /// Pack `n` bits of `v` into `buf` at virtual
 /// column offset `col_start`, LSB-first.
@@ -159,4 +184,49 @@ pub fn fill_range_check_witness(
     }
 
     Ok(())
+}
+
+/// Mirrors `hekate-keccak`'s absorb/squeeze permutation
+/// count; drift breaks every schedule built on it.
+pub(crate) fn sponge_calls(rate: usize, absorb: usize, squeeze: usize) -> usize {
+    absorb / rate + 1 + squeeze.div_ceil(rate).saturating_sub(1)
+}
+
+pub(crate) fn push_seg<F: TowerField>(
+    segs: &mut Vec<CadenceSegment<F>>,
+    origin: usize,
+    stride: usize,
+    count: usize,
+    values: &[F],
+) {
+    if count == 0 {
+        return;
+    }
+
+    segs.push(CadenceSegment {
+        stride,
+        count,
+        origin,
+        values: values.to_vec(),
+    });
+}
+
+pub(crate) fn segments_shape<F: TowerField>(segs: Vec<CadenceSegment<F>>) -> FixedShape<F> {
+    if segs.is_empty() {
+        FixedShape::Sparse(Vec::new())
+    } else {
+        FixedShape::Segments(segs)
+    }
+}
+
+pub(crate) fn ones_pattern<F: TowerField>(
+    stride: usize,
+    ones: impl IntoIterator<Item = usize>,
+) -> Vec<F> {
+    let mut values = vec![F::ZERO; stride];
+    for i in ones {
+        values[i] = F::ONE;
+    }
+
+    values
 }

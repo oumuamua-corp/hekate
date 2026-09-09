@@ -9,15 +9,14 @@ use hekate::crypto::transcript::Transcript;
 use hekate::math::{Block128, Flat, HardwareField, TowerField};
 use hekate_core::trace::TraceBuilder;
 use hekate_gadgets::{
-    ArithmeticOpcode, CpuArithColumns, CpuIntArithmeticUnit, IntArithmeticChiplet,
-    IntArithmeticLayout, IntArithmeticOp, generate_arithmetic_trace,
+    ArithmeticOpcode, CpuArithColumns, IntArithmeticChiplet, IntArithmeticLayout, IntArithmeticOp,
+    generate_arithmetic_trace,
 };
 use hekate_math::{Bit, Block32, Block64};
 use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::ConstraintAst;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::permutation::{PermutationCheckSpec, REQUEST_IDX_LABEL, Source};
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::circuit::{Circuit, CircuitProgram, Col};
+use hekate_program::digest::program_id;
+use hekate_program::{FixedShape, Program, ProgramInstance, ProgramWitness, define_columns};
 use hekate_prover_sys::prove;
 use hekate_scribble::{MutationKind, ScribbleConfig, assert_all_caught_all_targets};
 use hekate_sdk::preflight;
@@ -40,65 +39,54 @@ const PHY_S_SUB: usize = 8;
 // 1. SINGLE-CHIPLET PROGRAM (u32 OR u64)
 // =================================================================
 
-#[derive(Clone)]
-struct ArithCpuProgram {
-    bit_width: usize,
-    arith_num_rows: usize,
-    cpu_layout: Vec<ColumnType>,
+fn arith_cpu_layout(bit_width: usize) -> Vec<ColumnType> {
+    let operand = if bit_width == 64 {
+        ColumnType::B64
+    } else {
+        ColumnType::B32
+    };
+
+    vec![operand, operand, operand, ColumnType::B32, ColumnType::Bit]
 }
 
-impl ArithCpuProgram {
-    fn new(bit_width: usize, arith_num_rows: usize) -> Self {
-        let operand = if bit_width == 64 {
-            ColumnType::B64
-        } else {
-            ColumnType::B32
-        };
+fn arith_cpu_program(bit_width: usize, arith_num_rows: usize, num_ops: usize) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("ArithCpu", arith_num_rows).unwrap();
+    let cpu = cx.schema(&arith_cpu_layout(bit_width));
 
-        let cpu_layout = vec![operand, operand, operand, ColumnType::B32, ColumnType::Bit];
+    cx.fix(
+        cpu.at(CpuArithColumns::SELECTOR),
+        FixedShape::Cadence {
+            stride: 1,
+            count: num_ops,
+            origin: 0,
+            values: vec![F::ONE],
+        },
+    );
 
-        Self {
-            bit_width,
-            arith_num_rows,
-            cpu_layout,
-        }
-    }
-}
+    cx.bus(
+        IntArithmeticChiplet::BUS_ID,
+        IntArithmeticChiplet::cpu_linking_spec(),
+    );
 
-impl Air<F> for ArithCpuProgram {
-    fn column_layout(&self) -> &[ColumnType] {
-        &self.cpu_layout
-    }
+    let cs = cx.cs();
 
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![(
-            IntArithmeticChiplet::BUS_ID.into(),
-            CpuIntArithmeticUnit::linking_spec(),
-        )]
-    }
+    let selector = cs.col(CpuArithColumns::SELECTOR);
+    let not_active = cs.one() + selector;
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
+    cs.assert_zero_when(not_active, cs.col(CpuArithColumns::VAL_A));
+    cs.assert_zero_when(not_active, cs.col(CpuArithColumns::VAL_B));
+    cs.assert_zero_when(not_active, cs.col(CpuArithColumns::VAL_RES));
+    cs.assert_zero_when(not_active, cs.col(CpuArithColumns::OPCODE));
 
-        let selector = cs.col(CpuArithColumns::SELECTOR);
-        cs.assert_boolean(selector);
+    cx.attach(
+        ChipletDef::from_air(
+            &IntArithmeticChiplet::new(bit_width, arith_num_rows, num_ops)
+                .expect("IntArithmeticChiplet::new in test program"),
+        )
+        .unwrap(),
+    );
 
-        let not_active = cs.one() + selector;
-        cs.assert_zero_when(not_active, cs.col(CpuArithColumns::VAL_A));
-        cs.assert_zero_when(not_active, cs.col(CpuArithColumns::VAL_B));
-        cs.assert_zero_when(not_active, cs.col(CpuArithColumns::VAL_RES));
-        cs.assert_zero_when(not_active, cs.col(CpuArithColumns::OPCODE));
-
-        cs.build()
-    }
-}
-
-impl Program<F> for ArithCpuProgram {
-    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        let arith = IntArithmeticChiplet::new(self.bit_width, self.arith_num_rows)
-            .expect("IntArithmeticChiplet::new in test program");
-        Ok(vec![ChipletDef::from_air(&arith)?])
-    }
+    cx.compile().unwrap()
 }
 
 // =================================================================
@@ -108,95 +96,95 @@ impl Program<F> for ArithCpuProgram {
 const MIXED_BUS_U32: &str = "arith_link_u32";
 const MIXED_BUS_U64: &str = "arith_link_u64";
 
-const MIXED_U32_VAL_A: usize = 0;
-const MIXED_U32_VAL_B: usize = 1;
-const MIXED_U32_VAL_RES: usize = 2;
-const MIXED_U32_OPCODE: usize = 3;
-const MIXED_U32_SELECTOR: usize = 4;
-const MIXED_U64_VAL_A: usize = 5;
-const MIXED_U64_VAL_B: usize = 6;
-const MIXED_U64_VAL_RES: usize = 7;
-const MIXED_U64_OPCODE: usize = 8;
-const MIXED_U64_SELECTOR: usize = 9;
+define_columns! {
+    MixedArithColumns {
+        U32_VAL_A: B32,
+        U32_VAL_B: B32,
+        U32_VAL_RES: B32,
+        U32_OPCODE: B32,
+        U32_SELECTOR: Bit,
+        U64_VAL_A: B64,
+        U64_VAL_B: B64,
+        U64_VAL_RES: B64,
+        U64_OPCODE: B32,
+        U64_SELECTOR: Bit,
+    }
+}
 
-#[derive(Clone)]
-struct MixedArithProgram {
+fn mixed_arith_program(
+    cpu_rows: usize,
     chip32_rows: usize,
     chip64_rows: usize,
-}
+    num_ops32: usize,
+    num_ops64: usize,
+) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("MixedArith", cpu_rows).unwrap();
+    let cpu = cx.schema(&MixedArithColumns::build_layout());
 
-impl MixedArithProgram {
-    fn cpu_layout() -> Vec<ColumnType> {
-        vec![
-            ColumnType::B32,
-            ColumnType::B32,
-            ColumnType::B32,
-            ColumnType::B32,
-            ColumnType::Bit,
-            ColumnType::B64,
-            ColumnType::B64,
-            ColumnType::B64,
-            ColumnType::B32,
-            ColumnType::Bit,
-        ]
-    }
-}
+    let ops_prefix = |count: usize| FixedShape::Cadence {
+        stride: 1,
+        count,
+        origin: 0,
+        values: vec![F::ONE],
+    };
 
-impl Air<F> for MixedArithProgram {
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        LAYOUT.get_or_init(MixedArithProgram::cpu_layout)
-    }
+    cx.fix(
+        cpu.at(MixedArithColumns::U32_SELECTOR),
+        ops_prefix(num_ops32),
+    );
+    cx.fix(
+        cpu.at(MixedArithColumns::U64_SELECTOR),
+        ops_prefix(num_ops64),
+    );
 
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        let cpu32 = PermutationCheckSpec::new(
-            vec![
-                (Source::Column(MIXED_U32_VAL_A), b"kappa_val_a" as &[u8]),
-                (Source::Column(MIXED_U32_VAL_B), b"kappa_val_b" as &[u8]),
-                (Source::Column(MIXED_U32_VAL_RES), b"kappa_val_res" as &[u8]),
-                (Source::Column(MIXED_U32_OPCODE), b"kappa_opcode" as &[u8]),
-                (Source::RowIndexLeBytes(4), REQUEST_IDX_LABEL),
-            ],
-            Some(MIXED_U32_SELECTOR),
-        );
+    let u32_values: Vec<Col> = [
+        MixedArithColumns::U32_VAL_A,
+        MixedArithColumns::U32_VAL_B,
+        MixedArithColumns::U32_VAL_RES,
+        MixedArithColumns::U32_OPCODE,
+    ]
+    .map(|c| cpu.at(c))
+    .to_vec();
 
-        let cpu64 = PermutationCheckSpec::new(
-            vec![
-                (Source::Column(MIXED_U64_VAL_A), b"kappa_val_a" as &[u8]),
-                (Source::Column(MIXED_U64_VAL_B), b"kappa_val_b" as &[u8]),
-                (Source::Column(MIXED_U64_VAL_RES), b"kappa_val_res" as &[u8]),
-                (Source::Column(MIXED_U64_OPCODE), b"kappa_opcode" as &[u8]),
-                (Source::RowIndexLeBytes(4), REQUEST_IDX_LABEL),
-            ],
-            Some(MIXED_U64_SELECTOR),
-        );
+    let u64_values: Vec<Col> = [
+        MixedArithColumns::U64_VAL_A,
+        MixedArithColumns::U64_VAL_B,
+        MixedArithColumns::U64_VAL_RES,
+        MixedArithColumns::U64_OPCODE,
+    ]
+    .map(|c| cpu.at(c))
+    .to_vec();
 
-        vec![(MIXED_BUS_U32.into(), cpu32), (MIXED_BUS_U64.into(), cpu64)]
-    }
+    let mut u32_service = IntArithmeticChiplet::service();
+    u32_service.bus_id = MIXED_BUS_U32;
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(MIXED_U32_SELECTOR));
-        cs.assert_boolean(cs.col(MIXED_U64_SELECTOR));
+    let mut u64_service = IntArithmeticChiplet::service();
+    u64_service.bus_id = MIXED_BUS_U64;
 
-        cs.build()
-    }
-}
+    cx.call(
+        &u32_service,
+        &u32_values,
+        cpu.at(MixedArithColumns::U32_SELECTOR),
+    )
+    .unwrap();
+    cx.call(
+        &u64_service,
+        &u64_values,
+        cpu.at(MixedArithColumns::U64_SELECTOR),
+    )
+    .unwrap();
 
-impl Program<F> for MixedArithProgram {
-    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        let chip32 = IntArithmeticChiplet::new(32, self.chip32_rows)
-            .expect("u32 chiplet")
-            .with_bus_id(MIXED_BUS_U32);
-        let chip64 = IntArithmeticChiplet::new(64, self.chip64_rows)
-            .expect("u64 chiplet")
-            .with_bus_id(MIXED_BUS_U64);
+    let chip32 = IntArithmeticChiplet::new(32, chip32_rows, num_ops32)
+        .expect("u32 chiplet")
+        .with_bus_id(MIXED_BUS_U32);
+    let chip64 = IntArithmeticChiplet::new(64, chip64_rows, num_ops64)
+        .expect("u64 chiplet")
+        .with_bus_id(MIXED_BUS_U64);
 
-        Ok(vec![
-            ChipletDef::from_air(&chip32)?,
-            ChipletDef::from_air(&chip64)?,
-        ])
-    }
+    cx.attach(ChipletDef::from_air(&chip32).unwrap());
+    cx.attach(ChipletDef::from_air(&chip64).unwrap());
+
+    cx.compile().unwrap()
 }
 
 // =================================================================
@@ -227,9 +215,7 @@ fn compute_u64(op: ArithmeticOpcode, a: u64, b: u64) -> u64 {
 
 fn generate_cpu_trace(ops: &[IntArithmeticOp], num_rows: usize, bit_width: usize) -> ColumnTrace {
     let num_vars = num_rows.trailing_zeros() as usize;
-    let prog = ArithCpuProgram::new(bit_width, num_rows);
-
-    let mut tb = TraceBuilder::new(&prog.cpu_layout, num_vars).unwrap();
+    let mut tb = TraceBuilder::new(&arith_cpu_layout(bit_width), num_vars).unwrap();
 
     for (i, call) in ops.iter().enumerate() {
         match call {
@@ -291,7 +277,9 @@ fn run_prover_verifier(
     .map_err(|e| format!("prover: {e:?}"))?;
 
     let mut vt = Transcript::<H>::new(domain);
-    HekateVerifier::<F, H>::verify(program, instance, &proof, &mut vt, &config)
+    let pinned_id = program_id(program).unwrap();
+
+    HekateVerifier::<F, H>::verify(&pinned_id, program, instance, &proof, &mut vt, &config)
         .map_err(|e| format!("verifier: {e:?}"))
 }
 
@@ -326,7 +314,7 @@ fn prove_and_verify_arithmetic(ops: &[IntArithmeticOp], bit_width: usize) -> Res
     let arith_trace = generate_arithmetic_trace(&ops, &layout, arith_num_rows)
         .map_err(|e| format!("arith trace: {e:?}"))?;
 
-    let program = ArithCpuProgram::new(bit_width, arith_num_rows);
+    let program = arith_cpu_program(bit_width, arith_num_rows, ops.len());
     let instance = ProgramInstance::new(num_rows, vec![]);
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(vec![arith_trace]);
 
@@ -367,7 +355,7 @@ where
 
     tamper(&mut cpu_trace, &mut arith_trace);
 
-    let program = ArithCpuProgram::new(bit_width, arith_num_rows);
+    let program = arith_cpu_program(bit_width, arith_num_rows, ops.len());
     let instance = ProgramInstance::new(num_rows, vec![]);
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(vec![arith_trace]);
 
@@ -640,9 +628,7 @@ fn arithmetic_chiplet_mixed_widths_isolated() {
     let chip64_rows: usize = ops64.len().next_power_of_two().max(2);
     let num_vars = cpu_rows.trailing_zeros() as usize;
 
-    let layout = MixedArithProgram::cpu_layout();
-
-    let mut tb = TraceBuilder::new(&layout, num_vars).unwrap();
+    let mut tb = TraceBuilder::new(&MixedArithColumns::build_layout(), num_vars).unwrap();
 
     for (i, op) in ops32.iter().enumerate() {
         let IntArithmeticOp::U32 { op, a, b, .. } = op else {
@@ -651,13 +637,20 @@ fn arithmetic_chiplet_mixed_widths_isolated() {
 
         let res = compute_u32(*op, *a, *b);
 
-        tb.set_b32(MIXED_U32_VAL_A, i, Block32::from(*a)).unwrap();
-        tb.set_b32(MIXED_U32_VAL_B, i, Block32::from(*b)).unwrap();
-        tb.set_b32(MIXED_U32_VAL_RES, i, Block32::from(res))
+        tb.set_b32(MixedArithColumns::U32_VAL_A, i, Block32::from(*a))
             .unwrap();
-        tb.set_b32(MIXED_U32_OPCODE, i, Block32::from(*op as u8 as u32))
+        tb.set_b32(MixedArithColumns::U32_VAL_B, i, Block32::from(*b))
             .unwrap();
-        tb.set_bit(MIXED_U32_SELECTOR, i, Bit::ONE).unwrap();
+        tb.set_b32(MixedArithColumns::U32_VAL_RES, i, Block32::from(res))
+            .unwrap();
+        tb.set_b32(
+            MixedArithColumns::U32_OPCODE,
+            i,
+            Block32::from(*op as u8 as u32),
+        )
+        .unwrap();
+        tb.set_bit(MixedArithColumns::U32_SELECTOR, i, Bit::ONE)
+            .unwrap();
     }
 
     for (i, op) in ops64.iter().enumerate() {
@@ -667,13 +660,20 @@ fn arithmetic_chiplet_mixed_widths_isolated() {
 
         let res = compute_u64(*op, *a, *b);
 
-        tb.set_b64(MIXED_U64_VAL_A, i, Block64::from(*a)).unwrap();
-        tb.set_b64(MIXED_U64_VAL_B, i, Block64::from(*b)).unwrap();
-        tb.set_b64(MIXED_U64_VAL_RES, i, Block64::from(res))
+        tb.set_b64(MixedArithColumns::U64_VAL_A, i, Block64::from(*a))
             .unwrap();
-        tb.set_b32(MIXED_U64_OPCODE, i, Block32::from(*op as u8 as u32))
+        tb.set_b64(MixedArithColumns::U64_VAL_B, i, Block64::from(*b))
             .unwrap();
-        tb.set_bit(MIXED_U64_SELECTOR, i, Bit::ONE).unwrap();
+        tb.set_b64(MixedArithColumns::U64_VAL_RES, i, Block64::from(res))
+            .unwrap();
+        tb.set_b32(
+            MixedArithColumns::U64_OPCODE,
+            i,
+            Block32::from(*op as u8 as u32),
+        )
+        .unwrap();
+        tb.set_bit(MixedArithColumns::U64_SELECTOR, i, Bit::ONE)
+            .unwrap();
     }
 
     let cpu_trace = tb.build();
@@ -687,10 +687,8 @@ fn arithmetic_chiplet_mixed_widths_isolated() {
     let arith32 = generate_arithmetic_trace(&ops32_idx, &layout32, chip32_rows).unwrap();
     let arith64 = generate_arithmetic_trace(&ops64_idx, &layout64, chip64_rows).unwrap();
 
-    let program = MixedArithProgram {
-        chip32_rows,
-        chip64_rows,
-    };
+    let program = mixed_arith_program(cpu_rows, chip32_rows, chip64_rows, ops32.len(), ops64.len());
+
     let instance = ProgramInstance::new(cpu_rows, vec![]);
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(vec![arith32, arith64]);
 
@@ -724,8 +722,11 @@ fn arithmetic_chiplet_mixed_widths_isolated() {
     .expect("prove mixed_widths");
 
     let mut vt = Transcript::<H>::new(b"ARITH_MIXED");
-    let result = HekateVerifier::<F, H>::verify(&program, &instance, &proof, &mut vt, &config)
-        .expect("verify mixed_widths");
+    let pinned_id = program_id(&program).unwrap();
+
+    let result =
+        HekateVerifier::<F, H>::verify(&pinned_id, &program, &instance, &proof, &mut vt, &config)
+            .expect("verify mixed_widths");
 
     assert!(result, "mixed-width prove/verify failed");
 }
@@ -984,7 +985,7 @@ where
 
     tamper(&mut cpu_trace, padding_row);
 
-    let program = ArithCpuProgram::new(32, arith_num_rows);
+    let program = arith_cpu_program(32, arith_num_rows, ops.len());
     let instance = ProgramInstance::new(num_rows, vec![]);
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(vec![arith_trace]);
 
@@ -1036,7 +1037,7 @@ fn scribble_arithmetic_flip_selector_caught() {
     let arith_trace =
         generate_arithmetic_trace(&ops, &layout, arith_num_rows).expect("arith trace");
 
-    let air = ArithCpuProgram::new(bit_width, arith_num_rows);
+    let air = arith_cpu_program(bit_width, arith_num_rows, ops.len());
     let instance = ProgramInstance::new(num_rows, vec![]);
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(vec![arith_trace]);
 

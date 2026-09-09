@@ -901,7 +901,7 @@ pub fn ml_kem_decaps_traced(
 // =================================================================
 
 /// Forward NTT recording all butterfly ops.
-fn ntt_forward_traced(f: &mut [u16; N], ops: &mut Vec<ntt::NttOp>, instance_id: u32) {
+pub fn ntt_forward_traced(f: &mut [u16; N], ops: &mut Vec<ntt::NttOp>, instance_id: u32) {
     let zetas = zeta_powers();
 
     let mut k = 1usize;
@@ -979,7 +979,7 @@ fn ntt_forward_traced(f: &mut [u16; N], ops: &mut Vec<ntt::NttOp>, instance_id: 
 /// Decomposed into two NTT chiplet ops:
 /// 1. CT butterfly(a, b, w=1) -> (a+b, a-b)
 /// 2. MulOnly(b=a-b, w=zeta) -> (a-b)*zeta
-fn ntt_inverse_traced(f: &mut [u16; N], ops: &mut Vec<ntt::NttOp>, instance_id: u32) {
+pub fn ntt_inverse_traced(f: &mut [u16; N], ops: &mut Vec<ntt::NttOp>, instance_id: u32) {
     let zetas = zeta_powers();
 
     let mut k = 127usize;

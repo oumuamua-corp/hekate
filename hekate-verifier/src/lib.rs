@@ -7,10 +7,10 @@
 extern crate alloc;
 
 mod brakedown;
-mod evaluator;
 mod outer;
 mod sumcheck;
 
+pub mod evaluator;
 pub mod logup;
 
 pub use sumcheck::verify;
@@ -40,8 +40,10 @@ use hekate_program::outer::{
     EvalInputs, EvalRecord, OuterStatement, TableInputs, TablePads, TableRecord, TableShape,
     eval_record, table_record,
 };
-use hekate_program::permutation::{self, BusKind, eval_row_idx_byte_mle, eval_row_idx_le_mle};
-use hekate_program::{Air, FixedColumn, Program, ProgramInstance, chiplet, validate_fixed_columns};
+use hekate_program::permutation::{
+    self, BusKind, eval_row_idx_byte_mle, eval_row_idx_le_mle, validate_fixed_selectors,
+};
+use hekate_program::{Air, FixedColumn, Program, ProgramInstance, digest, validate_fixed_columns};
 use tracing::{debug, info, instrument, warn};
 
 struct ZerocheckMasked<F: HardwareField> {
@@ -125,6 +127,7 @@ where
     /// 7. Check that LogUp `claimed_sum` totals cancel per `bus_id`.
     #[instrument(skip_all, name = "Hekate::verify")]
     pub fn verify<P: Program<F> + Sync>(
+        program_id: &[u8; 32],
         program: &P,
         instance: &ProgramInstance<F>,
         proof: &InnerProof<F>,
@@ -156,6 +159,13 @@ where
             return Err(errors::Error::Protocol {
                 protocol: "verifier",
                 message: "trace_commitment.num_rows does not match instance.num_rows",
+            });
+        }
+
+        if instance.public_inputs().len() != program.num_public_inputs() {
+            return Err(errors::Error::Protocol {
+                protocol: "verifier",
+                message: "instance public input count does not match the program",
             });
         }
 
@@ -206,64 +216,19 @@ where
             });
         }
 
-        for (bus_id, spec) in &main_perm {
-            spec.validate_clock_stitching(bus_id)?;
-        }
-
         let mut chiplet_asts = Vec::with_capacity(chiplet_defs.len());
 
         for def in &chiplet_defs {
-            for (bus_id, spec) in &def.permutation_checks {
-                spec.validate_clock_stitching(bus_id)?;
-            }
+            validate_fixed_selectors(&def.permutation_checks, def.pins())?;
 
-            let def_ast = def.constraint_ast();
-            chiplet::validate_paired_bus_mutex(&def.permutation_checks, &def_ast)?;
-
-            for (sel, bus) in chiplet::unconstrained_bit_selectors(
-                &def.permutation_checks,
-                &def_ast,
-                Air::<F>::virtual_column_layout(def),
-            ) {
-                warn!(
-                    chiplet = %def.name(),
-                    bus,
-                    selector = sel,
-                    "chiplet bus Bit selector lacks a boolean-assertion root"
-                );
-            }
-
-            chiplet_asts.push(def_ast);
+            chiplet_asts.push(def.constraint_ast());
         }
 
         let main_ast = program.constraint_ast();
-        chiplet::validate_paired_bus_mutex(&main_perm, &main_ast)?;
+        let main_fixed = program.fixed_columns();
 
-        for (sel, bus) in chiplet::unconstrained_bit_selectors(
-            &main_perm,
-            &main_ast,
-            program.virtual_column_layout(),
-        ) {
-            warn!(
-                bus,
-                selector = sel,
-                "main bus Bit selector lacks a boolean-assertion root"
-            );
-        }
-
-        let all_endpoints = main_perm.iter().map(|(id, s)| (id.as_str(), s)).chain(
-            chiplet_defs
-                .iter()
-                .flat_map(|d| d.permutation_checks.iter().map(|(id, s)| (id.as_str(), s))),
-        );
-
-        permutation::validate_bus_set(all_endpoints)?;
-
-        validate_fixed_columns(
-            &program.fixed_columns(),
-            program.virtual_column_layout(),
-            Some(num_vars),
-        )?;
+        validate_fixed_selectors(&main_perm, &main_fixed)?;
+        validate_fixed_columns(&main_fixed, program.virtual_column_layout(), Some(num_vars))?;
 
         let main_shape = TableShape::from_air(program, num_vars, &main_ast)?;
         let mut chiplet_tables = Vec::with_capacity(chiplet_defs.len());
@@ -304,7 +269,15 @@ where
         // =========================================================
         // PHASE 1: TRACE COMMITMENT & FIAT-SHAMIR BINDING
         // =========================================================
-        Self::verify_trace_commitment(program, instance, proof, transcript, config, &main_plan)?;
+        let actual = digest::program_id_of(program, &chiplet_defs, &program.inline_chiplets()?);
+
+        if actual != *program_id {
+            return Err(errors::Error::ProgramIdMismatch { actual });
+        }
+
+        Self::verify_trace_commitment(
+            actual, program, instance, proof, transcript, config, &main_plan,
+        )?;
 
         if config.zero_knowledge != proof.pad_root.is_some()
             || config.zero_knowledge != proof.outer.is_some()
@@ -709,8 +682,9 @@ where
     /// absorbs every public parameter and the
     /// trace root before the first challenge.
     #[instrument(skip_all, name = "verify_trace_commitment")]
-    fn verify_trace_commitment<P: Program<F>>(
-        program: &P,
+    fn verify_trace_commitment<A: Air<F>>(
+        program_id: [u8; 32],
+        main: &A,
         instance: &ProgramInstance<F>,
         proof: &InnerProof<F>,
         transcript: &mut Transcript<H>,
@@ -718,8 +692,9 @@ where
         main_plan: &RingSwitchPlan,
     ) -> errors::Result<()> {
         let num_rows = instance.num_rows();
-        let num_cols = program.num_columns();
+        let num_cols = main.num_columns();
 
+        transcript.append_message(b"program_id", &program_id);
         transcript.append_u64(b"num_columns", num_cols as u64);
         transcript.append_u64(b"num_rows", num_rows as u64);
         transcript.append_u64(b"ldt_support_size", config.ldt_support_size as u64);
@@ -738,7 +713,7 @@ where
 
         transcript.append_message(b"trace_root", &proof.trace_commitment.root);
 
-        for bc in &program.boundary_constraints() {
+        for bc in &main.boundary_constraints() {
             bc.absorb_into(transcript);
         }
 
@@ -1220,15 +1195,15 @@ where
 
     /// Aggregates lookup-bus heights from main + chiplet commitments
     /// and draws one `r_bus` per bus_id in sorted order.
-    fn draw_lookup_bus_points<P: Program<F>>(
-        program: &P,
+    fn draw_lookup_bus_points<A: Air<F>>(
+        main: &A,
         chiplet_defs: &[ChipletDef<F>],
         proof: &InnerProof<F>,
         transcript: &mut Transcript<H>,
     ) -> errors::Result<BTreeMap<String, Vec<Flat<F>>>> {
         let mut heights: BTreeMap<String, u64> = BTreeMap::new();
         permutation::accumulate_lookup_heights(
-            &program.permutation_checks(),
+            &main.permutation_checks(),
             proof.trace_commitment.num_rows as u64,
             &mut heights,
         );

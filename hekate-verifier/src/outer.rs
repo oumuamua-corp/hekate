@@ -40,6 +40,7 @@ impl PadCursor {
 /// at the same columns, and the three Ligero tests
 /// over the assembled rows.
 #[instrument(skip_all, name = "verify_outer")]
+#[allow(clippy::too_many_arguments)]
 pub fn verify_outer<F, H>(
     proof: &InnerProof<F>,
     transcript: &mut Transcript<H>,

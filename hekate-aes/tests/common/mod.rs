@@ -5,20 +5,18 @@
 #![allow(dead_code)]
 
 use hekate_aes::{
-    Aes128Chiplet, Aes256Chiplet, AesRound128Air, AesRound256Air, CpuAes128Columns, CpuAes128Unit,
-    CpuAes256Columns, CpuAes256Unit, PhysSboxRomColumns,
+    Aes128Chiplet, Aes256Chiplet, AesRound128Air, AesRound256Air, CpuAes128Columns,
+    CpuAes256Columns, PhysSboxRomColumns, host_key_selector_shape, host_selector_shape,
     trace::{Aes128Call, Aes256Call, expand_key, expand_key_256},
 };
 use hekate_core::config::Config;
-use hekate_core::errors;
-use hekate_core::trace::{ColumnTrace, ColumnType, TraceBuilder, TraceColumn};
+use hekate_core::trace::{ColumnTrace, TraceBuilder, TraceColumn};
 use hekate_crypto::DefaultHasher;
 use hekate_crypto::transcript::Transcript;
 use hekate_math::{Bit, Block8, Block16, Block32, Block64, Block128, HardwareField, TowerField};
-use hekate_program::constraint::ConstraintAst;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::permutation::PermutationCheckSpec;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::circuit::{Circuit, CircuitProgram, Col};
+use hekate_program::digest::program_id;
+use hekate_program::{Program, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_sdk::preflight;
 use hekate_verifier::HekateVerifier;
@@ -123,97 +121,83 @@ pub fn whitened_256() -> [u8; 16] {
 
 #[derive(Clone)]
 pub struct Aes128Program {
+    pub program: CircuitProgram<F>,
     pub aes: Aes128Chiplet<F>,
-}
-
-impl Air<F> for Aes128Program {
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        LAYOUT.get_or_init(CpuAes128Columns::build_layout)
-    }
-
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![
-            (
-                AesRound128Air::LINK_BUS_ID.into(),
-                CpuAes128Unit::linking_spec(),
-            ),
-            (
-                AesRound128Air::KEY_BUS_ID.into(),
-                CpuAes128Unit::key_linking_spec(),
-            ),
-        ]
-    }
-
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        CpuAes128Unit::constrain(&cs, 0);
-
-        cs.build()
-    }
-}
-
-impl Program<F> for Aes128Program {
-    fn num_public_inputs(&self) -> usize {
-        0
-    }
-
-    fn chiplet_defs(&self) -> errors::Result<Vec<hekate_program::chiplet::ChipletDef<F>>> {
-        self.aes.composite().flatten_defs()
-    }
 }
 
 #[derive(Clone)]
 pub struct Aes256Program {
+    pub program: CircuitProgram<F>,
     pub aes: Aes256Chiplet<F>,
 }
 
-impl Air<F> for Aes256Program {
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        LAYOUT.get_or_init(CpuAes256Columns::build_layout)
+pub fn make_program_128(aes_rows: usize, num_blocks: usize) -> Aes128Program {
+    let aes = Aes128Chiplet::new(aes_rows, SBOX_ROM_ROWS, num_blocks).unwrap();
+
+    let mut cx = Circuit::<F>::new("Aes128Host", CPU_ROWS).unwrap();
+    let cpu = cx.schema(&CpuAes128Columns::build_layout());
+
+    let selector = cpu.at(CpuAes128Columns::SELECTOR);
+    let key_selector = cpu.at(CpuAes128Columns::KEY_SELECTOR);
+
+    let link_values: Vec<Col> = (0..16)
+        .map(|j| cpu.at(CpuAes128Columns::DATA + j))
+        .chain([key_selector])
+        .collect();
+
+    cx.call(&AesRound128Air::link_service(), &link_values, selector)
+        .unwrap();
+
+    let key_values: Vec<Col> = (0..16).map(|j| cpu.at(CpuAes128Columns::KEY + j)).collect();
+
+    cx.call(&AesRound128Air::key_service(), &key_values, key_selector)
+        .unwrap();
+
+    cx.fix(selector, host_selector_shape(2, num_blocks));
+    cx.fix(key_selector, host_key_selector_shape(2, num_blocks));
+
+    for def in aes.composite().flatten_defs().unwrap() {
+        cx.attach(def);
     }
 
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![
-            (
-                AesRound256Air::LINK_BUS_ID.into(),
-                CpuAes256Unit::linking_spec(),
-            ),
-            (
-                AesRound256Air::KEY_BUS_ID.into(),
-                CpuAes256Unit::key_linking_spec(),
-            ),
-        ]
-    }
-
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        CpuAes256Unit::constrain(&cs, 0);
-
-        cs.build()
-    }
-}
-
-impl Program<F> for Aes256Program {
-    fn num_public_inputs(&self) -> usize {
-        0
-    }
-
-    fn chiplet_defs(&self) -> errors::Result<Vec<hekate_program::chiplet::ChipletDef<F>>> {
-        self.aes.composite().flatten_defs()
-    }
-}
-
-pub fn make_program_128(aes_rows: usize) -> Aes128Program {
     Aes128Program {
-        aes: Aes128Chiplet::new(aes_rows, SBOX_ROM_ROWS).unwrap(),
+        program: cx.compile().unwrap(),
+        aes,
     }
 }
 
-pub fn make_program_256(aes_rows: usize) -> Aes256Program {
+pub fn make_program_256(aes_rows: usize, num_blocks: usize) -> Aes256Program {
+    let aes = Aes256Chiplet::new(aes_rows, SBOX_ROM_ROWS, num_blocks).unwrap();
+
+    let mut cx = Circuit::<F>::new("Aes256Host", CPU_ROWS).unwrap();
+    let cpu = cx.schema(&CpuAes256Columns::build_layout());
+
+    let selector = cpu.at(CpuAes256Columns::SELECTOR);
+    let key_selector = cpu.at(CpuAes256Columns::KEY_SELECTOR);
+
+    let link_values: Vec<Col> = (0..16)
+        .map(|j| cpu.at(CpuAes256Columns::DATA + j))
+        .chain([key_selector])
+        .collect();
+
+    cx.call(&AesRound256Air::link_service(), &link_values, selector)
+        .unwrap();
+
+    let key_values: Vec<Col> = (0..32).map(|j| cpu.at(CpuAes256Columns::KEY + j)).collect();
+
+    cx.call(&AesRound256Air::key_service(), &key_values, key_selector)
+        .unwrap();
+
+    cx.fix(selector, host_selector_shape(2, num_blocks));
+    cx.fix(key_selector, host_key_selector_shape(2, num_blocks));
+
+    for def in aes.composite().flatten_defs().unwrap() {
+        cx.attach(def);
+    }
+
     Aes256Program {
-        aes: Aes256Chiplet::new(aes_rows, SBOX_ROM_ROWS).unwrap(),
+        program: cx.compile().unwrap(),
+        aes,
     }
 }
 
@@ -249,7 +233,6 @@ pub fn build_cpu_trace_128(blocks: &[([u8; 16], [u8; 16])]) -> ColumnTrace {
 
 pub fn build_cpu_trace_256(data_in: &[u8; 16], data_out: &[u8; 16]) -> ColumnTrace {
     let num_vars = CPU_ROWS.trailing_zeros() as usize;
-
     let mut tb = TraceBuilder::new(&CpuAes256Columns::build_layout(), num_vars).unwrap();
 
     for j in 0..16 {
@@ -386,7 +369,9 @@ pub fn prove_and_verify<P: Program<F>>(
     .map_err(|e| format!("prover: {e:?}"))?;
 
     let mut vt = Transcript::<H>::new(TRANSCRIPT_LABEL);
-    HekateVerifier::<F, H>::verify(air, &instance, &proof, &mut vt, &config)
+    let pinned_id = program_id(air).unwrap();
+
+    HekateVerifier::<F, H>::verify(&pinned_id, air, &instance, &proof, &mut vt, &config)
         .map_err(|e| format!("verifier: {e:?}"))
 }
 
@@ -403,12 +388,15 @@ pub fn assert_air_clean<P: Program<F>>(air: &P, cpu: &ColumnTrace, chiplets: &[C
     );
 }
 
-/// Pins the rejection to a constraint root; a prover
-/// that failed for an unrelated reason cannot read green.
+/// Pins the rejection to a constraint root or schedule pin;
+/// a prover that failed for an unrelated reason cannot read green.
 pub fn assert_air_violated<P: Program<F>>(air: &P, cpu: &ColumnTrace, chiplets: &[ColumnTrace]) {
     let instance = ProgramInstance::new(CPU_ROWS, vec![]);
     let witness = ProgramWitness::new(cpu.clone()).with_chiplets(chiplets.to_vec());
     let report = preflight(air, &instance, &witness).unwrap();
 
-    assert!(!report.constraint_violations.is_empty());
+    assert!(
+        !report.constraint_violations.is_empty() || !report.fixed_column_violations.is_empty(),
+        "{report}"
+    );
 }

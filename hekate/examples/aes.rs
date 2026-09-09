@@ -9,18 +9,16 @@ use hekate::crypto::DefaultHasher;
 use hekate::crypto::transcript::Transcript;
 use hekate::math::{Bit, Block8, Block128, TowerField};
 use hekate_aes::{
-    Aes128Chiplet, Aes256Chiplet, AesRound128Air, AesRound256Air, CpuAes128Columns, CpuAes128Unit,
-    CpuAes256Columns, CpuAes256Unit, PhysAes128Columns, PhysAes256Columns,
+    Aes128Chiplet, Aes256Chiplet, AesRound128Air, AesRound256Air, CpuAes128Columns,
+    CpuAes256Columns, PhysAes128Columns, PhysAes256Columns, host_key_selector_shape,
+    host_selector_shape,
     trace::{Aes128Call, Aes256Call, expand_key, expand_key_256},
 };
 use hekate_core::config::Config;
 use hekate_core::errors;
-use hekate_core::trace::{ColumnTrace, ColumnType, TraceBuilder};
-use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::ConstraintAst;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::permutation::PermutationCheckSpec;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_core::trace::{ColumnTrace, TraceBuilder};
+use hekate_program::circuit::{Circuit, CircuitProgram, Col};
+use hekate_program::{Program, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 use rand::{TryRngCore, rngs::OsRng};
@@ -54,80 +52,68 @@ const FIPS256_KEY: [u8; 32] = [
 
 const CPU_IO_PER_BLOCK: usize = 2;
 
-#[derive(Clone)]
-struct Aes128ExampleProgram {
-    aes: Aes128Chiplet<F>,
+fn build_aes128_program(
+    cpu_rows: usize,
+    num_blocks: usize,
+    aes: &Aes128Chiplet<F>,
+) -> errors::Result<CircuitProgram<F>> {
+    let mut cx = Circuit::<F>::new("Aes128", cpu_rows)?;
+    let cpu = cx.schema(&CpuAes128Columns::build_layout());
+
+    let selector = cpu.at(CpuAes128Columns::SELECTOR);
+    let key_selector = cpu.at(CpuAes128Columns::KEY_SELECTOR);
+
+    let link_values: Vec<Col> = (0..16)
+        .map(|j| cpu.at(CpuAes128Columns::DATA + j))
+        .chain([key_selector])
+        .collect();
+
+    cx.call(&AesRound128Air::link_service(), &link_values, selector)?;
+
+    let key_values: Vec<Col> = (0..16).map(|j| cpu.at(CpuAes128Columns::KEY + j)).collect();
+
+    cx.call(&AesRound128Air::key_service(), &key_values, key_selector)?;
+
+    cx.fix(selector, host_selector_shape(2, num_blocks));
+    cx.fix(key_selector, host_key_selector_shape(2, num_blocks));
+
+    for def in aes.composite().flatten_defs()? {
+        cx.attach(def);
+    }
+
+    cx.compile()
 }
 
-impl Air<F> for Aes128ExampleProgram {
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        LAYOUT.get_or_init(CpuAes128Columns::build_layout)
+fn build_aes256_program(
+    cpu_rows: usize,
+    num_blocks: usize,
+    aes: &Aes256Chiplet<F>,
+) -> errors::Result<CircuitProgram<F>> {
+    let mut cx = Circuit::<F>::new("Aes256", cpu_rows)?;
+    let cpu = cx.schema(&CpuAes256Columns::build_layout());
+
+    let selector = cpu.at(CpuAes256Columns::SELECTOR);
+    let key_selector = cpu.at(CpuAes256Columns::KEY_SELECTOR);
+
+    let link_values: Vec<Col> = (0..16)
+        .map(|j| cpu.at(CpuAes256Columns::DATA + j))
+        .chain([key_selector])
+        .collect();
+
+    cx.call(&AesRound256Air::link_service(), &link_values, selector)?;
+
+    let key_values: Vec<Col> = (0..32).map(|j| cpu.at(CpuAes256Columns::KEY + j)).collect();
+
+    cx.call(&AesRound256Air::key_service(), &key_values, key_selector)?;
+
+    cx.fix(selector, host_selector_shape(2, num_blocks));
+    cx.fix(key_selector, host_key_selector_shape(2, num_blocks));
+
+    for def in aes.composite().flatten_defs()? {
+        cx.attach(def);
     }
 
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![
-            (
-                AesRound128Air::LINK_BUS_ID.into(),
-                CpuAes128Unit::linking_spec(),
-            ),
-            (
-                AesRound128Air::KEY_BUS_ID.into(),
-                CpuAes128Unit::key_linking_spec(),
-            ),
-        ]
-    }
-
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        CpuAes128Unit::constrain(&cs, 0);
-
-        cs.build()
-    }
-}
-
-impl Program<F> for Aes128ExampleProgram {
-    fn chiplet_defs(&self) -> errors::Result<Vec<ChipletDef<F>>> {
-        self.aes.composite().flatten_defs()
-    }
-}
-
-#[derive(Clone)]
-struct Aes256ExampleProgram {
-    aes: Aes256Chiplet<F>,
-}
-
-impl Air<F> for Aes256ExampleProgram {
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        LAYOUT.get_or_init(CpuAes256Columns::build_layout)
-    }
-
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![
-            (
-                AesRound256Air::LINK_BUS_ID.into(),
-                CpuAes256Unit::linking_spec(),
-            ),
-            (
-                AesRound256Air::KEY_BUS_ID.into(),
-                CpuAes256Unit::key_linking_spec(),
-            ),
-        ]
-    }
-
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        CpuAes256Unit::constrain(&cs, 0);
-
-        cs.build()
-    }
-}
-
-impl Program<F> for Aes256ExampleProgram {
-    fn chiplet_defs(&self) -> errors::Result<Vec<ChipletDef<F>>> {
-        self.aes.composite().flatten_defs()
-    }
+    cx.compile()
 }
 
 // =================================================================
@@ -155,7 +141,7 @@ fn extract_ciphertext(
     ct
 }
 
-fn prove_and_verify<P: Program<F> + Air<F>>(
+fn prove_and_verify<P: Program<F>>(
     air: &P,
     cpu_rows: usize,
     cpu_trace: ColumnTrace,
@@ -192,9 +178,10 @@ fn prove_and_verify<P: Program<F> + Air<F>>(
 
     // Phase 4:
     // Verify
+    let pinned_id = common::audited_id(air);
     let is_valid = common::phase_with_mem("Verifying", || {
         let mut vt = Transcript::<H>::new(transcript_label);
-        HekateVerifier::<F, H>::verify(air, &instance, &proof, &mut vt, &config)
+        HekateVerifier::<F, H>::verify(&pinned_id, air, &instance, &proof, &mut vt, &config)
             .expect("Verifier failed")
     });
 
@@ -285,7 +272,7 @@ fn run_aes128() {
             })
             .collect();
 
-        let aes = Aes128Chiplet::<F>::new(chiplet_rows, sbox_rom_rows).unwrap();
+        let aes = Aes128Chiplet::<F>::new(chiplet_rows, sbox_rom_rows, NUM_BLOCKS).unwrap();
         let chiplet_traces = aes.generate_traces(&calls).unwrap();
 
         let ciphertexts: Vec<[u8; 16]> = (0..NUM_BLOCKS)
@@ -302,7 +289,7 @@ fn run_aes128() {
         print_sample_blocks(&plaintexts, &ciphertexts);
 
         let cpu_trace = build_cpu128_trace(&calls, &ciphertexts, cpu_rows);
-        let air = Aes128ExampleProgram { aes };
+        let air = build_aes128_program(cpu_rows, NUM_BLOCKS, &aes).unwrap();
 
         (air, cpu_trace, chiplet_traces)
     });
@@ -389,7 +376,7 @@ fn run_aes256() {
             })
             .collect();
 
-        let aes = Aes256Chiplet::<F>::new(chiplet_rows, sbox_rom_rows).unwrap();
+        let aes = Aes256Chiplet::<F>::new(chiplet_rows, sbox_rom_rows, NUM_BLOCKS).unwrap();
         let chiplet_traces = aes.generate_traces(&calls).unwrap();
 
         let ciphertexts: Vec<[u8; 16]> = (0..NUM_BLOCKS)
@@ -406,7 +393,7 @@ fn run_aes256() {
         print_sample_blocks(&plaintexts, &ciphertexts);
 
         let cpu_trace = build_cpu256_trace(&calls, &ciphertexts, cpu_rows);
-        let air = Aes256ExampleProgram { aes };
+        let air = build_aes256_program(cpu_rows, NUM_BLOCKS, &aes).unwrap();
 
         (air, cpu_trace, chiplet_traces)
     });

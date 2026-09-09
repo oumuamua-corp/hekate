@@ -8,14 +8,27 @@ use alloc::vec::Vec;
 use hekate_core::errors;
 use hekate_math::{Flat, HardwareField, TowerField};
 
-/// Challenge label for Fiat-Shamir transcript.
+use crate::FixedColumn;
+
+/// Slot identity;
+/// position fixes the `β` power, never the label.
 pub type ChallengeLabel = &'static [u8];
 
-/// Shared label for the `request_idx` clock
-/// source on stateless-service buses; same
-/// label on both endpoints is load-bearing
-/// for `β`-mix alignment.
+/// Clock slot of a stateless-service bus, on both endpoints.
 pub const REQUEST_IDX_LABEL: ChallengeLabel = b"kappa_request_idx";
+
+/// One label per byte of a byte-split
+/// clock, in little-endian order.
+pub const REQUEST_IDX_BYTE_LABELS: [ChallengeLabel; 4] = [
+    b"kappa_request_idx_b0",
+    b"kappa_request_idx_b1",
+    b"kappa_request_idx_b2",
+    b"kappa_request_idx_b3",
+];
+
+/// `eval_row_idx_le_mle` folds at most eight
+/// bytes; a wider clock truncates silently.
+pub const MAX_ROW_INDEX_BYTES: usize = 8;
 
 /// LogUp bus semantics.
 ///
@@ -59,23 +72,20 @@ pub enum Source {
 ///
 /// Per row `i`:
 /// `h(i) = s(i) / (γ + Σ β^j · source_j(i))`.
-/// The endpoint contributes `claimed_sum = Σ_i h(i)`
-/// (Permutation) or `Σ_i Eq(r_bus, i) · h(i)` (Lookup)
-/// to the cross-bus check.
+/// The endpoint contributes `claimed_sum = Σ_i h(i)` (Permutation)
+/// or `Σ_i Eq(r_bus, i) · h(i)` (Lookup) to the cross-bus check.
 ///
 /// # Security
-/// `Permutation` kind cancels in char-2 by
-/// multiset parity, so endpoints with even
-/// per-key multiplicity collapse silently.
-/// Use `Source::RowIndexLeBytes` in the key
-/// to force per-row uniqueness, or switch to
-/// `BusKind::Lookup` for positional binding.
+/// `Permutation` kind cancels in char-2 by multiset parity;
+/// endpoints with even per-key multiplicity collapse silently.
+/// Use `Source::RowIndexLeBytes` in the key to force per-row
+/// uniqueness, or switch to `BusKind::Lookup` for positional binding.
 #[derive(Clone, Debug)]
 pub struct PermutationCheckSpec {
     pub kind: BusKind,
 
-    /// Key sources stitched via the global
-    /// `β` schedule using each label.
+    /// Key sources;
+    /// slot order fixes the `β` schedule.
     pub sources: Vec<(Source, ChallengeLabel)>,
 
     /// Selector column gating the row's `h`.
@@ -188,14 +198,29 @@ impl PermutationCheckSpec {
     pub fn has_request_idx_column(&self) -> bool {
         self.sources
             .iter()
-            .any(|(src, label)| matches!(src, Source::Column(_)) && *label == REQUEST_IDX_LABEL)
+            .any(|(src, label)| matches!(src, Source::Column(_)) && is_request_idx_label(label))
     }
 
     /// Per-spec only. `validate_bus_set` runs the
     /// cross-endpoint check that closes label spoofing.
     pub fn validate_clock_stitching(&self, _bus_id: &str) -> errors::Result<()> {
-        let waiver_status = self.clock_waiver.as_deref().map(WaiverStatus::classify);
+        for (src, _) in &self.sources {
+            let width_ok = match src {
+                Source::RowIndexLeBytes(n) => *n >= 1 && *n <= MAX_ROW_INDEX_BYTES,
+                Source::RowIndexByte(k) => *k < MAX_ROW_INDEX_BYTES,
+                Source::Column(_) | Source::Columns(_) | Source::Const(_) => true,
+            };
 
+            if !width_ok {
+                return Err(errors::Error::Protocol {
+                    protocol: "logup_bus",
+                    message: "row-index clock wider than 8 bytes; the row-index \
+                              MLE folds at most 8 and truncates the rest silently",
+                });
+            }
+        }
+
+        let waiver_status = self.clock_waiver.as_deref().map(WaiverStatus::classify);
         let has_clock_marker = self.has_real_clock_source() || self.has_request_idx_column();
 
         match (self.kind, has_clock_marker, waiver_status) {
@@ -234,15 +259,214 @@ impl PermutationCheckSpec {
             }
             (BusKind::Permutation, false, None) => Err(errors::Error::Protocol {
                 protocol: "logup_bus",
-                message: "permutation bus lacks per-row clock stitching; add \
-                          Source::RowIndexLeBytes, pair both endpoints with a \
-                          committed B32 column labelled REQUEST_IDX_LABEL whose \
-                          value matches the partner row index, switch to \
-                          BusKind::Lookup via new_lookup, or document the \
-                          carve-out via .with_clock_waiver(reason)",
+                message: "permutation bus lacks per-row clock stitching; give the \
+                          Service a RequestIdx or RequestIdxBytes slot, or a \
+                          clock_waiver citing the AIR constraint that forces \
+                          per-row uniqueness",
             }),
             _ => Ok(()),
         }
+    }
+}
+
+/// One key slot; its position fixes the `β` power.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceSlot {
+    /// Bound to a table column on each endpoint.
+    Value(ChallengeLabel),
+
+    /// Same constant on both endpoints
+    /// (cross-table domain separation).
+    Const(ChallengeLabel, u128),
+
+    /// Stateless-service clock: the requester folds
+    /// its own row index, the responder commits a
+    /// column carrying the requester's row.
+    RequestIdx { num_bytes: usize },
+
+    /// The same clock split one slot per byte, for
+    /// a responder whose AIR reads the bytes separately.
+    RequestIdxBytes { num_bytes: usize },
+}
+
+/// Bus key schema declared once by the serving
+/// chiplet; both endpoints derive their spec from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Service {
+    pub bus_id: &'static str,
+    pub kind: BusKind,
+    pub slots: Vec<ServiceSlot>,
+
+    /// Per-row uniqueness argued by a body
+    /// constraint rather than a clock slot.
+    pub clock_waiver: Option<&'static str>,
+}
+
+impl Service {
+    pub fn num_values(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|s| matches!(s, ServiceSlot::Value(_)))
+            .count()
+    }
+
+    /// Committed columns a responder must
+    /// supply for the schema's clock slot.
+    pub fn clock_columns(&self) -> usize {
+        self.slots
+            .iter()
+            .map(|s| match s {
+                ServiceSlot::RequestIdx { .. } => 1,
+                ServiceSlot::RequestIdxBytes { num_bytes } => *num_bytes,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// Requester endpoint: `values` bind the `Value` slots in
+    /// order; a clock slot folds the requester's own row index.
+    pub fn request(
+        &self,
+        values: &[usize],
+        selector: usize,
+    ) -> errors::Result<PermutationCheckSpec> {
+        self.spec(values, None, selector)
+    }
+
+    /// Responder endpoint: `clock_cols` are the committed columns
+    /// carrying the requester's row index, one per `clock_columns()`.
+    pub fn respond(
+        &self,
+        values: &[usize],
+        clock_cols: &[usize],
+        selector: usize,
+    ) -> errors::Result<PermutationCheckSpec> {
+        self.spec(values, Some(clock_cols), selector)
+    }
+
+    fn spec(
+        &self,
+        values: &[usize],
+        respond_idx: Option<&[usize]>,
+        selector: usize,
+    ) -> errors::Result<PermutationCheckSpec> {
+        let clock_slots = self
+            .slots
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s,
+                    ServiceSlot::RequestIdx { .. } | ServiceSlot::RequestIdxBytes { .. }
+                )
+            })
+            .count();
+
+        let clock_ok = matches!(
+            (self.kind, clock_slots, self.clock_waiver),
+            (BusKind::Permutation, 1, None)
+                | (BusKind::Permutation, 0, Some(_))
+                | (BusKind::Lookup, 0, None)
+        );
+
+        if !clock_ok {
+            return Err(errors::Error::Protocol {
+                protocol: "service",
+                message: "Permutation schema needs exactly one clock slot or a \
+                          clock_waiver, never both; Lookup schema must have neither",
+            });
+        }
+
+        if let Some(cols) = respond_idx
+            && cols.len() != self.clock_columns()
+        {
+            return Err(errors::Error::Protocol {
+                protocol: "service",
+                message: "clock column count does not match the schema's clock slot",
+            });
+        }
+
+        if values.len() != self.num_values() {
+            return Err(errors::Error::Protocol {
+                protocol: "service",
+                message: "value column count does not match the schema's Value slots",
+            });
+        }
+
+        let mut sources = Vec::with_capacity(self.slots.len());
+        let mut next_value = values.iter();
+        let mut next_clock = respond_idx.unwrap_or(&[]).iter();
+
+        for slot in &self.slots {
+            match slot {
+                ServiceSlot::Value(label) => {
+                    let col = next_value.next().ok_or(errors::Error::Protocol {
+                        protocol: "service",
+                        message: "value column count does not match the schema's Value slots",
+                    })?;
+
+                    sources.push((Source::Column(*col), *label));
+                }
+                ServiceSlot::Const(label, v) => {
+                    sources.push((Source::Const(*v), *label));
+                }
+                ServiceSlot::RequestIdx { num_bytes } => {
+                    if *num_bytes == 0 || *num_bytes > MAX_ROW_INDEX_BYTES {
+                        return Err(errors::Error::Protocol {
+                            protocol: "service",
+                            message: "RequestIdx num_bytes must be 1..=8; a wider \
+                                      clock is silently truncated by the row-index MLE",
+                        });
+                    }
+
+                    let source = match respond_idx {
+                        None => Source::RowIndexLeBytes(*num_bytes),
+                        Some(_) => {
+                            Source::Column(*next_clock.next().ok_or(errors::Error::Protocol {
+                                protocol: "service",
+                                message: "RequestIdx binds exactly one committed \
+                                          clock column on the responder",
+                            })?)
+                        }
+                    };
+
+                    sources.push((source, REQUEST_IDX_LABEL));
+                }
+                ServiceSlot::RequestIdxBytes { num_bytes } => {
+                    if *num_bytes == 0 || *num_bytes > REQUEST_IDX_BYTE_LABELS.len() {
+                        return Err(errors::Error::Protocol {
+                            protocol: "service",
+                            message: "byte-split clock wider than the label family",
+                        });
+                    }
+
+                    for (byte, label) in REQUEST_IDX_BYTE_LABELS.iter().enumerate().take(*num_bytes)
+                    {
+                        let source = match respond_idx {
+                            Some(_) => Source::Column(*next_clock.next().ok_or(
+                                errors::Error::Protocol {
+                                    protocol: "service",
+                                    message: "byte-split clock binds one committed \
+                                              column per byte on the responder",
+                                },
+                            )?),
+                            None => Source::RowIndexByte(byte),
+                        };
+
+                        sources.push((source, *label));
+                    }
+                }
+            }
+        }
+
+        let spec = match self.kind {
+            BusKind::Permutation => PermutationCheckSpec::new(sources, Some(selector)),
+            BusKind::Lookup => PermutationCheckSpec::new_lookup(sources, Some(selector)),
+        };
+
+        Ok(match self.clock_waiver {
+            Some(reason) => spec.with_clock_waiver(reason),
+            None => spec,
+        })
     }
 }
 
@@ -269,6 +493,46 @@ impl WaiverStatus {
             Self::Ok
         }
     }
+}
+
+/// A witness selector gives the prover freedom over which
+/// rows join the bus; every selector must be `None` or an
+/// overlay-pinned member of the table's `fixed_columns()`.
+pub fn validate_fixed_selectors<F>(
+    specs: &[(String, PermutationCheckSpec)],
+    fixed: &[FixedColumn<F>],
+) -> errors::Result<()> {
+    for (_, spec) in specs {
+        if spec.selector.is_none() && spec.recv_selector.is_some() {
+            return Err(errors::Error::Protocol {
+                protocol: "logup_bus",
+                message: "paired bus has recv_selector without send selector",
+            });
+        }
+
+        for sel in [spec.selector, spec.recv_selector].into_iter().flatten() {
+            let Some(fc) = fixed.iter().find(|fc| fc.col_idx == sel) else {
+                return Err(errors::Error::Protocol {
+                    protocol: "logup_bus",
+                    message: "bus selector reads a witness column; every selector \
+                              and recv_selector must be None or a member of the \
+                              table's fixed_columns",
+                });
+            };
+
+            if !fc.shape.is_overlay() {
+                return Err(errors::Error::Protocol {
+                    protocol: "logup_bus",
+                    message: "bus selector is pinned to a substituted shape; \
+                              FirstRow/LastRow/Custom replace the committed column \
+                              with a virtual poly the bus cannot read; pin selectors \
+                              with Cadence, Segments, Periodic, Sparse or Dense",
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Every multi-endpoint `Permutation` `bus_id`
@@ -367,9 +631,8 @@ where
     acc
 }
 
-/// MLE of `Source::RowIndexByte` at `r_final`.
-/// Same char-2 shortcut as `eval_row_idx_le_mle`,
-/// restricted to one byte.
+/// MLE of `Source::RowIndexByte` at `r_final`. Same char-2
+/// shortcut as `eval_row_idx_le_mle`, restricted to one byte.
 pub fn eval_row_idx_byte_mle<F>(byte_idx: usize, r_final: &[Flat<F>]) -> Flat<F>
 where
     F: TowerField + HardwareField + From<u128>,
@@ -389,9 +652,29 @@ where
     acc
 }
 
+/// Whether `label` marks a committed column
+/// as carrying the partner's row index.
+pub fn is_request_idx_label(label: ChallengeLabel) -> bool {
+    label == REQUEST_IDX_LABEL || REQUEST_IDX_BYTE_LABELS.contains(&label)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_service() -> Service {
+        Service {
+            bus_id: "svc",
+            kind: BusKind::Permutation,
+            slots: vec![
+                ServiceSlot::Value(b"k_a"),
+                ServiceSlot::Const(b"k_dom", 7),
+                ServiceSlot::RequestIdx { num_bytes: 4 },
+                ServiceSlot::Value(b"k_dir"),
+            ],
+            clock_waiver: None,
+        }
+    }
 
     #[test]
     fn permutation_spec_creation() {
@@ -507,5 +790,76 @@ mod tests {
             PermutationCheckSpec::new(vec![(Source::Column(0), b"k" as ChallengeLabel)], Some(1));
 
         assert!(validate_bus_set(vec![("ram_link", &spec)]).is_ok());
+    }
+
+    #[test]
+    fn service_endpoints_share_schema() {
+        let svc = test_service();
+
+        let req = svc.request(&[10, 11], 12).unwrap();
+        let resp = svc.respond(&[20, 21], &[22], 23).unwrap();
+
+        let req_labels: Vec<_> = req.sources.iter().map(|(_, l)| *l).collect();
+        let resp_labels: Vec<_> = resp.sources.iter().map(|(_, l)| *l).collect();
+
+        assert_eq!(req_labels, resp_labels);
+
+        assert_eq!(req.sources[0].0, Source::Column(10));
+        assert_eq!(req.sources[1].0, Source::Const(7));
+        assert_eq!(req.sources[2].0, Source::RowIndexLeBytes(4));
+        assert_eq!(req.sources[3].0, Source::Column(11));
+        assert_eq!(req.selector, Some(12));
+
+        assert_eq!(resp.sources[0].0, Source::Column(20));
+        assert_eq!(resp.sources[1].0, Source::Const(7));
+        assert_eq!(resp.sources[2].0, Source::Column(22));
+        assert_eq!(resp.sources[3].0, Source::Column(21));
+        assert_eq!(resp.selector, Some(23));
+
+        req.validate_clock_stitching("svc").unwrap();
+        resp.validate_clock_stitching("svc").unwrap();
+    }
+
+    #[test]
+    fn service_rejects_schema_mismatches() {
+        let svc = test_service();
+
+        assert!(svc.request(&[10], 12).is_err());
+        assert!(svc.respond(&[20, 21], &[], 23).is_err());
+
+        let lookup = Service {
+            bus_id: "rom",
+            kind: BusKind::Lookup,
+            slots: vec![ServiceSlot::Value(b"k_a")],
+            clock_waiver: None,
+        };
+
+        assert!(lookup.respond(&[3], &[9], 4).is_err());
+
+        let clockless = Service {
+            bus_id: "bad",
+            kind: BusKind::Permutation,
+            slots: vec![ServiceSlot::Value(b"k_a")],
+            clock_waiver: None,
+        };
+
+        assert!(clockless.request(&[1], 2).is_err());
+    }
+
+    #[test]
+    fn lookup_service_derives_lookup_specs() {
+        let svc = Service {
+            bus_id: "rom",
+            kind: BusKind::Lookup,
+            slots: vec![ServiceSlot::Value(b"k_a")],
+            clock_waiver: None,
+        };
+
+        let req = svc.request(&[1], 2).unwrap();
+        let resp = svc.respond(&[3], &[], 4).unwrap();
+
+        assert_eq!(req.kind, BusKind::Lookup);
+        assert_eq!(resp.kind, BusKind::Lookup);
+        assert_eq!(req.sources.len(), 1);
     }
 }

@@ -628,19 +628,21 @@ pub mod hekate {
             since = "2.0.0",
             note = "Use associated constants instead. This will no longer be generated in 2021."
         )]
-        pub const ENUM_MAX_FIXED_SHAPE_KIND: u8 = 5;
+        pub const ENUM_MAX_FIXED_SHAPE_KIND: u8 = 7;
         #[deprecated(
             since = "2.0.0",
             note = "Use associated constants instead. This will no longer be generated in 2021."
         )]
         #[allow(non_camel_case_types)]
-        pub const ENUM_VALUES_FIXED_SHAPE_KIND: [FixedShapeKind; 6] = [
+        pub const ENUM_VALUES_FIXED_SHAPE_KIND: [FixedShapeKind; 8] = [
             FixedShapeKind::LastRow,
             FixedShapeKind::FirstRow,
             FixedShapeKind::Custom,
             FixedShapeKind::Periodic,
             FixedShapeKind::Sparse,
             FixedShapeKind::Dense,
+            FixedShapeKind::Cadence,
+            FixedShapeKind::Segments,
         ];
 
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -654,9 +656,11 @@ pub mod hekate {
             pub const Periodic: Self = Self(3);
             pub const Sparse: Self = Self(4);
             pub const Dense: Self = Self(5);
+            pub const Cadence: Self = Self(6);
+            pub const Segments: Self = Self(7);
 
             pub const ENUM_MIN: u8 = 0;
-            pub const ENUM_MAX: u8 = 5;
+            pub const ENUM_MAX: u8 = 7;
             pub const ENUM_VALUES: &'static [Self] = &[
                 Self::LastRow,
                 Self::FirstRow,
@@ -664,6 +668,8 @@ pub mod hekate {
                 Self::Periodic,
                 Self::Sparse,
                 Self::Dense,
+                Self::Cadence,
+                Self::Segments,
             ];
             /// Returns the variant's name or "" if unknown.
             pub fn variant_name(self) -> Option<&'static str> {
@@ -674,6 +680,8 @@ pub mod hekate {
                     Self::Periodic => Some("Periodic"),
                     Self::Sparse => Some("Sparse"),
                     Self::Dense => Some("Dense"),
+                    Self::Cadence => Some("Cadence"),
+                    Self::Segments => Some("Segments"),
                     _ => None,
                 }
             }
@@ -2644,6 +2652,191 @@ pub mod hekate {
                 ds.finish()
             }
         }
+        pub enum CadenceSegmentOffset {}
+        #[derive(Copy, Clone, PartialEq)]
+
+        pub struct CadenceSegment<'a> {
+            pub _tab: ::flatbuffers::Table<'a>,
+        }
+
+        impl<'a> ::flatbuffers::Follow<'a> for CadenceSegment<'a> {
+            type Inner = CadenceSegment<'a>;
+            #[inline]
+            unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+                Self {
+                    _tab: unsafe { ::flatbuffers::Table::new(buf, loc) },
+                }
+            }
+        }
+
+        impl<'a> CadenceSegment<'a> {
+            pub const VT_STRIDE: ::flatbuffers::VOffsetT = 4;
+            pub const VT_COUNT: ::flatbuffers::VOffsetT = 6;
+            pub const VT_ORIGIN: ::flatbuffers::VOffsetT = 8;
+            pub const VT_VALUES: ::flatbuffers::VOffsetT = 10;
+
+            #[inline]
+            pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
+                CadenceSegment { _tab: table }
+            }
+            #[allow(unused_mut)]
+            pub fn create<
+                'bldr: 'args,
+                'args: 'mut_bldr,
+                'mut_bldr,
+                A: ::flatbuffers::Allocator + 'bldr,
+            >(
+                _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
+                args: &'args CadenceSegmentArgs<'args>,
+            ) -> ::flatbuffers::WIPOffset<CadenceSegment<'bldr>> {
+                let mut builder = CadenceSegmentBuilder::new(_fbb);
+                builder.add_origin(args.origin);
+                builder.add_count(args.count);
+                builder.add_stride(args.stride);
+                if let Some(x) = args.values {
+                    builder.add_values(x);
+                }
+                builder.finish()
+            }
+
+            #[inline]
+            pub fn stride(&self) -> u64 {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<u64>(CadenceSegment::VT_STRIDE, Some(0))
+                        .unwrap()
+                }
+            }
+            #[inline]
+            pub fn count(&self) -> u64 {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<u64>(CadenceSegment::VT_COUNT, Some(0))
+                        .unwrap()
+                }
+            }
+            #[inline]
+            pub fn origin(&self) -> u64 {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<u64>(CadenceSegment::VT_ORIGIN, Some(0))
+                        .unwrap()
+                }
+            }
+            #[inline]
+            pub fn values(&self) -> Option<::flatbuffers::Vector<'a, Block128>> {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, Block128>>>(
+                            CadenceSegment::VT_VALUES,
+                            None,
+                        )
+                }
+            }
+        }
+
+        impl ::flatbuffers::Verifiable for CadenceSegment<'_> {
+            #[inline]
+            fn run_verifier(
+                v: &mut ::flatbuffers::Verifier,
+                pos: usize,
+            ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+                v.visit_table(pos)?
+     .visit_field::<u64>("stride", Self::VT_STRIDE, false)?
+     .visit_field::<u64>("count", Self::VT_COUNT, false)?
+     .visit_field::<u64>("origin", Self::VT_ORIGIN, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, Block128>>>("values", Self::VT_VALUES, false)?
+     .finish();
+                Ok(())
+            }
+        }
+        pub struct CadenceSegmentArgs<'a> {
+            pub stride: u64,
+            pub count: u64,
+            pub origin: u64,
+            pub values: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, Block128>>>,
+        }
+        impl<'a> Default for CadenceSegmentArgs<'a> {
+            #[inline]
+            fn default() -> Self {
+                CadenceSegmentArgs {
+                    stride: 0,
+                    count: 0,
+                    origin: 0,
+                    values: None,
+                }
+            }
+        }
+
+        pub struct CadenceSegmentBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
+            fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+            start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
+        }
+        impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> CadenceSegmentBuilder<'a, 'b, A> {
+            #[inline]
+            pub fn add_stride(&mut self, stride: u64) {
+                self.fbb_
+                    .push_slot::<u64>(CadenceSegment::VT_STRIDE, stride, 0);
+            }
+            #[inline]
+            pub fn add_count(&mut self, count: u64) {
+                self.fbb_
+                    .push_slot::<u64>(CadenceSegment::VT_COUNT, count, 0);
+            }
+            #[inline]
+            pub fn add_origin(&mut self, origin: u64) {
+                self.fbb_
+                    .push_slot::<u64>(CadenceSegment::VT_ORIGIN, origin, 0);
+            }
+            #[inline]
+            pub fn add_values(
+                &mut self,
+                values: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b, Block128>>,
+            ) {
+                self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(
+                    CadenceSegment::VT_VALUES,
+                    values,
+                );
+            }
+            #[inline]
+            pub fn new(
+                _fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+            ) -> CadenceSegmentBuilder<'a, 'b, A> {
+                let start = _fbb.start_table();
+                CadenceSegmentBuilder {
+                    fbb_: _fbb,
+                    start_: start,
+                }
+            }
+            #[inline]
+            pub fn finish(self) -> ::flatbuffers::WIPOffset<CadenceSegment<'a>> {
+                let o = self.fbb_.end_table(self.start_);
+                ::flatbuffers::WIPOffset::new(o.value())
+            }
+        }
+
+        impl ::core::fmt::Debug for CadenceSegment<'_> {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                let mut ds = f.debug_struct("CadenceSegment");
+                ds.field("stride", &self.stride());
+                ds.field("count", &self.count());
+                ds.field("origin", &self.origin());
+                ds.field("values", &self.values());
+                ds.finish()
+            }
+        }
         pub enum FixedColumnOffset {}
         #[derive(Copy, Clone, PartialEq)]
 
@@ -2669,6 +2862,10 @@ pub mod hekate {
             pub const VT_VALUES: ::flatbuffers::VOffsetT = 12;
             pub const VT_SPARSE_ROWS: ::flatbuffers::VOffsetT = 14;
             pub const VT_SPARSE_VALUES: ::flatbuffers::VOffsetT = 16;
+            pub const VT_STRIDE: ::flatbuffers::VOffsetT = 18;
+            pub const VT_COUNT: ::flatbuffers::VOffsetT = 20;
+            pub const VT_ORIGIN: ::flatbuffers::VOffsetT = 22;
+            pub const VT_SEGMENTS: ::flatbuffers::VOffsetT = 24;
 
             #[inline]
             pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -2685,6 +2882,12 @@ pub mod hekate {
                 args: &'args FixedColumnArgs<'args>,
             ) -> ::flatbuffers::WIPOffset<FixedColumn<'bldr>> {
                 let mut builder = FixedColumnBuilder::new(_fbb);
+                builder.add_origin(args.origin);
+                builder.add_count(args.count);
+                builder.add_stride(args.stride);
+                if let Some(x) = args.segments {
+                    builder.add_segments(x);
+                }
                 if let Some(x) = args.sparse_values {
                     builder.add_sparse_values(x);
                 }
@@ -2788,6 +2991,53 @@ pub mod hekate {
                         )
                 }
             }
+            #[inline]
+            pub fn stride(&self) -> u64 {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<u64>(FixedColumn::VT_STRIDE, Some(0))
+                        .unwrap()
+                }
+            }
+            #[inline]
+            pub fn count(&self) -> u64 {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<u64>(FixedColumn::VT_COUNT, Some(0))
+                        .unwrap()
+                }
+            }
+            #[inline]
+            pub fn origin(&self) -> u64 {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<u64>(FixedColumn::VT_ORIGIN, Some(0))
+                        .unwrap()
+                }
+            }
+            #[inline]
+            pub fn segments(
+                &self,
+            ) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<CadenceSegment<'a>>>>
+            {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab.get::<::flatbuffers::ForwardsUOffset<
+                        ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<CadenceSegment>>,
+                    >>(FixedColumn::VT_SEGMENTS, None)
+                }
+            }
         }
 
         impl ::flatbuffers::Verifiable for FixedColumn<'_> {
@@ -2804,6 +3054,10 @@ pub mod hekate {
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, Block128>>>("values", Self::VT_VALUES, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u64>>>("sparse_rows", Self::VT_SPARSE_ROWS, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, Block128>>>("sparse_values", Self::VT_SPARSE_VALUES, false)?
+     .visit_field::<u64>("stride", Self::VT_STRIDE, false)?
+     .visit_field::<u64>("count", Self::VT_COUNT, false)?
+     .visit_field::<u64>("origin", Self::VT_ORIGIN, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<CadenceSegment>>>>("segments", Self::VT_SEGMENTS, false)?
      .finish();
                 Ok(())
             }
@@ -2817,6 +3071,14 @@ pub mod hekate {
             pub sparse_rows: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u64>>>,
             pub sparse_values:
                 Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, Block128>>>,
+            pub stride: u64,
+            pub count: u64,
+            pub origin: u64,
+            pub segments: Option<
+                ::flatbuffers::WIPOffset<
+                    ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<CadenceSegment<'a>>>,
+                >,
+            >,
         }
         impl<'a> Default for FixedColumnArgs<'a> {
             #[inline]
@@ -2829,6 +3091,10 @@ pub mod hekate {
                     values: None,
                     sparse_rows: None,
                     sparse_values: None,
+                    stride: 0,
+                    count: 0,
+                    origin: 0,
+                    segments: None,
                 }
             }
         }
@@ -2897,6 +3163,32 @@ pub mod hekate {
                 );
             }
             #[inline]
+            pub fn add_stride(&mut self, stride: u64) {
+                self.fbb_
+                    .push_slot::<u64>(FixedColumn::VT_STRIDE, stride, 0);
+            }
+            #[inline]
+            pub fn add_count(&mut self, count: u64) {
+                self.fbb_.push_slot::<u64>(FixedColumn::VT_COUNT, count, 0);
+            }
+            #[inline]
+            pub fn add_origin(&mut self, origin: u64) {
+                self.fbb_
+                    .push_slot::<u64>(FixedColumn::VT_ORIGIN, origin, 0);
+            }
+            #[inline]
+            pub fn add_segments(
+                &mut self,
+                segments: ::flatbuffers::WIPOffset<
+                    ::flatbuffers::Vector<'b, ::flatbuffers::ForwardsUOffset<CadenceSegment<'b>>>,
+                >,
+            ) {
+                self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(
+                    FixedColumn::VT_SEGMENTS,
+                    segments,
+                );
+            }
+            #[inline]
             pub fn new(
                 _fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
             ) -> FixedColumnBuilder<'a, 'b, A> {
@@ -2923,6 +3215,10 @@ pub mod hekate {
                 ds.field("values", &self.values());
                 ds.field("sparse_rows", &self.sparse_rows());
                 ds.field("sparse_values", &self.sparse_values());
+                ds.field("stride", &self.stride());
+                ds.field("count", &self.count());
+                ds.field("origin", &self.origin());
+                ds.field("segments", &self.segments());
                 ds.finish()
             }
         }
@@ -3102,11 +3398,11 @@ pub mod hekate {
             pub const VT_NUM_COLUMNS: ::flatbuffers::VOffsetT = 6;
             pub const VT_COLUMN_LAYOUT: ::flatbuffers::VOffsetT = 8;
             pub const VT_VIRTUAL_COLUMN_LAYOUT: ::flatbuffers::VOffsetT = 10;
-            pub const VT_CONSTRAINT_AST: ::flatbuffers::VOffsetT = 12;
-            pub const VT_BOUNDARY_CONSTRAINTS: ::flatbuffers::VOffsetT = 14;
-            pub const VT_PERMUTATION_CHECKS: ::flatbuffers::VOffsetT = 16;
-            pub const VT_VIRTUAL_EXPANDER: ::flatbuffers::VOffsetT = 18;
-            pub const VT_FIXED_COLUMNS: ::flatbuffers::VOffsetT = 20;
+            pub const VT_VIRTUAL_EXPANDER: ::flatbuffers::VOffsetT = 12;
+            pub const VT_CONSTRAINT_AST: ::flatbuffers::VOffsetT = 14;
+            pub const VT_BOUNDARY_CONSTRAINTS: ::flatbuffers::VOffsetT = 16;
+            pub const VT_FIXED_COLUMNS: ::flatbuffers::VOffsetT = 18;
+            pub const VT_PERMUTATION_CHECKS: ::flatbuffers::VOffsetT = 20;
 
             #[inline]
             pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -3123,20 +3419,20 @@ pub mod hekate {
                 args: &'args ChipletDefArgs<'args>,
             ) -> ::flatbuffers::WIPOffset<ChipletDef<'bldr>> {
                 let mut builder = ChipletDefBuilder::new(_fbb);
-                if let Some(x) = args.fixed_columns {
-                    builder.add_fixed_columns(x);
-                }
-                if let Some(x) = args.virtual_expander {
-                    builder.add_virtual_expander(x);
-                }
                 if let Some(x) = args.permutation_checks {
                     builder.add_permutation_checks(x);
+                }
+                if let Some(x) = args.fixed_columns {
+                    builder.add_fixed_columns(x);
                 }
                 if let Some(x) = args.boundary_constraints {
                     builder.add_boundary_constraints(x);
                 }
                 if let Some(x) = args.constraint_ast {
                     builder.add_constraint_ast(x);
+                }
+                if let Some(x) = args.virtual_expander {
+                    builder.add_virtual_expander(x);
                 }
                 if let Some(x) = args.virtual_column_layout {
                     builder.add_virtual_column_layout(x);
@@ -3191,6 +3487,19 @@ pub mod hekate {
                 }
             }
             #[inline]
+            pub fn virtual_expander(&self) -> Option<VirtualExpander<'a>> {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<::flatbuffers::ForwardsUOffset<VirtualExpander>>(
+                            ChipletDef::VT_VIRTUAL_EXPANDER,
+                            None,
+                        )
+                }
+            }
+            #[inline]
             pub fn constraint_ast(&self) -> Option<ConstraintAst<'a>> {
                 // Safety:
                 // Created from valid Table for this object
@@ -3222,33 +3531,6 @@ pub mod hekate {
                 }
             }
             #[inline]
-            pub fn permutation_checks(
-                &self,
-            ) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<BusEndpoint<'a>>>>
-            {
-                // Safety:
-                // Created from valid Table for this object
-                // which contains a valid value in this slot
-                unsafe {
-                    self._tab.get::<::flatbuffers::ForwardsUOffset<
-                        ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<BusEndpoint>>,
-                    >>(ChipletDef::VT_PERMUTATION_CHECKS, None)
-                }
-            }
-            #[inline]
-            pub fn virtual_expander(&self) -> Option<VirtualExpander<'a>> {
-                // Safety:
-                // Created from valid Table for this object
-                // which contains a valid value in this slot
-                unsafe {
-                    self._tab
-                        .get::<::flatbuffers::ForwardsUOffset<VirtualExpander>>(
-                            ChipletDef::VT_VIRTUAL_EXPANDER,
-                            None,
-                        )
-                }
-            }
-            #[inline]
             pub fn fixed_columns(
                 &self,
             ) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<FixedColumn<'a>>>>
@@ -3260,6 +3542,20 @@ pub mod hekate {
                     self._tab.get::<::flatbuffers::ForwardsUOffset<
                         ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<FixedColumn>>,
                     >>(ChipletDef::VT_FIXED_COLUMNS, None)
+                }
+            }
+            #[inline]
+            pub fn permutation_checks(
+                &self,
+            ) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<BusEndpoint<'a>>>>
+            {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab.get::<::flatbuffers::ForwardsUOffset<
+                        ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<BusEndpoint>>,
+                    >>(ChipletDef::VT_PERMUTATION_CHECKS, None)
                 }
             }
         }
@@ -3275,11 +3571,11 @@ pub mod hekate {
      .visit_field::<u32>("num_columns", Self::VT_NUM_COLUMNS, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ColumnType>>>("column_layout", Self::VT_COLUMN_LAYOUT, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ColumnType>>>("virtual_column_layout", Self::VT_VIRTUAL_COLUMN_LAYOUT, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<VirtualExpander>>("virtual_expander", Self::VT_VIRTUAL_EXPANDER, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<ConstraintAst>>("constraint_ast", Self::VT_CONSTRAINT_AST, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<BoundaryConstraint>>>>("boundary_constraints", Self::VT_BOUNDARY_CONSTRAINTS, false)?
-     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<BusEndpoint>>>>("permutation_checks", Self::VT_PERMUTATION_CHECKS, false)?
-     .visit_field::<::flatbuffers::ForwardsUOffset<VirtualExpander>>("virtual_expander", Self::VT_VIRTUAL_EXPANDER, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<FixedColumn>>>>("fixed_columns", Self::VT_FIXED_COLUMNS, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<BusEndpoint>>>>("permutation_checks", Self::VT_PERMUTATION_CHECKS, false)?
      .finish();
                 Ok(())
             }
@@ -3291,6 +3587,7 @@ pub mod hekate {
                 Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ColumnType>>>,
             pub virtual_column_layout:
                 Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ColumnType>>>,
+            pub virtual_expander: Option<::flatbuffers::WIPOffset<VirtualExpander<'a>>>,
             pub constraint_ast: Option<::flatbuffers::WIPOffset<ConstraintAst<'a>>>,
             pub boundary_constraints: Option<
                 ::flatbuffers::WIPOffset<
@@ -3300,15 +3597,14 @@ pub mod hekate {
                     >,
                 >,
             >,
-            pub permutation_checks: Option<
-                ::flatbuffers::WIPOffset<
-                    ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<BusEndpoint<'a>>>,
-                >,
-            >,
-            pub virtual_expander: Option<::flatbuffers::WIPOffset<VirtualExpander<'a>>>,
             pub fixed_columns: Option<
                 ::flatbuffers::WIPOffset<
                     ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<FixedColumn<'a>>>,
+                >,
+            >,
+            pub permutation_checks: Option<
+                ::flatbuffers::WIPOffset<
+                    ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<BusEndpoint<'a>>>,
                 >,
             >,
         }
@@ -3320,11 +3616,11 @@ pub mod hekate {
                     num_columns: 0,
                     column_layout: None,
                     virtual_column_layout: None,
+                    virtual_expander: None,
                     constraint_ast: None,
                     boundary_constraints: None,
-                    permutation_checks: None,
-                    virtual_expander: None,
                     fixed_columns: None,
+                    permutation_checks: None,
                 }
             }
         }
@@ -3367,6 +3663,17 @@ pub mod hekate {
                 );
             }
             #[inline]
+            pub fn add_virtual_expander(
+                &mut self,
+                virtual_expander: ::flatbuffers::WIPOffset<VirtualExpander<'b>>,
+            ) {
+                self.fbb_
+                    .push_slot_always::<::flatbuffers::WIPOffset<VirtualExpander>>(
+                        ChipletDef::VT_VIRTUAL_EXPANDER,
+                        virtual_expander,
+                    );
+            }
+            #[inline]
             pub fn add_constraint_ast(
                 &mut self,
                 constraint_ast: ::flatbuffers::WIPOffset<ConstraintAst<'b>>,
@@ -3393,29 +3700,6 @@ pub mod hekate {
                 );
             }
             #[inline]
-            pub fn add_permutation_checks(
-                &mut self,
-                permutation_checks: ::flatbuffers::WIPOffset<
-                    ::flatbuffers::Vector<'b, ::flatbuffers::ForwardsUOffset<BusEndpoint<'b>>>,
-                >,
-            ) {
-                self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(
-                    ChipletDef::VT_PERMUTATION_CHECKS,
-                    permutation_checks,
-                );
-            }
-            #[inline]
-            pub fn add_virtual_expander(
-                &mut self,
-                virtual_expander: ::flatbuffers::WIPOffset<VirtualExpander<'b>>,
-            ) {
-                self.fbb_
-                    .push_slot_always::<::flatbuffers::WIPOffset<VirtualExpander>>(
-                        ChipletDef::VT_VIRTUAL_EXPANDER,
-                        virtual_expander,
-                    );
-            }
-            #[inline]
             pub fn add_fixed_columns(
                 &mut self,
                 fixed_columns: ::flatbuffers::WIPOffset<
@@ -3425,6 +3709,18 @@ pub mod hekate {
                 self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(
                     ChipletDef::VT_FIXED_COLUMNS,
                     fixed_columns,
+                );
+            }
+            #[inline]
+            pub fn add_permutation_checks(
+                &mut self,
+                permutation_checks: ::flatbuffers::WIPOffset<
+                    ::flatbuffers::Vector<'b, ::flatbuffers::ForwardsUOffset<BusEndpoint<'b>>>,
+                >,
+            ) {
+                self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(
+                    ChipletDef::VT_PERMUTATION_CHECKS,
+                    permutation_checks,
                 );
             }
             #[inline]
@@ -3451,11 +3747,11 @@ pub mod hekate {
                 ds.field("num_columns", &self.num_columns());
                 ds.field("column_layout", &self.column_layout());
                 ds.field("virtual_column_layout", &self.virtual_column_layout());
+                ds.field("virtual_expander", &self.virtual_expander());
                 ds.field("constraint_ast", &self.constraint_ast());
                 ds.field("boundary_constraints", &self.boundary_constraints());
-                ds.field("permutation_checks", &self.permutation_checks());
-                ds.field("virtual_expander", &self.virtual_expander());
                 ds.field("fixed_columns", &self.fixed_columns());
+                ds.field("permutation_checks", &self.permutation_checks());
                 ds.finish()
             }
         }
@@ -3972,23 +4268,24 @@ pub mod hekate {
 
         impl<'a> ProgramBundle<'a> {
             pub const VT_VERSION: ::flatbuffers::VOffsetT = 4;
-            pub const VT_NUM_COLUMNS: ::flatbuffers::VOffsetT = 6;
-            pub const VT_NUM_PUBLIC_INPUTS: ::flatbuffers::VOffsetT = 8;
-            pub const VT_COLUMN_LAYOUT: ::flatbuffers::VOffsetT = 10;
-            pub const VT_VIRTUAL_COLUMN_LAYOUT: ::flatbuffers::VOffsetT = 12;
-            pub const VT_CONSTRAINT_AST: ::flatbuffers::VOffsetT = 14;
-            pub const VT_BOUNDARY_CONSTRAINTS: ::flatbuffers::VOffsetT = 16;
-            pub const VT_PERMUTATION_CHECKS: ::flatbuffers::VOffsetT = 18;
-            pub const VT_VIRTUAL_EXPANDER: ::flatbuffers::VOffsetT = 20;
-            pub const VT_CHIPLET_DEFS: ::flatbuffers::VOffsetT = 22;
-            pub const VT_INLINE_CHIPLETS: ::flatbuffers::VOffsetT = 24;
-            pub const VT_INLINE_CHIPLET_KERNELS: ::flatbuffers::VOffsetT = 26;
-            pub const VT_NUM_ROWS: ::flatbuffers::VOffsetT = 28;
-            pub const VT_PUBLIC_INPUTS: ::flatbuffers::VOffsetT = 30;
-            pub const VT_MAIN_TRACE: ::flatbuffers::VOffsetT = 32;
-            pub const VT_CHIPLET_TRACES: ::flatbuffers::VOffsetT = 34;
-            pub const VT_CONFIG: ::flatbuffers::VOffsetT = 36;
-            pub const VT_FIXED_COLUMNS: ::flatbuffers::VOffsetT = 38;
+            pub const VT_NAME: ::flatbuffers::VOffsetT = 6;
+            pub const VT_NUM_COLUMNS: ::flatbuffers::VOffsetT = 8;
+            pub const VT_NUM_PUBLIC_INPUTS: ::flatbuffers::VOffsetT = 10;
+            pub const VT_COLUMN_LAYOUT: ::flatbuffers::VOffsetT = 12;
+            pub const VT_VIRTUAL_COLUMN_LAYOUT: ::flatbuffers::VOffsetT = 14;
+            pub const VT_VIRTUAL_EXPANDER: ::flatbuffers::VOffsetT = 16;
+            pub const VT_CONSTRAINT_AST: ::flatbuffers::VOffsetT = 18;
+            pub const VT_BOUNDARY_CONSTRAINTS: ::flatbuffers::VOffsetT = 20;
+            pub const VT_FIXED_COLUMNS: ::flatbuffers::VOffsetT = 22;
+            pub const VT_PERMUTATION_CHECKS: ::flatbuffers::VOffsetT = 24;
+            pub const VT_CHIPLET_DEFS: ::flatbuffers::VOffsetT = 26;
+            pub const VT_INLINE_CHIPLETS: ::flatbuffers::VOffsetT = 28;
+            pub const VT_INLINE_CHIPLET_KERNELS: ::flatbuffers::VOffsetT = 30;
+            pub const VT_NUM_ROWS: ::flatbuffers::VOffsetT = 32;
+            pub const VT_PUBLIC_INPUTS: ::flatbuffers::VOffsetT = 34;
+            pub const VT_MAIN_TRACE: ::flatbuffers::VOffsetT = 36;
+            pub const VT_CHIPLET_TRACES: ::flatbuffers::VOffsetT = 38;
+            pub const VT_CONFIG: ::flatbuffers::VOffsetT = 40;
 
             #[inline]
             pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -4006,9 +4303,6 @@ pub mod hekate {
             ) -> ::flatbuffers::WIPOffset<ProgramBundle<'bldr>> {
                 let mut builder = ProgramBundleBuilder::new(_fbb);
                 builder.add_num_rows(args.num_rows);
-                if let Some(x) = args.fixed_columns {
-                    builder.add_fixed_columns(x);
-                }
                 if let Some(x) = args.config {
                     builder.add_config(x);
                 }
@@ -4030,17 +4324,20 @@ pub mod hekate {
                 if let Some(x) = args.chiplet_defs {
                     builder.add_chiplet_defs(x);
                 }
-                if let Some(x) = args.virtual_expander {
-                    builder.add_virtual_expander(x);
-                }
                 if let Some(x) = args.permutation_checks {
                     builder.add_permutation_checks(x);
+                }
+                if let Some(x) = args.fixed_columns {
+                    builder.add_fixed_columns(x);
                 }
                 if let Some(x) = args.boundary_constraints {
                     builder.add_boundary_constraints(x);
                 }
                 if let Some(x) = args.constraint_ast {
                     builder.add_constraint_ast(x);
+                }
+                if let Some(x) = args.virtual_expander {
+                    builder.add_virtual_expander(x);
                 }
                 if let Some(x) = args.virtual_column_layout {
                     builder.add_virtual_column_layout(x);
@@ -4050,6 +4347,9 @@ pub mod hekate {
                 }
                 builder.add_num_public_inputs(args.num_public_inputs);
                 builder.add_num_columns(args.num_columns);
+                if let Some(x) = args.name {
+                    builder.add_name(x);
+                }
                 builder.add_version(args.version);
                 builder.finish()
             }
@@ -4063,6 +4363,16 @@ pub mod hekate {
                     self._tab
                         .get::<u32>(ProgramBundle::VT_VERSION, Some(0))
                         .unwrap()
+                }
+            }
+            #[inline]
+            pub fn name(&self) -> Option<&'a str> {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<::flatbuffers::ForwardsUOffset<&str>>(ProgramBundle::VT_NAME, None)
                 }
             }
             #[inline]
@@ -4106,6 +4416,19 @@ pub mod hekate {
                 }
             }
             #[inline]
+            pub fn virtual_expander(&self) -> Option<VirtualExpander<'a>> {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab
+                        .get::<::flatbuffers::ForwardsUOffset<VirtualExpander>>(
+                            ProgramBundle::VT_VIRTUAL_EXPANDER,
+                            None,
+                        )
+                }
+            }
+            #[inline]
             pub fn constraint_ast(&self) -> Option<ConstraintAst<'a>> {
                 // Safety:
                 // Created from valid Table for this object
@@ -4137,6 +4460,20 @@ pub mod hekate {
                 }
             }
             #[inline]
+            pub fn fixed_columns(
+                &self,
+            ) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<FixedColumn<'a>>>>
+            {
+                // Safety:
+                // Created from valid Table for this object
+                // which contains a valid value in this slot
+                unsafe {
+                    self._tab.get::<::flatbuffers::ForwardsUOffset<
+                        ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<FixedColumn>>,
+                    >>(ProgramBundle::VT_FIXED_COLUMNS, None)
+                }
+            }
+            #[inline]
             pub fn permutation_checks(
                 &self,
             ) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<BusEndpoint<'a>>>>
@@ -4148,19 +4485,6 @@ pub mod hekate {
                     self._tab.get::<::flatbuffers::ForwardsUOffset<
                         ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<BusEndpoint>>,
                     >>(ProgramBundle::VT_PERMUTATION_CHECKS, None)
-                }
-            }
-            #[inline]
-            pub fn virtual_expander(&self) -> Option<VirtualExpander<'a>> {
-                // Safety:
-                // Created from valid Table for this object
-                // which contains a valid value in this slot
-                unsafe {
-                    self._tab
-                        .get::<::flatbuffers::ForwardsUOffset<VirtualExpander>>(
-                            ProgramBundle::VT_VIRTUAL_EXPANDER,
-                            None,
-                        )
                 }
             }
             #[inline]
@@ -4269,20 +4593,6 @@ pub mod hekate {
                     )
                 }
             }
-            #[inline]
-            pub fn fixed_columns(
-                &self,
-            ) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<FixedColumn<'a>>>>
-            {
-                // Safety:
-                // Created from valid Table for this object
-                // which contains a valid value in this slot
-                unsafe {
-                    self._tab.get::<::flatbuffers::ForwardsUOffset<
-                        ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<FixedColumn>>,
-                    >>(ProgramBundle::VT_FIXED_COLUMNS, None)
-                }
-            }
         }
 
         impl ::flatbuffers::Verifiable for ProgramBundle<'_> {
@@ -4293,14 +4603,16 @@ pub mod hekate {
             ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
                 v.visit_table(pos)?
      .visit_field::<u32>("version", Self::VT_VERSION, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("name", Self::VT_NAME, false)?
      .visit_field::<u32>("num_columns", Self::VT_NUM_COLUMNS, false)?
      .visit_field::<u32>("num_public_inputs", Self::VT_NUM_PUBLIC_INPUTS, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ColumnType>>>("column_layout", Self::VT_COLUMN_LAYOUT, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ColumnType>>>("virtual_column_layout", Self::VT_VIRTUAL_COLUMN_LAYOUT, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<VirtualExpander>>("virtual_expander", Self::VT_VIRTUAL_EXPANDER, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<ConstraintAst>>("constraint_ast", Self::VT_CONSTRAINT_AST, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<BoundaryConstraint>>>>("boundary_constraints", Self::VT_BOUNDARY_CONSTRAINTS, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<FixedColumn>>>>("fixed_columns", Self::VT_FIXED_COLUMNS, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<BusEndpoint>>>>("permutation_checks", Self::VT_PERMUTATION_CHECKS, false)?
-     .visit_field::<::flatbuffers::ForwardsUOffset<VirtualExpander>>("virtual_expander", Self::VT_VIRTUAL_EXPANDER, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<ChipletDef>>>>("chiplet_defs", Self::VT_CHIPLET_DEFS, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<ChipletDef>>>>("inline_chiplets", Self::VT_INLINE_CHIPLETS, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<InlineKernelHint>>>>("inline_chiplet_kernels", Self::VT_INLINE_CHIPLET_KERNELS, false)?
@@ -4309,19 +4621,20 @@ pub mod hekate {
      .visit_field::<::flatbuffers::ForwardsUOffset<ColumnTrace>>("main_trace", Self::VT_MAIN_TRACE, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<ColumnTrace>>>>("chiplet_traces", Self::VT_CHIPLET_TRACES, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<Config>>("config", Self::VT_CONFIG, false)?
-     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<FixedColumn>>>>("fixed_columns", Self::VT_FIXED_COLUMNS, false)?
      .finish();
                 Ok(())
             }
         }
         pub struct ProgramBundleArgs<'a> {
             pub version: u32,
+            pub name: Option<::flatbuffers::WIPOffset<&'a str>>,
             pub num_columns: u32,
             pub num_public_inputs: u32,
             pub column_layout:
                 Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ColumnType>>>,
             pub virtual_column_layout:
                 Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ColumnType>>>,
+            pub virtual_expander: Option<::flatbuffers::WIPOffset<VirtualExpander<'a>>>,
             pub constraint_ast: Option<::flatbuffers::WIPOffset<ConstraintAst<'a>>>,
             pub boundary_constraints: Option<
                 ::flatbuffers::WIPOffset<
@@ -4331,12 +4644,16 @@ pub mod hekate {
                     >,
                 >,
             >,
+            pub fixed_columns: Option<
+                ::flatbuffers::WIPOffset<
+                    ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<FixedColumn<'a>>>,
+                >,
+            >,
             pub permutation_checks: Option<
                 ::flatbuffers::WIPOffset<
                     ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<BusEndpoint<'a>>>,
                 >,
             >,
-            pub virtual_expander: Option<::flatbuffers::WIPOffset<VirtualExpander<'a>>>,
             pub chiplet_defs: Option<
                 ::flatbuffers::WIPOffset<
                     ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<ChipletDef<'a>>>,
@@ -4362,25 +4679,22 @@ pub mod hekate {
                 >,
             >,
             pub config: Option<::flatbuffers::WIPOffset<Config<'a>>>,
-            pub fixed_columns: Option<
-                ::flatbuffers::WIPOffset<
-                    ::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<FixedColumn<'a>>>,
-                >,
-            >,
         }
         impl<'a> Default for ProgramBundleArgs<'a> {
             #[inline]
             fn default() -> Self {
                 ProgramBundleArgs {
                     version: 0,
+                    name: None,
                     num_columns: 0,
                     num_public_inputs: 0,
                     column_layout: None,
                     virtual_column_layout: None,
+                    virtual_expander: None,
                     constraint_ast: None,
                     boundary_constraints: None,
+                    fixed_columns: None,
                     permutation_checks: None,
-                    virtual_expander: None,
                     chiplet_defs: None,
                     inline_chiplets: None,
                     inline_chiplet_kernels: None,
@@ -4389,7 +4703,6 @@ pub mod hekate {
                     main_trace: None,
                     chiplet_traces: None,
                     config: None,
-                    fixed_columns: None,
                 }
             }
         }
@@ -4403,6 +4716,11 @@ pub mod hekate {
             pub fn add_version(&mut self, version: u32) {
                 self.fbb_
                     .push_slot::<u32>(ProgramBundle::VT_VERSION, version, 0);
+            }
+            #[inline]
+            pub fn add_name(&mut self, name: ::flatbuffers::WIPOffset<&'b str>) {
+                self.fbb_
+                    .push_slot_always::<::flatbuffers::WIPOffset<_>>(ProgramBundle::VT_NAME, name);
             }
             #[inline]
             pub fn add_num_columns(&mut self, num_columns: u32) {
@@ -4440,6 +4758,17 @@ pub mod hekate {
                 );
             }
             #[inline]
+            pub fn add_virtual_expander(
+                &mut self,
+                virtual_expander: ::flatbuffers::WIPOffset<VirtualExpander<'b>>,
+            ) {
+                self.fbb_
+                    .push_slot_always::<::flatbuffers::WIPOffset<VirtualExpander>>(
+                        ProgramBundle::VT_VIRTUAL_EXPANDER,
+                        virtual_expander,
+                    );
+            }
+            #[inline]
             pub fn add_constraint_ast(
                 &mut self,
                 constraint_ast: ::flatbuffers::WIPOffset<ConstraintAst<'b>>,
@@ -4466,6 +4795,18 @@ pub mod hekate {
                 );
             }
             #[inline]
+            pub fn add_fixed_columns(
+                &mut self,
+                fixed_columns: ::flatbuffers::WIPOffset<
+                    ::flatbuffers::Vector<'b, ::flatbuffers::ForwardsUOffset<FixedColumn<'b>>>,
+                >,
+            ) {
+                self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(
+                    ProgramBundle::VT_FIXED_COLUMNS,
+                    fixed_columns,
+                );
+            }
+            #[inline]
             pub fn add_permutation_checks(
                 &mut self,
                 permutation_checks: ::flatbuffers::WIPOffset<
@@ -4476,17 +4817,6 @@ pub mod hekate {
                     ProgramBundle::VT_PERMUTATION_CHECKS,
                     permutation_checks,
                 );
-            }
-            #[inline]
-            pub fn add_virtual_expander(
-                &mut self,
-                virtual_expander: ::flatbuffers::WIPOffset<VirtualExpander<'b>>,
-            ) {
-                self.fbb_
-                    .push_slot_always::<::flatbuffers::WIPOffset<VirtualExpander>>(
-                        ProgramBundle::VT_VIRTUAL_EXPANDER,
-                        virtual_expander,
-                    );
             }
             #[inline]
             pub fn add_chiplet_defs(
@@ -4571,18 +4901,6 @@ pub mod hekate {
                     );
             }
             #[inline]
-            pub fn add_fixed_columns(
-                &mut self,
-                fixed_columns: ::flatbuffers::WIPOffset<
-                    ::flatbuffers::Vector<'b, ::flatbuffers::ForwardsUOffset<FixedColumn<'b>>>,
-                >,
-            ) {
-                self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(
-                    ProgramBundle::VT_FIXED_COLUMNS,
-                    fixed_columns,
-                );
-            }
-            #[inline]
             pub fn new(
                 _fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
             ) -> ProgramBundleBuilder<'a, 'b, A> {
@@ -4603,14 +4921,16 @@ pub mod hekate {
             fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
                 let mut ds = f.debug_struct("ProgramBundle");
                 ds.field("version", &self.version());
+                ds.field("name", &self.name());
                 ds.field("num_columns", &self.num_columns());
                 ds.field("num_public_inputs", &self.num_public_inputs());
                 ds.field("column_layout", &self.column_layout());
                 ds.field("virtual_column_layout", &self.virtual_column_layout());
+                ds.field("virtual_expander", &self.virtual_expander());
                 ds.field("constraint_ast", &self.constraint_ast());
                 ds.field("boundary_constraints", &self.boundary_constraints());
+                ds.field("fixed_columns", &self.fixed_columns());
                 ds.field("permutation_checks", &self.permutation_checks());
-                ds.field("virtual_expander", &self.virtual_expander());
                 ds.field("chiplet_defs", &self.chiplet_defs());
                 ds.field("inline_chiplets", &self.inline_chiplets());
                 ds.field("inline_chiplet_kernels", &self.inline_chiplet_kernels());
@@ -4619,7 +4939,6 @@ pub mod hekate {
                 ds.field("main_trace", &self.main_trace());
                 ds.field("chiplet_traces", &self.chiplet_traces());
                 ds.field("config", &self.config());
-                ds.field("fixed_columns", &self.fixed_columns());
                 ds.finish()
             }
         }

@@ -9,12 +9,10 @@
 //! The prover runs an independent ZeroCheck per chiplet.
 //! The bus (GPA) reconnects chiplets to the main trace.
 
-use crate::constraint::{
-    BoundaryConstraint, BoundaryTarget, ConstraintAst, ConstraintExpr, ExprId,
-};
+use crate::constraint::{BoundaryConstraint, BoundaryTarget, ConstraintAst};
 use crate::expander::VirtualExpander;
-use crate::permutation::PermutationCheckSpec;
-use crate::{Air, FixedColumn, ProgramCell, validate_fixed_columns};
+use crate::permutation::{PermutationCheckSpec, validate_fixed_selectors};
+use crate::{Air, FixedColumn, validate_fixed_columns};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -24,6 +22,7 @@ use hekate_core::trace::{ColumnTrace, ColumnType, Trace, TraceCompatibleField};
 use hekate_math::{Flat, HardwareField, PackableField, TowerField};
 
 /// Pre-computed chiplet AIR definition.
+#[derive(Clone)]
 pub struct ChipletDef<F: TowerField> {
     name: String,
     num_columns: usize,
@@ -53,7 +52,7 @@ impl<F: TowerField> ChipletDef<F> {
         let boundary_constraints = p.boundary_constraints();
         let fixed_columns = p.fixed_columns();
 
-        validate_paired_bus_mutex(&permutation_checks, &constraint_ast)?;
+        validate_fixed_selectors(&permutation_checks, &fixed_columns)?;
         validate_chiplet_boundaries(&boundary_constraints, p.num_columns())?;
         validate_fixed_columns(&fixed_columns, p.virtual_column_layout(), None)?;
         validate_expander_coverage(p.virtual_expander(), p.column_layout())?;
@@ -70,6 +69,19 @@ impl<F: TowerField> ChipletDef<F> {
             expander: p.virtual_expander().cloned(),
             permutation_checks,
         })
+    }
+
+    /// Borrowed views of what the `Air` getters clone.
+    pub fn ast(&self) -> &ConstraintAst<F> {
+        &self.constraint_ast
+    }
+
+    pub fn boundaries(&self) -> &[BoundaryConstraint<F>] {
+        &self.boundary_constraints
+    }
+
+    pub fn pins(&self) -> &[FixedColumn<F>] {
+        &self.fixed_columns
     }
 
     /// Prefixes internal bus_ids with a namespace.
@@ -119,7 +131,7 @@ impl<F: TowerField> ChipletDef<F> {
             spec.validate_clock_stitching(bus_id)?;
         }
 
-        validate_paired_bus_mutex(&permutation_checks, &constraint_ast)?;
+        validate_fixed_selectors(&permutation_checks, &fixed_columns)?;
         validate_chiplet_boundaries(&boundary_constraints, num_columns)?;
 
         let virt_layout = match &expander {
@@ -130,7 +142,7 @@ impl<F: TowerField> ChipletDef<F> {
         validate_fixed_columns(&fixed_columns, virt_layout, None)?;
         validate_column_count(num_columns, virt_layout.len())?;
 
-        Ok(Self {
+        Ok(Self::from_parts(
             name,
             num_columns,
             constraint_ast,
@@ -140,22 +152,33 @@ impl<F: TowerField> ChipletDef<F> {
             fixed_columns,
             expander,
             permutation_checks,
-        })
+        ))
     }
-}
 
-impl<F: TowerField> Clone for ChipletDef<F> {
-    fn clone(&self) -> Self {
+    /// Main-table construction path; callers own
+    /// validation (chiplet boundary rules do not apply).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
+        name: String,
+        num_columns: usize,
+        constraint_ast: ConstraintAst<F>,
+        column_layout: Vec<ColumnType>,
+        virtual_column_layout: Vec<ColumnType>,
+        boundary_constraints: Vec<BoundaryConstraint<F>>,
+        fixed_columns: Vec<FixedColumn<F>>,
+        expander: Option<VirtualExpander>,
+        permutation_checks: Vec<(String, PermutationCheckSpec)>,
+    ) -> Self {
         Self {
-            name: self.name.clone(),
-            num_columns: self.num_columns,
-            constraint_ast: self.constraint_ast.clone(),
-            column_layout: self.column_layout.clone(),
-            virtual_column_layout: self.virtual_column_layout.clone(),
-            boundary_constraints: self.boundary_constraints.clone(),
-            fixed_columns: self.fixed_columns.clone(),
-            expander: self.expander.clone(),
-            permutation_checks: self.permutation_checks.clone(),
+            name,
+            num_columns,
+            constraint_ast,
+            column_layout,
+            virtual_column_layout,
+            boundary_constraints,
+            fixed_columns,
+            expander,
+            permutation_checks,
         }
     }
 }
@@ -467,51 +490,6 @@ pub fn compose_external_buses<F: TraceCompatibleField>(
     buses
 }
 
-/// Without the mutex root, both selectors high collapse
-/// the bus numerator to zero in char-2; without the
-/// boolean roots, the mutex admits non-zero field-element
-/// selectors that bypass binary on/off semantics.
-pub fn validate_paired_bus_mutex<F: TowerField>(
-    specs: &[(String, PermutationCheckSpec)],
-    ast: &ConstraintAst<F>,
-) -> errors::Result<()> {
-    for (_bus_id, spec) in specs {
-        let (s_send, s_recv) = match (spec.selector, spec.recv_selector) {
-            (Some(send), Some(recv)) => (send, recv),
-            (None, Some(_)) => {
-                return Err(errors::Error::Protocol {
-                    protocol: "logup_bus",
-                    message: "paired bus has recv_selector without send selector",
-                });
-            }
-            _ => continue,
-        };
-
-        if !ast_contains_mutex_root(ast, s_send, s_recv) {
-            return Err(errors::Error::Protocol {
-                protocol: "logup_bus",
-                message: "paired bus requires `s_send · s_recv = 0` mutex root in the AST",
-            });
-        }
-
-        if !ast_contains_boolean_root(ast, s_send) {
-            return Err(errors::Error::Protocol {
-                protocol: "logup_bus",
-                message: "paired bus requires boolean-assertion root for s_send",
-            });
-        }
-
-        if !ast_contains_boolean_root(ast, s_recv) {
-            return Err(errors::Error::Protocol {
-                protocol: "logup_bus",
-                message: "paired bus requires boolean-assertion root for s_recv",
-            });
-        }
-    }
-
-    Ok(())
-}
-
 /// Chiplets carry no `public_inputs`; a `PublicInput`
 /// boundary target is unsatisfiable; reject it at
 /// snapshot time. Also rejects out-of-range `col_idx`.
@@ -570,112 +548,13 @@ fn validate_column_count(num_columns: usize, virtual_columns: usize) -> errors::
     Ok(())
 }
 
-/// Non-paired `Bit` selectors with no direct `s·s + s` boolean root,
-/// each tagged with the declaring `bus_id`. Advisory only:
-/// booleanness can hold indirectly (one-hot, disjoint products),
-/// callers warn rather than reject.
-pub fn unconstrained_bit_selectors<'a, F: TowerField>(
-    specs: &'a [(String, PermutationCheckSpec)],
-    ast: &ConstraintAst<F>,
-    virtual_layout: &[ColumnType],
-) -> Vec<(usize, &'a str)> {
-    let mut flagged: Vec<(usize, &str)> = Vec::new();
-    for (bus_id, spec) in specs {
-        if spec.recv_selector.is_some() {
-            continue;
-        }
-
-        let Some(sel) = spec.selector else {
-            continue;
-        };
-
-        if virtual_layout.get(sel) != Some(&ColumnType::Bit) {
-            continue;
-        }
-
-        if !ast_contains_boolean_root(ast, sel) && !flagged.iter().any(|(s, _)| *s == sel) {
-            flagged.push((sel, bus_id.as_str()));
-        }
-    }
-
-    flagged
-}
-
-fn ast_contains_mutex_root<F: TowerField>(
-    ast: &ConstraintAst<F>,
-    s_send: usize,
-    s_recv: usize,
-) -> bool {
-    ast.roots
-        .iter()
-        .any(|root| is_mutex_product(ast, *root, s_send, s_recv))
-}
-
-fn ast_contains_boolean_root<F: TowerField>(ast: &ConstraintAst<F>, col: usize) -> bool {
-    ast.roots
-        .iter()
-        .any(|root| is_boolean_assertion(ast, *root, col))
-}
-
-fn is_boolean_assertion<F: TowerField>(ast: &ConstraintAst<F>, id: ExprId, col: usize) -> bool {
-    let ConstraintExpr::Add(a, b) = ast.arena.get(id) else {
-        return false;
-    };
-
-    matches_boolean_pair(ast, *a, *b, col) || matches_boolean_pair(ast, *b, *a, col)
-}
-
-fn matches_boolean_pair<F: TowerField>(
-    ast: &ConstraintAst<F>,
-    sq_id: ExprId,
-    cell_id: ExprId,
-    col: usize,
-) -> bool {
-    let ConstraintExpr::Mul(x, y) = ast.arena.get(sq_id) else {
-        return false;
-    };
-
-    current_col_idx(ast, *x) == Some(col)
-        && current_col_idx(ast, *y) == Some(col)
-        && current_col_idx(ast, cell_id) == Some(col)
-}
-
-fn is_mutex_product<F: TowerField>(
-    ast: &ConstraintAst<F>,
-    id: ExprId,
-    s_send: usize,
-    s_recv: usize,
-) -> bool {
-    let ConstraintExpr::Mul(a, b) = ast.arena.get(id) else {
-        return false;
-    };
-
-    let lhs = current_col_idx(ast, *a);
-    let rhs = current_col_idx(ast, *b);
-
-    matches!(
-        (lhs, rhs),
-        (Some(x), Some(y)) if (x == s_send && y == s_recv) || (x == s_recv && y == s_send)
-    )
-}
-
-fn current_col_idx<F: TowerField>(ast: &ConstraintAst<F>, id: ExprId) -> Option<usize> {
-    match ast.arena.get(id) {
-        ConstraintExpr::Cell(ProgramCell {
-            col_idx,
-            next_row: false,
-        }) => Some(*col_idx),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ConstraintAst;
     use crate::constraint::builder::ConstraintSystem;
     use crate::define_columns;
     use crate::permutation::{BusKind, ChallengeLabel, PermutationCheckSpec, Source};
+    use crate::{ConstraintAst, FixedShape};
     use alloc::string::String;
     use alloc::vec;
     use hekate_core::trace::ColumnType;
@@ -732,6 +611,10 @@ mod tests {
             vec![("test_bus".into(), self.spec.clone())]
         }
 
+        fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+            liveness_pin(1)
+        }
+
         fn constraint_ast(&self) -> ConstraintAst<F> {
             ConstraintSystem::<F>::new().build()
         }
@@ -739,7 +622,7 @@ mod tests {
 
     #[derive(Clone)]
     struct PairedAir {
-        with_mutex: bool,
+        pinned: bool,
     }
 
     impl Air<F> for PairedAir {
@@ -769,62 +652,18 @@ mod tests {
             )]
         }
 
-        fn constraint_ast(&self) -> ConstraintAst<F> {
-            let cs = ConstraintSystem::<F>::new();
-
-            cs.assert_boolean(cs.col(PairedAirCols::S_SEND));
-            cs.assert_boolean(cs.col(PairedAirCols::S_RECV));
-
-            if self.with_mutex {
-                cs.constrain_named(
-                    "paired_bus_mutex",
-                    cs.col(PairedAirCols::S_SEND) * cs.col(PairedAirCols::S_RECV),
-                );
+        fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+            match self.pinned {
+                true => vec![
+                    FixedColumn::sparse(PairedAirCols::S_SEND, vec![(0, F::ONE)]),
+                    FixedColumn::sparse(PairedAirCols::S_RECV, vec![(1, F::ONE)]),
+                ],
+                false => Vec::new(),
             }
-
-            cs.build()
-        }
-    }
-
-    #[derive(Clone)]
-    struct PairedNoBoolAir;
-
-    impl Air<F> for PairedNoBoolAir {
-        fn num_columns(&self) -> usize {
-            PairedAirCols::NUM_COLUMNS
-        }
-
-        fn column_layout(&self) -> &[ColumnType] {
-            static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-            LAYOUT.get_or_init(PairedAirCols::build_layout)
-        }
-
-        fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-            let sources = vec![
-                (Source::Column(PairedAirCols::KEY), b"k_a" as ChallengeLabel),
-                (Source::RowIndexLeBytes(4), b"k_clk" as ChallengeLabel),
-            ];
-
-            vec![(
-                "paired_test_bus".into(),
-                PermutationCheckSpec::new_paired(
-                    sources,
-                    PairedAirCols::S_SEND,
-                    PairedAirCols::S_RECV,
-                    BusKind::Permutation,
-                ),
-            )]
         }
 
         fn constraint_ast(&self) -> ConstraintAst<F> {
-            let cs = ConstraintSystem::<F>::new();
-
-            cs.constrain_named(
-                "paired_bus_mutex",
-                cs.col(PairedAirCols::S_SEND) * cs.col(PairedAirCols::S_RECV),
-            );
-
-            cs.build()
+            ConstraintSystem::<F>::new().build()
         }
     }
 
@@ -851,6 +690,10 @@ mod tests {
             Ok(_) => panic!("expected Err(Protocol {{ protocol: \"logup_bus\", .. }})"),
             Err(other) => panic!("expected Err(Protocol), got {:?}", other),
         }
+    }
+
+    fn liveness_pin(col: usize) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::sparse(col, vec![(0, F::ONE)])]
     }
 
     #[test]
@@ -911,58 +754,14 @@ mod tests {
     }
 
     #[test]
-    fn paired_bus_emits_mutex_and_boolean_assertions() {
-        let cs = ConstraintSystem::<F>::new();
-
-        cs.assert_paired_bus_mutex(PairedAirCols::S_SEND, PairedAirCols::S_RECV);
-
-        let ast = cs.build();
-
-        let labels: Vec<_> = ast.labels.iter().filter_map(|l| *l).collect();
-
-        assert_eq!(
-            labels.iter().filter(|l| **l == "boolean").count(),
-            2,
-            "gadget must emit two boolean assertions"
-        );
-        assert_eq!(
-            labels.iter().filter(|l| **l == "paired_bus_mutex").count(),
-            1,
-            "gadget must emit exactly one mutex root"
-        );
+    fn chiplet_def_rejects_paired_spec_with_witness_selectors() {
+        assert_logup_bus_err(ChipletDef::<F>::from_air(&PairedAir { pinned: false }));
     }
 
     #[test]
-    fn paired_bus_shares_cell_nodes() {
-        let cs = ConstraintSystem::<F>::new();
-
-        let send_first = cs.col(PairedAirCols::S_SEND);
-        let recv_first = cs.col(PairedAirCols::S_RECV);
-
-        cs.assert_paired_bus_mutex(PairedAirCols::S_SEND, PairedAirCols::S_RECV);
-
-        let send_again = cs.col(PairedAirCols::S_SEND);
-        let recv_again = cs.col(PairedAirCols::S_RECV);
-
-        assert_eq!(send_first.id, send_again.id, "S_SEND must dedup");
-        assert_eq!(recv_first.id, recv_again.id, "S_RECV must dedup");
-    }
-
-    #[test]
-    fn chiplet_def_rejects_paired_spec_without_mutex() {
-        let bad = PairedAir { with_mutex: false };
-        assert_logup_bus_err(ChipletDef::<F>::from_air(&bad));
-    }
-
-    #[test]
-    fn chiplet_def_accepts_paired_spec_with_mutex() {
-        let good = PairedAir { with_mutex: true };
-        ChipletDef::<F>::from_air(&good).expect("paired AIR with mutex must snapshot");
-    }
-
-    #[test]
-    fn chiplet_def_rejects_paired_spec_without_boolean_roots() {
-        assert_logup_bus_err(ChipletDef::<F>::from_air(&PairedNoBoolAir));
+    fn chiplet_def_accepts_paired_spec_with_fixed_selectors() {
+        ChipletDef::<F>::from_air(&PairedAir { pinned: true })
+            .expect("paired AIR with fixed selectors must snapshot");
     }
 
     #[test]
@@ -1000,42 +799,45 @@ mod tests {
             clock_waiver: None,
         };
 
-        let ast = ConstraintSystem::<F>::new().build();
-
-        assert_logup_bus_err(validate_paired_bus_mutex(
+        assert_logup_bus_err(validate_fixed_selectors::<F>(
             &[("asym_bus".into(), spec)],
-            &ast,
+            &liveness_pin(PairedAirCols::S_RECV),
         ));
     }
 
     #[test]
-    fn flags_bit_selector_without_boolean_root() {
-        let ast = ConstraintSystem::<F>::new().build();
-        let layout = vec![ColumnType::B32, ColumnType::Bit];
-        let specs = vec![(
-            String::from("bus"),
-            PermutationCheckSpec::new(vec![(Source::Column(0), b"k" as ChallengeLabel)], Some(1)),
-        )];
-
-        assert_eq!(
-            unconstrained_bit_selectors(&specs, &ast, &layout),
-            vec![(1, "bus")]
-        );
+    fn def_rejects_witness_selector() {
+        let spec = PermutationCheckSpec::new(key_with_clock(), Some(0));
+        assert_logup_bus_err(snapshot(spec));
     }
 
     #[test]
-    fn boolean_root_clears_bit_selector() {
-        let cs = ConstraintSystem::<F>::new();
-        let sel = cs.col(1);
-        cs.assert_boolean(sel);
-        let ast = cs.build();
+    fn def_accepts_absent_selector() {
+        let spec = PermutationCheckSpec::new(key_with_clock(), None);
+        snapshot(spec).expect("selector-free bus must accept");
+    }
 
-        let layout = vec![ColumnType::B32, ColumnType::Bit];
-        let specs = vec![(
-            String::from("bus"),
-            PermutationCheckSpec::new(vec![(Source::Column(0), b"k" as ChallengeLabel)], Some(1)),
-        )];
+    #[test]
+    fn validator_rejects_selector_pinned_to_substituted_shape() {
+        let spec = PermutationCheckSpec::new(key_with_clock(), Some(1));
 
-        assert!(unconstrained_bit_selectors(&specs, &ast, &layout).is_empty());
+        for shape in [
+            FixedShape::FirstRow,
+            FixedShape::LastRow,
+            FixedShape::Custom(vec![true, false]),
+        ] {
+            assert_logup_bus_err(validate_fixed_selectors(
+                &[("svc".into(), spec.clone())],
+                &[FixedColumn::<F> { col_idx: 1, shape }],
+            ));
+        }
+    }
+
+    #[test]
+    fn validator_accepts_selector_pinned_to_overlay_shape() {
+        let spec = PermutationCheckSpec::new(key_with_clock(), Some(1));
+
+        validate_fixed_selectors(&[("svc".into(), spec)], &liveness_pin(1))
+            .expect("overlay-pinned selector must accept");
     }
 }

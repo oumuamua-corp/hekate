@@ -193,16 +193,26 @@ impl<F: TowerField> ConstraintSystem<F> {
         self.constrain_named("one_hot", s + one);
     }
 
-    /// Emit the `s_send · s_recv = 0` mutex root
-    /// plus boolean checks on both selectors.
-    pub fn assert_paired_bus_mutex(&self, s_send: usize, s_recv: usize) {
-        let send = self.col(s_send);
-        let recv = self.col(s_recv);
+    /// Roots registered so far.
+    pub fn num_roots(&self) -> usize {
+        self.inner.borrow().roots.len()
+    }
 
-        self.assert_boolean(send);
-        self.assert_boolean(recv);
+    /// Append another AST's nodes and roots,
+    /// preserving this builder's root order.
+    pub fn merge_ast(&self, other: ConstraintAst<F>) {
+        let mut inner = self.inner.borrow_mut();
+        let mut ast = ConstraintAst {
+            arena: core::mem::take(&mut inner.arena),
+            roots: core::mem::take(&mut inner.roots),
+            labels: core::mem::take(&mut inner.labels),
+        };
 
-        self.constrain_named("paired_bus_mutex", send * recv);
+        ast.merge(other);
+
+        inner.arena = ast.arena;
+        inner.roots = ast.roots;
+        inner.labels = ast.labels;
     }
 
     // ===========================================================

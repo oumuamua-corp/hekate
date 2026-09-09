@@ -5,10 +5,10 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use hekate::core::trace::{ColumnTrace, ColumnType, TraceColumn};
+use hekate::core::trace::{ColumnTrace, TraceColumn};
 use hekate::crypto::DefaultHasher;
 use hekate::crypto::transcript::Transcript;
-use hekate::math::{Block32, Block128, HardwareField};
+use hekate::math::{Block32, Block128, HardwareField, TowerField};
 use hekate_core::config::Config;
 use hekate_core::errors;
 use hekate_gadgets::{
@@ -16,10 +16,8 @@ use hekate_gadgets::{
     generate_arithmetic_trace,
 };
 use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
-use hekate_program::expander::VirtualExpander;
-use hekate_program::{Air, InlineKernelHint, Program, ProgramInstance, ProgramWitness};
+use hekate_program::circuit::{Circuit, CircuitProgram};
+use hekate_program::{FixedShape, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 use rand::{TryRngCore, rngs::OsRng};
@@ -44,78 +42,35 @@ type H = DefaultHasher;
 const PHY_VAL_A: usize = 0;
 const PHY_VAL_B: usize = 1;
 
-#[derive(Clone)]
-struct FibChipletProgram {
-    num_rows: usize,
-    chiplet: IntArithmeticChiplet,
-}
+fn build_program(num_rows: usize) -> errors::Result<CircuitProgram<F>> {
+    let chiplet = IntArithmeticChiplet::new(32, num_rows, num_rows - 1)?;
+    let layout = chiplet.layout().clone();
 
-impl FibChipletProgram {
-    fn new(num_rows: usize) -> Self {
-        let chiplet =
-            IntArithmeticChiplet::new(32, num_rows).expect("ArithmeticChiplet::new(32, num_rows)");
-        Self { num_rows, chiplet }
-    }
-}
+    let mut cx = Circuit::<F>::new("FibonacciInt", num_rows)?;
 
-impl Air<F> for FibChipletProgram {
-    fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
-        vec![BoundaryConstraint::with_public_input(
-            self.chiplet.layout().val_b,
-            self.num_rows - 1,
-            0,
-        )]
-    }
+    let arith = cx.mount_unlinked(ChipletDef::from_air(&chiplet)?);
 
-    fn column_layout(&self) -> &[ColumnType] {
-        <IntArithmeticChiplet as Air<F>>::column_layout(&self.chiplet)
-    }
+    let cs = cx.cs();
 
-    fn virtual_expander(&self) -> Option<&VirtualExpander> {
-        <IntArithmeticChiplet as Air<F>>::virtual_expander(&self.chiplet)
-    }
+    let s_add = cs.col(layout.s_add);
+    let val_b = cs.col(layout.val_b);
+    let val_res = cs.col(layout.val_res);
+    let next_val_a = cs.next(layout.val_a);
+    let next_val_b = cs.next(layout.val_b);
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let mut ast = <IntArithmeticChiplet as Air<F>>::constraint_ast(&self.chiplet);
+    cs.constrain(s_add * (next_val_a + val_b));
+    cs.constrain(s_add * (next_val_b + val_res));
 
-        let layout = self.chiplet.layout();
-        let cs = ConstraintSystem::<F>::new();
+    cs.assert_zero_when(cs.one() + s_add, val_res);
 
-        let s_add = cs.col(layout.s_add);
-        let val_b = cs.col(layout.val_b);
-        let val_res = cs.col(layout.val_res);
-        let next_val_a = cs.next(layout.val_a);
-        let next_val_b = cs.next(layout.val_b);
+    cx.boundary(arith.col(layout.val_a), 0, F::ZERO);
+    cx.boundary(arith.col(layout.val_b), 0, F::ONE);
 
-        cs.constrain(s_add * (next_val_a + val_b));
-        cs.constrain(s_add * (next_val_b + val_res));
+    cx.fix(arith.col(layout.s_add), FixedShape::LastRow);
 
-        cs.assert_zero_when(cs.one() + s_add, val_res);
+    cx.publish(arith.col(layout.val_b), num_rows - 1);
 
-        let fib_ast = cs.build();
-
-        ast.merge(fib_ast);
-
-        ast
-    }
-
-    fn inline_chiplets(&self) -> errors::Result<Vec<ChipletDef<F>>> {
-        Ok(vec![ChipletDef::from_air(&self.chiplet)?])
-    }
-
-    fn inline_chiplet_kernels(&self) -> Vec<InlineKernelHint> {
-        vec![InlineKernelHint {
-            chiplet_idx: 0,
-            root_offset: 0,
-            column_offset: 0,
-        }]
-    }
-}
-
-impl Program<F> for FibChipletProgram {
-    fn num_public_inputs(&self) -> usize {
-        1
-    }
+    cx.compile()
 }
 
 // =================================================================
@@ -198,7 +153,7 @@ fn main() {
 
     let instance = ProgramInstance::new(num_rows, vec![F::from(final_b as u128)]);
     let witness = ProgramWitness::new(trace);
-    let program = FibChipletProgram::new(num_rows);
+    let program = build_program(num_rows).expect("program build");
 
     let proof = common::phase("Proving", || {
         prove(
@@ -217,8 +172,11 @@ fn main() {
 
     let mut verifier_transcript = Transcript::<H>::new(b"FibonacciIntChiplet");
 
+    let pinned_id = common::audited_id::<F, _>(&program);
+
     let is_valid = common::phase_with_mem("Verifying", || {
         HekateVerifier::<F, H>::verify(
+            &pinned_id,
             &program,
             &instance,
             &proof,

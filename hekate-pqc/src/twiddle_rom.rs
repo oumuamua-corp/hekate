@@ -24,18 +24,18 @@
 //! The twiddle table has 1024 entries
 //! (8 layers × 128 butterflies per layer).
 
-use super::ntt::NttChiplet;
+use super::ntt::{NttChiplet, NttSchedule};
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use hekate_core::trace::{ColumnTrace, ColumnType, TraceBuilder};
 use hekate_math::{Bit, Block32, TowerField};
-use hekate_program::Air;
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
 use hekate_program::define_columns;
-use hekate_program::permutation::{PermutationCheckSpec, REQUEST_IDX_LABEL, Source};
+use hekate_program::permutation::{BusKind, PermutationCheckSpec, Service, ServiceSlot};
+use hekate_program::{Air, FixedColumn};
 
 // Sentinel layer for basemul MulOnly entries;
 // must exceed any real NTT layer (0..=7)
@@ -72,57 +72,80 @@ define_columns! {
 pub struct TwiddleRomChiplet {
     pub modulus: u32,
     pub num_rows: usize,
+
+    schedule: NttSchedule,
 }
 
 impl TwiddleRomChiplet {
-    pub fn new(modulus: u32, num_rows: usize) -> Self {
+    pub fn new(modulus: u32, num_rows: usize, schedule: NttSchedule) -> Self {
         assert!(num_rows.is_power_of_two());
-        Self { modulus, num_rows }
+        assert!(
+            schedule.total_rows() <= num_rows,
+            "NTT schedule exceeds num_rows"
+        );
+
+        Self {
+            modulus,
+            num_rows,
+            schedule,
+        }
+    }
+
+    /// Both endpoints derive from this schema.
+    pub fn service() -> Service {
+        Service {
+            bus_id: NttChiplet::TWIDDLE_BUS_ID,
+            kind: BusKind::Lookup,
+            slots: vec![
+                ServiceSlot::Value(b"kappa_tw_layer"),
+                ServiceSlot::Value(b"kappa_tw_bfly"),
+                ServiceSlot::Value(b"kappa_tw_w"),
+            ],
+            clock_waiver: None,
+        }
+    }
+
+    /// Both endpoints derive from this schema.
+    pub fn w_binding_service() -> Service {
+        Service {
+            bus_id: TWIDDLE_W_BINDING_BUS_ID,
+            kind: BusKind::Permutation,
+            slots: vec![
+                ServiceSlot::Value(b"kappa_wb_bfly"),
+                ServiceSlot::Value(b"kappa_wb_w"),
+                ServiceSlot::RequestIdx { num_bytes: 4 },
+            ],
+            clock_waiver: None,
+        }
     }
 
     /// Linking specification matching
     /// NTT chiplet's `ntt_twiddle` bus.
     pub fn linking_spec() -> PermutationCheckSpec {
-        PermutationCheckSpec::new_lookup(
-            vec![
-                (
-                    Source::Column(TwiddleRomColumns::LAYER),
-                    b"kappa_tw_layer" as &[u8],
-                ),
-                (
-                    Source::Column(TwiddleRomColumns::BUTTERFLY_IDX),
-                    b"kappa_tw_bfly" as &[u8],
-                ),
-                (
-                    Source::Column(TwiddleRomColumns::W_VALUE),
-                    b"kappa_tw_w" as &[u8],
-                ),
-            ],
-            Some(TwiddleRomColumns::SELECTOR),
-        )
+        Self::service()
+            .respond(
+                &[
+                    TwiddleRomColumns::LAYER,
+                    TwiddleRomColumns::BUTTERFLY_IDX,
+                    TwiddleRomColumns::W_VALUE,
+                ],
+                &[],
+                TwiddleRomColumns::SELECTOR,
+            )
+            .expect("service slots match the responder columns")
     }
 
     /// W-side binding bus:
     /// MulOnly entries matched
     /// against ctrl w-side RAM reads.
     pub fn w_binding_linking_spec() -> PermutationCheckSpec {
-        PermutationCheckSpec::new(
-            vec![
-                (
-                    Source::Column(TwiddleRomColumns::BUTTERFLY_IDX),
-                    b"kappa_wb_bfly" as &[u8],
-                ),
-                (
-                    Source::Column(TwiddleRomColumns::W_VALUE),
-                    b"kappa_wb_w" as &[u8],
-                ),
-                (
-                    Source::Column(TwiddleRomColumns::REQUEST_IDX_TR),
-                    REQUEST_IDX_LABEL,
-                ),
-            ],
-            Some(TwiddleRomColumns::MULONLY_SELECTOR),
-        )
+        Self::w_binding_service()
+            .respond(
+                &[TwiddleRomColumns::BUTTERFLY_IDX, TwiddleRomColumns::W_VALUE],
+                &[TwiddleRomColumns::REQUEST_IDX_TR],
+                TwiddleRomColumns::MULONLY_SELECTOR,
+            )
+            .expect("service slots match the responder columns")
     }
 }
 
@@ -148,6 +171,23 @@ impl<F: TowerField> Air<F> for TwiddleRomChiplet {
                 TWIDDLE_W_BINDING_BUS_ID.into(),
                 Self::w_binding_linking_spec(),
             ),
+        ]
+    }
+
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        if self.schedule.is_empty() {
+            return Vec::new();
+        }
+
+        vec![
+            FixedColumn {
+                col_idx: TwiddleRomColumns::SELECTOR,
+                shape: self.schedule.active_shape(),
+            },
+            FixedColumn {
+                col_idx: TwiddleRomColumns::MULONLY_SELECTOR,
+                shape: self.schedule.mulonly_shape(),
+            },
         ]
     }
 
@@ -396,7 +436,7 @@ mod tests {
         // The challenge labels in
         // TwiddleRomChiplet::linking_spec must
         // match NttChiplet::twiddle_linking_spec.
-        let ntt = NttChiplet::new(3329, 1024);
+        let ntt = NttChiplet::new(3329, 1024, NttSchedule::empty());
         let ntt_spec = ntt.twiddle_linking_spec();
         let rom_spec = TwiddleRomChiplet::linking_spec();
 

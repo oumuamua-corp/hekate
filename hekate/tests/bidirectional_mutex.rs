@@ -10,10 +10,13 @@ use hekate::math::{Bit, Block32, Block128, TowerField};
 use hekate_program::chiplet::ChipletDef;
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
+use hekate_program::digest::program_id;
 use hekate_program::permutation::{
     BusKind, ChallengeLabel, PermutationCheckSpec, REQUEST_IDX_LABEL, Source,
 };
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness, define_columns};
+use hekate_program::{
+    Air, FixedColumn, FixedShape, Program, ProgramInstance, ProgramWitness, define_columns,
+};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 use std::sync::Arc;
@@ -42,7 +45,7 @@ define_columns! {
 #[derive(Clone)]
 struct PairedCpu {
     kind: BusKind,
-    with_mutex: bool,
+    pinned: bool,
 }
 
 impl Air<F> for PairedCpu {
@@ -72,20 +75,21 @@ impl Air<F> for PairedCpu {
         )]
     }
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-
-        cs.assert_boolean(cs.col(PairedCpuCols::S_SEND));
-        cs.assert_boolean(cs.col(PairedCpuCols::S_RECV));
-
-        if self.with_mutex {
-            cs.constrain_named(
-                "paired_bus_mutex",
-                cs.col(PairedCpuCols::S_SEND) * cs.col(PairedCpuCols::S_RECV),
-            );
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        match self.pinned {
+            true => vec![
+                FixedColumn::sparse(PairedCpuCols::S_SEND, vec![(0, F::ONE)]),
+                FixedColumn {
+                    col_idx: PairedCpuCols::S_RECV,
+                    shape: FixedShape::Sparse(Vec::new()),
+                },
+            ],
+            false => Vec::new(),
         }
+    }
 
-        cs.build()
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        ConstraintSystem::<F>::new().build()
     }
 }
 
@@ -118,11 +122,12 @@ impl Air<F> for PartnerChiplet {
         vec![(BUS_ID.into(), spec)]
     }
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(PartnerCols::SEL));
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::sparse(PartnerCols::SEL, vec![(0, F::ONE)])]
+    }
 
-        cs.build()
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        ConstraintSystem::<F>::new().build()
     }
 }
 
@@ -143,6 +148,10 @@ impl Air<F> for ForgeryHost {
 
     fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
         self.cpu.permutation_checks()
+    }
+
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        self.cpu.fixed_columns()
     }
 
     fn constraint_ast(&self) -> ConstraintAst<F> {
@@ -219,8 +228,17 @@ fn run(
     };
 
     let mut verifier_t = Transcript::<H>::new(b"BIDIR_FORGERY");
-    HekateVerifier::<F, H>::verify(program, &instance, &proof, &mut verifier_t, &config)
-        .unwrap_or(false)
+    let pinned_id = program_id(program).unwrap();
+
+    HekateVerifier::<F, H>::verify(
+        &pinned_id,
+        program,
+        &instance,
+        &proof,
+        &mut verifier_t,
+        &config,
+    )
+    .unwrap_or(false)
 }
 
 #[test]
@@ -228,7 +246,7 @@ fn paired_bus_disjoint_selectors_honest_accepts() {
     let program = ForgeryHost {
         cpu: PairedCpu {
             kind: BusKind::Permutation,
-            with_mutex: true,
+            pinned: true,
         },
         partner: PartnerChiplet {
             kind: BusKind::Permutation,
@@ -251,7 +269,7 @@ fn paired_bus_disjoint_selectors_honest_accepts() {
 
     assert!(
         run(&program, &cpu_rows, &partner_rows),
-        "honest disjoint selectors with mutex constraint must verify"
+        "honest disjoint fixed selectors must verify"
     );
 }
 
@@ -260,7 +278,7 @@ fn exploit_paired_bus_both_selectors_high_permutation() {
     let program = ForgeryHost {
         cpu: PairedCpu {
             kind: BusKind::Permutation,
-            with_mutex: false,
+            pinned: true,
         },
         partner: PartnerChiplet {
             kind: BusKind::Permutation,
@@ -292,7 +310,7 @@ fn exploit_paired_bus_both_selectors_high_lookup() {
     let program = ForgeryHost {
         cpu: PairedCpu {
             kind: BusKind::Lookup,
-            with_mutex: false,
+            pinned: true,
         },
         partner: PartnerChiplet {
             kind: BusKind::Lookup,
@@ -320,50 +338,15 @@ fn exploit_paired_bus_both_selectors_high_lookup() {
 }
 
 #[test]
-fn exploit_paired_bus_missing_mutex_constraint() {
-    #[derive(Clone)]
-    struct PairedNoMutexChiplet;
+fn exploit_paired_bus_witness_selectors() {
+    let unpinned = PairedCpu {
+        kind: BusKind::Permutation,
+        pinned: false,
+    };
 
-    impl Air<F> for PairedNoMutexChiplet {
-        fn num_columns(&self) -> usize {
-            PairedCpuCols::NUM_COLUMNS
-        }
-
-        fn column_layout(&self) -> &[ColumnType] {
-            static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-            LAYOUT.get_or_init(PairedCpuCols::build_layout)
-        }
-
-        fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-            let sources = vec![
-                (Source::Column(PairedCpuCols::KEY), b"kappa_key" as &[u8]),
-                (Source::RowIndexLeBytes(4), b"kappa_clk" as &[u8]),
-            ];
-
-            vec![(
-                BUS_ID.into(),
-                PermutationCheckSpec::new_paired(
-                    sources,
-                    PairedCpuCols::S_SEND,
-                    PairedCpuCols::S_RECV,
-                    BusKind::Permutation,
-                ),
-            )]
-        }
-
-        fn constraint_ast(&self) -> ConstraintAst<F> {
-            let cs = ConstraintSystem::<F>::new();
-            cs.assert_boolean(cs.col(PairedCpuCols::S_SEND));
-            cs.assert_boolean(cs.col(PairedCpuCols::S_RECV));
-
-            cs.build()
-        }
-    }
-
-    let result = ChipletDef::<F>::from_air(&PairedNoMutexChiplet);
     assert!(
-        result.is_err(),
-        "ChipletDef::from_air must reject paired chiplet without mutex constraint"
+        ChipletDef::<F>::from_air(&unpinned).is_err(),
+        "ChipletDef::from_air must reject paired witness selectors"
     );
 }
 
@@ -406,8 +389,22 @@ impl Air<F> for PairedAir {
         )]
     }
 
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![
+            FixedColumn {
+                col_idx: 1,
+                shape: FixedShape::Sparse(Vec::new()),
+            },
+            FixedColumn {
+                col_idx: 2,
+                shape: FixedShape::Sparse(Vec::new()),
+            },
+        ]
+    }
+
     fn constraint_ast(&self) -> ConstraintAst<F> {
         let cs = ConstraintSystem::<F>::new();
+
         cs.assert_boolean(cs.col(1));
         cs.assert_boolean(cs.col(2));
 
@@ -453,19 +450,24 @@ fn paired_air_constraint_ast_mutated_post_prove_rejected() {
     .expect("paired baseline prove");
 
     let mut vt = Transcript::<H>::new(b"AuditP0");
+    let pinned_id = program_id(&air).unwrap();
+
     assert!(
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config).unwrap(),
+        HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config)
+            .unwrap(),
         "paired baseline must verify"
     );
 
     air.include_mutex.store(false, Ordering::SeqCst);
 
     let mut vt = Transcript::<H>::new(b"AuditP0");
-    let result = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
+
+    let result =
+        HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config);
 
     assert!(
         result.is_err(),
-        "SECURITY FAILURE: proof accepted under mutated constraint_ast"
+        "SECURITY FAILURE: mutated constraint_ast must miss the pinned program_id"
     );
 }
 
@@ -487,9 +489,9 @@ define_columns! {
 }
 
 #[derive(Clone)]
-struct HonestChipletWithMutexA;
+struct PinnedChipletA;
 
-impl Air<F> for HonestChipletWithMutexA {
+impl Air<F> for PinnedChipletA {
     fn name(&self) -> String {
         "evil_host".to_string()
     }
@@ -521,20 +523,21 @@ impl Air<F> for HonestChipletWithMutexA {
         )]
     }
 
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![
+            FixedColumn {
+                col_idx: EvilChipletCols::S_SEND_A,
+                shape: FixedShape::Sparse(Vec::new()),
+            },
+            FixedColumn {
+                col_idx: EvilChipletCols::S_RECV_A,
+                shape: FixedShape::Sparse(Vec::new()),
+            },
+        ]
+    }
+
     fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-
-        cs.assert_boolean(cs.col(EvilChipletCols::S_SEND_A));
-        cs.assert_boolean(cs.col(EvilChipletCols::S_RECV_A));
-        cs.assert_boolean(cs.col(EvilChipletCols::S_SEND_B));
-        cs.assert_boolean(cs.col(EvilChipletCols::S_RECV_B));
-
-        cs.constrain_named(
-            "paired_bus_mutex",
-            cs.col(EvilChipletCols::S_SEND_A) * cs.col(EvilChipletCols::S_RECV_A),
-        );
-
-        cs.build()
+        ConstraintSystem::<F>::new().build()
     }
 }
 
@@ -560,7 +563,7 @@ impl Air<F> for MaliciousHost {
 
 impl Program<F> for MaliciousHost {
     fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        let mut def = ChipletDef::from_air(&HonestChipletWithMutexA)?;
+        let mut def = ChipletDef::from_air(&PinnedChipletA)?;
 
         def.permutation_checks.push((
             EVIL_BUS_B.into(),
@@ -583,7 +586,7 @@ impl Program<F> for MaliciousHost {
 }
 
 #[test]
-fn chiplet_paired_bus_without_mutex_root_rejected_at_verify() {
+fn chiplet_witness_selector_spec_injected_post_construction_rejected() {
     let num_vars = 4;
     let num_rows = 1 << num_vars;
 
@@ -624,7 +627,9 @@ fn chiplet_paired_bus_without_mutex_root_rejected_at_verify() {
     let accepted = match proof_res {
         Ok(proof) => {
             let mut vt = Transcript::<H>::new(b"EvilHost");
-            HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config)
+            let pinned_id = program_id(&air).unwrap();
+
+            HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config)
                 .unwrap_or(false)
         }
         Err(_) => false,
@@ -632,6 +637,6 @@ fn chiplet_paired_bus_without_mutex_root_rejected_at_verify() {
 
     assert!(
         !accepted,
-        "SECURITY FAILURE: chiplet paired-bus spec without mutex root in AST accepted"
+        "SECURITY FAILURE: injected paired spec with witness selectors accepted"
     );
 }

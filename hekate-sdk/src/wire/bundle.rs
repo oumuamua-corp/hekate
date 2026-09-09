@@ -21,21 +21,22 @@ use hekate_program::{
 use crate::generated::program as fb;
 use crate::wire::{ast, boundary, chiplet, config, expander, fixed_column, permutation, trace};
 
-const WIRE_FORMAT_VERSION: u32 = 3;
+const WIRE_FORMAT_VERSION: u32 = 4;
 
 pub struct DeserializedBundle<F: TowerField> {
-    pub constraint_ast: ConstraintAst<F>,
+    pub name: String,
+    pub num_columns: usize,
+    pub num_public_inputs: usize,
     pub column_layout: Vec<ColumnType>,
     pub virtual_column_layout: Vec<ColumnType>,
-    pub boundary_constraints: Vec<BoundaryConstraint<F>>,
-    pub permutation_checks: Vec<(String, PermutationCheckSpec)>,
     pub virtual_expander: Option<VirtualExpander>,
+    pub constraint_ast: ConstraintAst<F>,
+    pub boundary_constraints: Vec<BoundaryConstraint<F>>,
+    pub fixed_columns: Vec<FixedColumn<F>>,
+    pub permutation_checks: Vec<(String, PermutationCheckSpec)>,
     pub chiplet_defs: Vec<ChipletDef<F>>,
     pub inline_chiplets: Vec<ChipletDef<F>>,
     pub inline_chiplet_kernels: Vec<InlineKernelHint>,
-    pub num_columns: usize,
-    pub num_public_inputs: usize,
-    pub fixed_columns: Vec<FixedColumn<F>>,
     pub instance: ProgramInstance<F>,
     pub witness: ProgramWitness<F>,
     pub config: Config,
@@ -109,6 +110,12 @@ pub fn deserialize_bundle<F: TowerField>(bytes: &[u8]) -> Result<DeserializedBun
             message: "wire format version mismatch",
         });
     }
+
+    let name = String::from(
+        bundle
+            .name()
+            .ok_or(wire_err("bundle missing program name"))?,
+    );
 
     let column_layout = bundle
         .column_layout()
@@ -240,18 +247,19 @@ pub fn deserialize_bundle<F: TowerField>(bytes: &[u8]) -> Result<DeserializedBun
     };
 
     Ok(DeserializedBundle {
-        constraint_ast,
+        name,
+        num_columns: bundle.num_columns() as usize,
+        num_public_inputs: bundle.num_public_inputs() as usize,
         column_layout,
         virtual_column_layout,
-        boundary_constraints,
-        permutation_checks,
         virtual_expander,
+        constraint_ast,
+        boundary_constraints,
+        fixed_columns,
+        permutation_checks,
         chiplet_defs,
         inline_chiplets,
         inline_chiplet_kernels,
-        num_columns: bundle.num_columns() as usize,
-        num_public_inputs: bundle.num_public_inputs() as usize,
-        fixed_columns,
         instance,
         witness,
         config: cfg,
@@ -335,18 +343,22 @@ where
     let fixed = program.fixed_columns();
     let fixed_columns = fixed_column::serialize_fixed_columns(&mut fbb, &fixed);
 
+    let name = fbb.create_string(&program.name());
+
     let bundle = fb::ProgramBundle::create(
         &mut fbb,
         &fb::ProgramBundleArgs {
             version: WIRE_FORMAT_VERSION,
+            name: Some(name),
             num_columns: program.num_columns() as u32,
             num_public_inputs: program.num_public_inputs() as u32,
             column_layout: Some(layout),
             virtual_column_layout: Some(virtual_layout),
+            virtual_expander: virtual_exp,
             constraint_ast: Some(constraint_ast),
             boundary_constraints: Some(boundaries),
+            fixed_columns: Some(fixed_columns),
             permutation_checks: Some(perms),
-            virtual_expander: virtual_exp,
             chiplet_defs: Some(chiplets),
             inline_chiplets: Some(inline_chiplets),
             inline_chiplet_kernels: Some(inline_chiplet_kernels),
@@ -355,7 +367,6 @@ where
             main_trace: Some(main_trace),
             chiplet_traces: Some(chiplet_traces),
             config: Some(cfg_offset),
-            fixed_columns: Some(fixed_columns),
         },
     );
 

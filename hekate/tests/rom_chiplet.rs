@@ -3,19 +3,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use hekate::core::config::Config;
-use hekate::core::trace::{ColumnTrace, ColumnType, TraceColumn};
+use hekate::core::trace::{ColumnTrace, TraceColumn};
 use hekate::crypto::DefaultHasher;
 use hekate::crypto::transcript::Transcript;
 use hekate::math::{Block128, TowerField};
 use hekate_core::trace::IntoTraceColumn;
-use hekate_gadgets::{
-    CpuFetchColumns, CpuFetchUnit, Instruction, RomChiplet, RomColumns, generate_rom_trace,
-};
+use hekate_gadgets::{CpuFetchColumns, Instruction, RomChiplet, generate_rom_trace};
 use hekate_math::{Bit, Block32};
-use hekate_program::constraint::ConstraintAst;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::permutation::PermutationCheckSpec;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::chiplet::ChipletDef;
+use hekate_program::circuit::{Circuit, CircuitProgram, Col};
+use hekate_program::digest::program_id;
+use hekate_program::{FixedShape, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_scribble::{MutationKind, ScribbleConfig, Target, assert_all_caught};
 use hekate_verifier::HekateVerifier;
@@ -25,57 +23,47 @@ type H = DefaultHasher;
 
 // Define Combined AIR for Testing
 
-#[derive(Clone)]
-struct RomTestAir;
+// Both endpoints live on the main trace;
+// the mount shares the ROM's canonical
+// bus_id so their LogUp sums cancel.
+fn rom_test_air(num_rows: usize, num_instructions: usize) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("RomTest", num_rows).unwrap();
+    let cpu = cx.schema(&CpuFetchColumns::build_layout());
 
-impl Air<F> for RomTestAir {
-    fn num_columns(&self) -> usize {
-        CpuFetchColumns::NUM_COLUMNS + RomColumns::NUM_COLUMNS
-    }
+    cx.fix(
+        cpu.at(CpuFetchColumns::SELECTOR),
+        FixedShape::Cadence {
+            stride: 1,
+            count: num_instructions,
+            origin: 0,
+            values: vec![F::ONE],
+        },
+    );
 
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
+    let values: Vec<Col> = [
+        CpuFetchColumns::PC_B0,
+        CpuFetchColumns::PC_B1,
+        CpuFetchColumns::PC_B2,
+        CpuFetchColumns::PC_B3,
+        CpuFetchColumns::OPCODE,
+        CpuFetchColumns::ARG0,
+        CpuFetchColumns::ARG1,
+        CpuFetchColumns::ARG2,
+    ]
+    .map(|c| cpu.at(c))
+    .to_vec();
 
-        LAYOUT.get_or_init(|| {
-            let mut cols = CpuFetchColumns::build_layout();
-            cols.extend(RomColumns::build_layout());
+    cx.call(
+        &RomChiplet::service(),
+        &values,
+        cpu.at(CpuFetchColumns::SELECTOR),
+    )
+    .unwrap();
 
-            cols
-        })
-    }
+    cx.mount(ChipletDef::from_air(&RomChiplet::new(num_rows, num_instructions)).unwrap());
 
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        // Both endpoints live on the main
-        // trace; share the ROM's canonical
-        // bus_id so their LogUp sums cancel.
-        let cpu_spec = CpuFetchUnit::linking_spec();
-        let mut rom_spec = RomChiplet::linking_spec();
-        rom_spec.shift_column_indices(CpuFetchColumns::NUM_COLUMNS);
-
-        vec![
-            (RomChiplet::BUS_ID.into(), cpu_spec),
-            (RomChiplet::BUS_ID.into(), rom_spec),
-        ]
-    }
-
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CpuFetchColumns::SELECTOR));
-
-        let mut ast = cs.build();
-
-        let rom_chiplet = RomChiplet { num_rows: 0 };
-
-        let mut rom_ast = rom_chiplet.constraint_ast();
-        rom_ast.arena.shift_cells(CpuFetchColumns::NUM_COLUMNS);
-
-        ast.merge(rom_ast);
-
-        ast
-    }
+    cx.compile().unwrap()
 }
-
-impl Program<F> for RomTestAir {}
 
 // --- 2. Trace Generation Helpers ---
 
@@ -181,7 +169,7 @@ fn rom_cpu_linking() {
     let seed = [0xAAu8; 32];
 
     // 1. Setup
-    let air = RomTestAir;
+    let air = rom_test_air(num_rows, program.len());
     let trace = generate_combined_trace(&program, num_rows);
     let witness = ProgramWitness::new(trace);
     let instance = ProgramInstance::new(num_rows, vec![]); // No public inputs
@@ -201,9 +189,18 @@ fn rom_cpu_linking() {
 
     // 3. Verify
     println!("-> Verifying...");
+
     let mut verifier_transcript = Transcript::<H>::new(b"ROM_E2E");
-    let result =
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut verifier_transcript, &config);
+    let pinned_id = program_id(&air).unwrap();
+
+    let result = HekateVerifier::<F, H>::verify(
+        &pinned_id,
+        &air,
+        &instance,
+        &proof,
+        &mut verifier_transcript,
+        &config,
+    );
 
     assert!(result.unwrap(), "Verification failed");
 
@@ -233,7 +230,7 @@ fn rom_gpa_large_trace() {
         instructions.push(Instruction::new(pc, opcode, args));
     }
 
-    let air = RomTestAir;
+    let air = rom_test_air(num_rows, instructions.len());
     let trace = generate_combined_trace(&instructions, num_rows);
     let witness = ProgramWitness::new(trace);
     let instance = ProgramInstance::new(num_rows, vec![]);
@@ -252,7 +249,10 @@ fn rom_gpa_large_trace() {
     // enforces endpoint cancellation across
     // the paired (main, ROM) bus.
     let mut vt = Transcript::<H>::new(b"ROM_Large");
-    let ok = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config).unwrap();
+    let pinned_id = program_id(&air).unwrap();
+
+    let ok = HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config)
+        .unwrap();
 
     assert!(ok, "Large trace verification failed");
 }
@@ -267,7 +267,7 @@ fn rom_padding_transparency() {
     let num_rows = 1 << num_vars;
     let seed = [0xAAu8; 32];
 
-    let air = RomTestAir;
+    let air = rom_test_air(num_rows, 0);
     let instance = ProgramInstance::new(num_rows, vec![]);
 
     // Case 1: All Padding (Empty program)
@@ -319,7 +319,7 @@ fn scribble_rom_flip_selector_caught() {
     let num_vars = 4;
     let num_rows = 1 << num_vars;
 
-    let air = RomTestAir;
+    let air = rom_test_air(num_rows, program.len());
     let trace = generate_combined_trace(&program, num_rows);
     let witness = ProgramWitness::new(trace);
     let instance = ProgramInstance::new(num_rows, vec![]);

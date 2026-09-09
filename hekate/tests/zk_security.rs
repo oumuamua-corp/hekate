@@ -12,10 +12,12 @@ use hekate_core::trace::{IntoTraceColumn, Trace, TraceBuilder};
 use hekate_core::utils::compute_split_vars;
 use hekate_math::{Bit, Block32};
 use hekate_program::chiplet::ChipletDef;
+use hekate_program::circuit::{Circuit, CircuitProgram};
 use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
+use hekate_program::constraint::{BoundaryConstraint, BoundaryTarget, ConstraintAst};
+use hekate_program::digest::program_id;
 use hekate_program::permutation::{PermutationCheckSpec, REQUEST_IDX_LABEL, Source};
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::{Air, FixedColumn, FixedShape, Program, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 use rand::{TryRngCore, rngs::OsRng};
@@ -25,46 +27,28 @@ use std::sync::atomic::{AtomicBool, Ordering};
 type F = Block128;
 type H = DefaultHasher;
 
-#[derive(Clone)]
-struct FibAir {
-    num_cols: usize,
-    num_rows: usize,
-}
+fn fib_air(num_rows: usize) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("FibZk", num_rows).unwrap();
 
-impl Air<F> for FibAir {
-    fn num_columns(&self) -> usize {
-        self.num_cols
-    }
+    let words = cx.columns(2, ColumnType::B32);
+    let q = cx.column(ColumnType::Bit);
 
-    fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
-        vec![BoundaryConstraint::with_public_input(
-            1,
-            self.num_rows - 1,
-            0,
-        )]
-    }
+    let cs = cx.cs();
 
-    fn column_layout(&self) -> &'static [ColumnType] {
-        &[ColumnType::B32, ColumnType::B32, ColumnType::Bit]
-    }
+    let [a, b] = [cs.col(words.at(0).index()), cs.col(words.at(1).index())];
+    let [na, nb] = [cs.next(words.at(0).index()), cs.next(words.at(1).index())];
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
+    let q_cell = cs.col(q.index());
 
-        let [a, b, q] = [cs.col(0), cs.col(1), cs.col(2)];
-        let [na, nb] = [cs.next(0), cs.next(1)];
+    cs.constrain(q_cell * (na + b));
+    cs.constrain(q_cell * (nb + a + b));
 
-        cs.constrain(q * (na + b));
-        cs.constrain(q * (nb + a + b));
+    cx.fix(q, FixedShape::LastRow);
+    cx.boundary(words.at(0), 0, F::ZERO);
+    cx.boundary(words.at(1), 0, F::ONE);
+    cx.publish(words.at(1), num_rows - 1);
 
-        cs.build()
-    }
-}
-
-impl Program<F> for FibAir {
-    fn num_public_inputs(&self) -> usize {
-        1
-    }
+    cx.compile().unwrap()
 }
 
 fn generate_fib_trace(num_vars: usize) -> ColumnTrace {
@@ -81,11 +65,11 @@ fn generate_fib_trace(num_vars: usize) -> ColumnTrace {
         a_col.push(a);
         b_col.push(b);
 
-        if i == num_rows - 1 {
-            sel_col.push(Bit::ZERO);
+        sel_col.push(if i == num_rows - 1 {
+            Bit::ZERO
         } else {
-            sel_col.push(Bit::ONE);
-        }
+            Bit::ONE
+        });
 
         let tmp = a + b;
         a = b;
@@ -131,10 +115,7 @@ fn noise_entropy_inspection() {
     let instance = ProgramInstance::new(num_rows, vec![expected_pub]);
     let witness = ProgramWitness::new(trace);
 
-    let air = FibAir {
-        num_cols: 3,
-        num_rows,
-    };
+    let air = fib_air(num_rows);
 
     let config = Config {
         zero_knowledge: true,
@@ -162,11 +143,8 @@ fn noise_entropy_inspection() {
     let columns = &proof.eval_proof.ldt_proof.opened_columns;
     assert!(!columns.is_empty(), "Must have opened columns");
 
-    // Architecture:
-    // FibAir uses [B32, B32, Bit]. The MDS RS code
-    // commits each cell at its rs_field width, Bit
-    // widens to B32: (4 + 4 + 4) = 12 bytes per row.
-    let data_bytes_per_row = 4 + 4 + 4;
+    let rs_field_bytes = 4;
+    let data_bytes_per_row = air.column_layout().len() * rs_field_bytes;
 
     // ZK Sumcheck noise is always Block128 (16 bytes).
     let noise_bytes_per_row = config.blind_units() * 16;
@@ -257,10 +235,7 @@ fn seed_nondeterminism() {
 
     let trace = generate_fib_trace(num_vars);
     let expected_pub = trace.get_element(1, num_rows - 1).unwrap().to_tower();
-    let air = FibAir {
-        num_cols: 3,
-        num_rows,
-    };
+    let air = fib_air(num_rows);
     let instance = ProgramInstance::new(num_rows, vec![expected_pub]);
 
     let config_a = Config {
@@ -317,13 +292,29 @@ fn seed_nondeterminism() {
     assert_ne!(col_a, col_b, "Opened noise bytes must differ");
 
     let mut vt_a = Transcript::<H>::new(b"ZK_Seed");
-    let ok_a =
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof_a, &mut vt_a, &config_a).unwrap();
+    let ok_a = HekateVerifier::<F, H>::verify(
+        &program_id(&air).unwrap(),
+        &air,
+        &instance,
+        &proof_a,
+        &mut vt_a,
+        &config_a,
+    )
+    .unwrap();
+
     assert!(ok_a, "Proof A must verify");
 
     let mut vt_b = Transcript::<H>::new(b"ZK_Seed");
-    let ok_b =
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof_b, &mut vt_b, &config_b).unwrap();
+    let ok_b = HekateVerifier::<F, H>::verify(
+        &program_id(&air).unwrap(),
+        &air,
+        &instance,
+        &proof_b,
+        &mut vt_b,
+        &config_b,
+    )
+    .unwrap();
+
     assert!(ok_b, "Proof B must verify");
 }
 
@@ -341,10 +332,7 @@ fn noise_integrity_check() {
     let instance = ProgramInstance::new(num_rows, vec![expected_pub]);
     let witness = ProgramWitness::new(trace);
 
-    let air = FibAir {
-        num_cols: 3,
-        num_rows,
-    };
+    let air = fib_air(num_rows);
 
     let config = Config {
         zero_knowledge: true,
@@ -384,8 +372,14 @@ fn noise_integrity_check() {
     }
 
     let mut verifier_transcript = Transcript::<H>::new(b"ZK_Integrity");
-    let result =
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut verifier_transcript, &config);
+    let result = HekateVerifier::<F, H>::verify(
+        &program_id(&air).unwrap(),
+        &air,
+        &instance,
+        &proof,
+        &mut verifier_transcript,
+        &config,
+    );
 
     match result {
         Ok(true) => panic!("SECURITY FAILURE: Verifier accepted modified noise!"),
@@ -412,11 +406,11 @@ impl Air<F> for MaliciousAir {
         if self.is_prover.load(Ordering::SeqCst) {
             vec![]
         } else {
-            vec![BoundaryConstraint::with_public_input(
-                1,
-                self.num_rows - 1,
-                0,
-            )]
+            vec![BoundaryConstraint {
+                col_idx: 1,
+                row_idx: self.num_rows - 1,
+                target: BoundaryTarget::PublicInput(0),
+            }]
         }
     }
 
@@ -506,6 +500,7 @@ fn trust_me_bro_knowledge() {
 
     let mut verifier_transcript = Transcript::<H>::new(b"Exploit");
     let result_zk = HekateVerifier::<F, H>::verify(
+        &program_id(&air).unwrap(),
         &air,
         &instance,
         &proof_zk,
@@ -548,6 +543,7 @@ fn trust_me_bro_knowledge() {
 
     let mut verifier_transcript2 = Transcript::<H>::new(b"Exploit2");
     let result_no_zk = HekateVerifier::<F, H>::verify(
+        &program_id(&air).unwrap(),
         &air,
         &instance,
         &proof_no_zk,
@@ -576,10 +572,7 @@ fn algebraic_and_evaluation_perfect_hiding() {
     let expected_pub = trace.get_element(1, num_rows - 1).unwrap().to_tower();
     let instance = ProgramInstance::new(num_rows, vec![expected_pub]);
     let witness = ProgramWitness::new(trace.clone());
-    let air = FibAir {
-        num_cols: 3,
-        num_rows,
-    };
+    let air = fib_air(num_rows);
 
     let config_no_zk = Config {
         zero_knowledge: false,
@@ -654,19 +647,43 @@ fn algebraic_and_evaluation_perfect_hiding() {
     // and validates the proof.
     let mut vt1 = Transcript::<H>::new(b"ZK_Hiding");
     assert!(
-        HekateVerifier::<F, H>::verify(&air, &instance, &p_no_zk, &mut vt1, &config_no_zk).unwrap(),
+        HekateVerifier::<F, H>::verify(
+            &program_id(&air).unwrap(),
+            &air,
+            &instance,
+            &p_no_zk,
+            &mut vt1,
+            &config_no_zk,
+        )
+        .unwrap(),
         "No-ZK proof failed to verify"
     );
 
     let mut vt2 = Transcript::<H>::new(b"ZK_Hiding");
     assert!(
-        HekateVerifier::<F, H>::verify(&air, &instance, &p_zk_a, &mut vt2, &config_zk).unwrap(),
+        HekateVerifier::<F, H>::verify(
+            &program_id(&air).unwrap(),
+            &air,
+            &instance,
+            &p_zk_a,
+            &mut vt2,
+            &config_zk,
+        )
+        .unwrap(),
         "ZK proof A failed to verify"
     );
 
     let mut vt3 = Transcript::<H>::new(b"ZK_Hiding");
     assert!(
-        HekateVerifier::<F, H>::verify(&air, &instance, &p_zk_b, &mut vt3, &config_zk).unwrap(),
+        HekateVerifier::<F, H>::verify(
+            &program_id(&air).unwrap(),
+            &air,
+            &instance,
+            &p_zk_b,
+            &mut vt3,
+            &config_zk,
+        )
+        .unwrap(),
         "ZK proof B failed to verify"
     );
 
@@ -733,15 +750,29 @@ fn algebraic_and_evaluation_perfect_hiding() {
 
     let mut vt4 = Transcript::<H>::new(b"ZK_Hiding");
     assert!(
-        HekateVerifier::<F, H>::verify(&air, &instance, &p_only_ldt_a, &mut vt4, &config_only_ldt)
-            .unwrap(),
+        HekateVerifier::<F, H>::verify(
+            &program_id(&air).unwrap(),
+            &air,
+            &instance,
+            &p_only_ldt_a,
+            &mut vt4,
+            &config_only_ldt,
+        )
+        .unwrap(),
         "K=0/ldt>0 proof A must verify"
     );
 
     let mut vt5 = Transcript::<H>::new(b"ZK_Hiding");
     assert!(
-        HekateVerifier::<F, H>::verify(&air, &instance, &p_only_ldt_b, &mut vt5, &config_only_ldt)
-            .unwrap(),
+        HekateVerifier::<F, H>::verify(
+            &program_id(&air).unwrap(),
+            &air,
+            &instance,
+            &p_only_ldt_b,
+            &mut vt5,
+            &config_only_ldt,
+        )
+        .unwrap(),
         "K=0/ldt>0 proof B must verify"
     );
 
@@ -779,10 +810,7 @@ fn point_evaluation_claims_vs_mle(zero_knowledge: bool) -> Vec<[(F, F); 2]> {
     let expected_pub = trace.get_element(1, num_rows - 1).unwrap().to_tower();
     let instance = ProgramInstance::new(num_rows, vec![expected_pub]);
     let witness = ProgramWitness::new(trace.clone());
-    let air = FibAir {
-        num_cols: 3,
-        num_rows,
-    };
+    let air = fib_air(num_rows);
 
     let config = Config {
         zero_knowledge,
@@ -798,7 +826,17 @@ fn point_evaluation_claims_vs_mle(zero_knowledge: bool) -> Vec<[(F, F); 2]> {
     let proof = prove(b"ZK_Hiding", &air, &instance, &witness, &config, seed, None).unwrap();
 
     let mut vt = Transcript::<H>::new(b"ZK_Hiding");
-    assert!(HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config).unwrap());
+    assert!(
+        HekateVerifier::<F, H>::verify(
+            &program_id(&air).unwrap(),
+            &air,
+            &instance,
+            &proof,
+            &mut vt,
+            &config,
+        )
+        .unwrap()
+    );
 
     let (r_final, claims) = &proof.eval_proof.point_evaluation;
     let num_cols = air.num_columns();
@@ -874,17 +912,8 @@ fn true_zk_memory_isolation() {
     trace.add_column(b_col.into_trace_column()).unwrap();
     trace.add_column(TraceColumn::Bit(sel_col)).unwrap();
 
-    let air = FibAir {
-        num_cols: 3,
-        num_rows,
-    };
+    let air = fib_air(num_rows);
 
-    // FibAir's transition constraint is
-    // `selector * (next_a + b) = 0`. With sel_col
-    // all zeros it holds trivially regardless of a/b
-    // content. The boundary constraint pins
-    // `b[num_rows - 1] = public_input[0] = ZERO`,
-    // which the all-zero b_col satisfies.
     let instance = ProgramInstance::new(num_rows, vec![F::ZERO]);
     let witness = ProgramWitness::new(trace);
 
@@ -988,10 +1017,7 @@ fn truncation_overflow_injection() {
     let expected_pub = trace.get_element(1, num_rows - 1).unwrap().to_tower();
     let instance = ProgramInstance::new(num_rows, vec![expected_pub]);
     let witness = ProgramWitness::new(trace);
-    let air = FibAir {
-        num_cols: 3,
-        num_rows,
-    };
+    let air = fib_air(num_rows);
 
     let config = Config {
         zero_knowledge: true,
@@ -1055,8 +1081,14 @@ fn truncation_overflow_injection() {
 
     // 2. Verify the corrupted proof
     let mut verifier_transcript = Transcript::<H>::new(b"ZK_Truncation");
-    let result =
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut verifier_transcript, &config);
+    let result = HekateVerifier::<F, H>::verify(
+        &program_id(&air).unwrap(),
+        &air,
+        &instance,
+        &proof,
+        &mut verifier_transcript,
+        &config,
+    );
 
     // 3. Guarantee rejection
     match result {
@@ -1085,10 +1117,7 @@ fn noise_shift_sign_forgery() {
     let expected_pub = trace.get_element(1, num_rows - 1).unwrap().to_tower();
     let instance = ProgramInstance::new(num_rows, vec![expected_pub]);
     let witness = ProgramWitness::new(trace);
-    let air = FibAir {
-        num_cols: 3,
-        num_rows,
-    };
+    let air = fib_air(num_rows);
 
     let config = Config {
         zero_knowledge: true,
@@ -1132,8 +1161,14 @@ fn noise_shift_sign_forgery() {
 
     // 2. Verify the forged proof
     let mut verifier_transcript = Transcript::<H>::new(b"ZK_NoiseShift");
-    let result =
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut verifier_transcript, &config);
+    let result = HekateVerifier::<F, H>::verify(
+        &program_id(&air).unwrap(),
+        &air,
+        &instance,
+        &proof,
+        &mut verifier_transcript,
+        &config,
+    );
 
     // 3. Guarantee rejection
     match result {
@@ -1159,10 +1194,7 @@ fn ghost_protocol_indistinguishability() {
 
     let num_vars = 6;
     let num_rows = 1 << num_vars;
-    let air = FibAir {
-        num_cols: 3,
-        num_rows,
-    };
+    let air = fib_air(num_rows);
 
     let config = Config {
         zero_knowledge: true,
@@ -1285,7 +1317,9 @@ fn ghost_protocol_indistinguishability() {
 ///   `[1,...,1,0]` (set in `make_minimal_bus_trace`)
 ///   so the MLE has support but the last row is silent.
 #[derive(Clone)]
-struct MinimalBusChiplet;
+struct MinimalBusChiplet {
+    num_rows: usize,
+}
 
 impl Air<F> for MinimalBusChiplet {
     fn name(&self) -> String {
@@ -1318,11 +1352,12 @@ impl Air<F> for MinimalBusChiplet {
         ]
     }
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(1));
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::prefix(1, self.num_rows - 1)]
+    }
 
-        cs.build()
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        ConstraintSystem::<F>::new().build()
     }
 }
 
@@ -1434,7 +1469,7 @@ fn chiplet_pipeline_witness_isolation() {
     // (chiplet0::bus_n <> chiplet1::bus_n)
     // and satisfies GPA bus exhaustiveness
     // with exactly 2 endpoints.
-    let chiplet = MinimalBusChiplet;
+    let chiplet = MinimalBusChiplet { num_rows };
     let air = MultiBusProgram {
         defs: vec![
             ChipletDef::from_air(&chiplet).unwrap(),
@@ -1493,7 +1528,15 @@ fn chiplet_pipeline_witness_isolation() {
 
     let mut vt_zk = Transcript::<H>::new(b"ChipletWitnessIsolation");
     assert!(
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof_zk, &mut vt_zk, &config_zk).unwrap(),
+        HekateVerifier::<F, H>::verify(
+            &program_id(&air).unwrap(),
+            &air,
+            &instance,
+            &proof_zk,
+            &mut vt_zk,
+            &config_zk,
+        )
+        .unwrap(),
         "ZK proof must verify",
     );
 

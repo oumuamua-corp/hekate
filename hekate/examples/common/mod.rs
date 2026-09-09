@@ -4,6 +4,8 @@
 
 use hekate_core::proofs::InnerProof;
 use hekate_math::TowerField;
+use hekate_program::Program;
+use hekate_program::digest::{program_id, program_id_hex};
 use std::time::Instant;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -270,6 +272,37 @@ pub fn num_vars(default: usize) -> usize {
 #[allow(dead_code)]
 pub fn level(default: &str) -> String {
     std::env::var("HEKATE_LEVEL").unwrap_or_else(|_| default.to_string())
+}
+
+/// `HEKATE_PROGRAM_ID=<64 hex>` is the audited constant
+/// a deployment pins. Unset, the run derives its own
+/// and the verifier's drift check cannot fire.
+pub fn audited_id<F: TowerField, P: Program<F>>(program: &P) -> [u8; 32] {
+    let Ok(pinned) = std::env::var("HEKATE_PROGRAM_ID") else {
+        println!(
+            "program_id: {}",
+            program_id_hex(program).expect("program_id_hex")
+        );
+
+        return program_id(program).expect("program_id");
+    };
+
+    decode_id(&pinned).expect("HEKATE_PROGRAM_ID must be 64 lowercase hex chars")
+}
+
+fn decode_id(s: &str) -> Option<[u8; 32]> {
+    let hex = s.trim().as_bytes();
+    if hex.len() != 64 {
+        return None;
+    }
+
+    let mut out = [0u8; 32];
+    for (i, pair) in hex.chunks_exact(2).enumerate() {
+        let text = core::str::from_utf8(pair).ok()?;
+        out[i] = u8::from_str_radix(text, 16).ok()?;
+    }
+
+    Some(out)
 }
 
 fn enc_size<T: serde::Serialize>(val: &T, cfg: bincode::config::Configuration) -> usize {

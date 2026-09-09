@@ -10,10 +10,8 @@ mod generated;
 mod program;
 mod wire;
 
-pub mod builder;
 pub mod preflight;
 
-pub use builder::{program_id, program_id_hex};
 pub use preflight::preflight;
 pub use program::BundleProgram;
 pub use wire::bundle::{

@@ -15,8 +15,8 @@ use alloc::collections::BTreeMap;
 use alloc::collections::BTreeSet;
 use alloc::vec;
 use alloc::vec::Vec;
-use hekate_core::errors;
 use hekate_core::trace::{ColumnTrace, TraceBuilder, TraceCompatibleField};
+use hekate_core::{errors, trace};
 use hekate_gadgets::chiplets::ram;
 use hekate_keccak as keccak;
 use hekate_math::{
@@ -33,12 +33,7 @@ use hekate_math::{
 pub(crate) enum CtrlDispatch<'a> {
     /// IO row:
     /// public input byte chunk.
-    /// PAD_SEL binding.
-    Io {
-        data: u32,
-        #[allow(dead_code)]
-        is_pad: bool,
-    },
+    Io { data: u32 },
 
     /// Keccak permutation input row.
     KeccakInput {
@@ -134,7 +129,15 @@ where
         sig: &MlDsaSignature,
         msg: &[u8],
     ) -> errors::Result<Vec<ColumnTrace>> {
+        if msg.len() != self.msg_len() {
+            return Err(errors::Error::Protocol {
+                protocol: "mldsa",
+                message: "message length does not match the chiplet",
+            });
+        }
+
         let (result, ntt_ops) = ml_dsa_verify_traced(pk, sig, msg);
+
         self.generate_traces_inner(&result, &ntt_ops)
     }
 
@@ -236,17 +239,8 @@ where
 
         for chunk in io_buf.chunks(4) {
             let val = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            schedule.push((
-                Phase::Io,
-                CtrlDispatch::Io {
-                    data: val,
-                    is_pad: false,
-                },
-            ));
+            schedule.push((Phase::Io, CtrlDispatch::Io { data: val }));
         }
-
-        // Keccak calls.
-        // Input binding deferred to Phase 4.
 
         for (i, (input, output)) in result.keccak_calls.iter().enumerate() {
             let ph = result.keccak_phases[i];
@@ -433,6 +427,12 @@ where
         // rows share the same instance.
         schedule.sort_by_key(|(ph, d)| (*ph as u8, d.ntt_instance_key()));
 
+        if schedule.len() + 1 > self.params.ctrl_rows {
+            return Err(errors::Error::Trace(trace::Error::InvalidParameters {
+                message: "ctrl_rows too small for ML-DSA dispatch schedule",
+            }));
+        }
+
         // ==========================================================
         // Fill ctrl rows
         // ==========================================================
@@ -456,10 +456,6 @@ where
         let mut wbind_ctrl_rows: BTreeMap<(u32, u32), Vec<u32>> = BTreeMap::new();
 
         for (phase, dispatch) in &schedule {
-            if ctrl_row >= self.params.ctrl_rows {
-                break;
-            }
-
             // Sticky RATE_REG carry
             for i in 0..25 {
                 ctrl_tb.set_b64(
@@ -765,27 +761,25 @@ where
         // carry sticky RATE_REG + BIND_SEEN
         // to first padding row
         // for cyclic boundary.
-        if ctrl_row < self.params.ctrl_rows {
-            for i in 0..25 {
-                ctrl_tb.set_b64(
-                    MlDsaCtrlColumns::RATE_REG + i,
-                    ctrl_row,
-                    Block64::from(rate_regs[i]),
-                )?;
-            }
+        for i in 0..25 {
+            ctrl_tb.set_b64(
+                MlDsaCtrlColumns::RATE_REG + i,
+                ctrl_row,
+                Block64::from(rate_regs[i]),
+            )?;
+        }
 
-            if seen_tr {
-                ctrl_tb.set_bit(MlDsaCtrlColumns::TR_BIND_SEEN, ctrl_row, Bit::ONE)?;
-            }
-            if seen_mu {
-                ctrl_tb.set_bit(MlDsaCtrlColumns::MU_BIND_SEEN, ctrl_row, Bit::ONE)?;
-            }
-            if seen_ctilde_prime {
-                ctrl_tb.set_bit(MlDsaCtrlColumns::CTILDE_PRIME_BIND_SEEN, ctrl_row, Bit::ONE)?;
-            }
-            if seen_ctilde_ref {
-                ctrl_tb.set_bit(MlDsaCtrlColumns::CTILDE_REF_BIND_SEEN, ctrl_row, Bit::ONE)?;
-            }
+        if seen_tr {
+            ctrl_tb.set_bit(MlDsaCtrlColumns::TR_BIND_SEEN, ctrl_row, Bit::ONE)?;
+        }
+        if seen_mu {
+            ctrl_tb.set_bit(MlDsaCtrlColumns::MU_BIND_SEEN, ctrl_row, Bit::ONE)?;
+        }
+        if seen_ctilde_prime {
+            ctrl_tb.set_bit(MlDsaCtrlColumns::CTILDE_PRIME_BIND_SEEN, ctrl_row, Bit::ONE)?;
+        }
+        if seen_ctilde_ref {
+            ctrl_tb.set_bit(MlDsaCtrlColumns::CTILDE_REF_BIND_SEEN, ctrl_row, Bit::ONE)?;
         }
 
         let ctrl_trace = ctrl_tb.build();

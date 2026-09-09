@@ -124,6 +124,15 @@ enum FixedShapeKind: ubyte {
   Periodic = 3,
   Sparse = 4,
   Dense = 5,
+  Cadence = 6,
+  Segments = 7,
+}
+
+table CadenceSegment {
+  stride: uint64;
+  count: uint64;
+  origin: uint64;
+  values: [Block128];
 }
 
 table FixedColumn {
@@ -134,6 +143,10 @@ table FixedColumn {
   values: [Block128];
   sparse_rows: [uint64];
   sparse_values: [Block128];
+  stride: uint64;
+  count: uint64;
+  origin: uint64;
+  segments: [CadenceSegment];
 }
 
 // ===== Inline Kernel Hints =====
@@ -151,11 +164,11 @@ table ChipletDef {
   num_columns: uint32;
   column_layout: [ColumnType];
   virtual_column_layout: [ColumnType];
+  virtual_expander: VirtualExpander;
   constraint_ast: ConstraintAst;
   boundary_constraints: [BoundaryConstraint];
-  permutation_checks: [BusEndpoint];
-  virtual_expander: VirtualExpander;
   fixed_columns: [FixedColumn];
+  permutation_checks: [BusEndpoint];
 }
 
 // ===== Trace Data =====
@@ -185,15 +198,21 @@ table Config {
 table ProgramBundle {
   version: uint32;
 
-  // Program description
+  // Identity
+  name: string;
   num_columns: uint32;
   num_public_inputs: uint32;
+
+  // Main table
   column_layout: [ColumnType];
   virtual_column_layout: [ColumnType];
+  virtual_expander: VirtualExpander;
   constraint_ast: ConstraintAst;
   boundary_constraints: [BoundaryConstraint];
+  fixed_columns: [FixedColumn];
   permutation_checks: [BusEndpoint];
-  virtual_expander: VirtualExpander;
+
+  // Chiplets
   chiplet_defs: [ChipletDef];
   inline_chiplets: [ChipletDef];
   inline_chiplet_kernels: [InlineKernelHint];
@@ -208,8 +227,6 @@ table ProgramBundle {
 
   // Config
   config: Config;
-
-  fixed_columns: [FixedColumn];
 }
 
 root_type ProgramBundle;

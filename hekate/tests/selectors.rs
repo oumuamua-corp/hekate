@@ -9,8 +9,9 @@ use hekate::crypto::transcript::Transcript;
 use hekate::math::{Bit, Block32, Block128};
 use hekate_core::trace::IntoTraceColumn;
 use hekate_math::TowerField;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::circuit::{Circuit, CircuitProgram};
+use hekate_program::digest::program_id;
+use hekate_program::{ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 
@@ -30,60 +31,42 @@ type H = DefaultHasher;
 /// 1: s_halt (halt selector)
 /// 2: s_memory_op (memory operation event selector)
 /// 3: q_step (transition selector: 1 for rows 0..N-2, 0 for N-1)
-#[derive(Clone)]
-struct DummyCpuAir {
-    #[allow(dead_code)]
-    num_rows: usize,
+fn dummy_cpu_air(num_rows: usize) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("DummyCpu", num_rows).unwrap();
+
+    let pc_col = cx.column(ColumnType::B32);
+    let flags = cx.columns(3, ColumnType::Bit);
+
+    let cs = cx.cs();
+
+    let pc = cs.col(pc_col.index());
+    let s_halt = cs.col(flags.at(0).index());
+    let s_mem = cs.col(flags.at(1).index());
+    let q_step = cs.col(flags.at(2).index());
+    let s_halt_next = cs.next(flags.at(0).index());
+    let pc_next = cs.next(pc_col.index());
+
+    // Booleanity:
+    // s_halt, s_memory_op, q_step must be binary
+    cs.assert_boolean(s_halt);
+    cs.assert_boolean(s_mem);
+    cs.assert_boolean(q_step);
+
+    // Sticky halt:
+    // q_step * s_halt * (1 + s_halt_next) = 0
+    let one = cs.one();
+    cs.constrain(q_step * s_halt * (s_halt_next + one));
+
+    // Frozen PC:
+    // q_step * s_halt * (pc_next + pc) = 0
+    cs.constrain(q_step * s_halt * (pc_next + pc));
+
+    // Event silence:
+    // s_halt * s_mem = 0
+    cs.constrain(s_halt * s_mem);
+
+    cx.compile().unwrap()
 }
-
-impl Air<F> for DummyCpuAir {
-    fn num_columns(&self) -> usize {
-        4
-    }
-
-    fn column_layout(&self) -> &'static [ColumnType] {
-        &[
-            ColumnType::B32,
-            ColumnType::Bit,
-            ColumnType::Bit,
-            ColumnType::Bit,
-        ]
-    }
-
-    fn constraint_ast(&self) -> hekate_program::constraint::ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-
-        let pc = cs.col(0);
-        let s_halt = cs.col(1);
-        let s_mem = cs.col(2);
-        let q_step = cs.col(3);
-        let s_halt_next = cs.next(1);
-        let pc_next = cs.next(0);
-
-        // Booleanity:
-        // s_halt, s_memory_op, q_step must be binary
-        cs.assert_boolean(s_halt);
-        cs.assert_boolean(s_mem);
-        cs.assert_boolean(q_step);
-
-        // Sticky halt:
-        // q_step * s_halt * (1 + s_halt_next) = 0
-        let one = cs.one();
-        cs.constrain(q_step * s_halt * (s_halt_next + one));
-
-        // Frozen PC:
-        // q_step * s_halt * (pc_next + pc) = 0
-        cs.constrain(q_step * s_halt * (pc_next + pc));
-
-        // Event silence:
-        // s_halt * s_mem = 0
-        cs.constrain(s_halt * s_mem);
-
-        cs.build()
-    }
-}
-
-impl Program<F> for DummyCpuAir {}
 
 /// Generate a valid trace:
 /// runs for a few cycles, then halts cleanly.
@@ -241,7 +224,7 @@ fn valid_halt_trace_passes() {
         ..Config::default()
     };
 
-    let air = DummyCpuAir { num_rows };
+    let air = dummy_cpu_air(num_rows);
     let instance = ProgramInstance::new(num_rows, vec![]);
     let trace = generate_valid_trace(num_vars);
     let witness = ProgramWitness::new(trace);
@@ -260,8 +243,16 @@ fn valid_halt_trace_passes() {
 
     // Verify
     let mut verifier_transcript = Transcript::<H>::new(b"phase1_test");
-    let result =
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut verifier_transcript, &config);
+    let pinned_id = program_id(&air).unwrap();
+
+    let result = HekateVerifier::<F, H>::verify(
+        &pinned_id,
+        &air,
+        &instance,
+        &proof,
+        &mut verifier_transcript,
+        &config,
+    );
 
     match result {
         Ok(true) => {} // Success
@@ -288,7 +279,7 @@ fn wakeup_after_halt_rejected() {
         ..Config::default()
     };
 
-    let air = DummyCpuAir { num_rows };
+    let air = dummy_cpu_air(num_rows);
     let instance = ProgramInstance::new(num_rows, vec![]);
     let trace = generate_wakeup_trace(num_vars);
     let witness = ProgramWitness::new(trace);
@@ -308,7 +299,10 @@ fn wakeup_after_halt_rejected() {
         Ok(proof) => {
             // If prover succeeds, verifier MUST reject
             let mut verifier_transcript = Transcript::<H>::new(b"phase1_wakeup");
+            let pinned_id = program_id(&air).unwrap();
+
             let verify_result = HekateVerifier::<F, H>::verify(
+                &pinned_id,
                 &air,
                 &instance,
                 &proof,
@@ -350,7 +344,7 @@ fn event_while_halted_rejected() {
         ..Config::default()
     };
 
-    let air = DummyCpuAir { num_rows };
+    let air = dummy_cpu_air(num_rows);
     let instance = ProgramInstance::new(num_rows, vec![]);
     let trace = generate_event_while_halted_trace(num_vars);
     let witness = ProgramWitness::new(trace);
@@ -370,7 +364,10 @@ fn event_while_halted_rejected() {
         Ok(proof) => {
             // If prover succeeds, verifier MUST reject
             let mut verifier_transcript = Transcript::<H>::new(b"phase1_event");
+            let pinned_id = program_id(&air).unwrap();
+
             let verify_result = HekateVerifier::<F, H>::verify(
+                &pinned_id,
                 &air,
                 &instance,
                 &proof,
@@ -413,7 +410,7 @@ fn boolean_constraint_enforced() {
         ..Config::default()
     };
 
-    let air = DummyCpuAir { num_rows };
+    let air = dummy_cpu_air(num_rows);
     let instance = ProgramInstance::new(num_rows, vec![]);
 
     // Create trace with non-boolean selector (value = 2)

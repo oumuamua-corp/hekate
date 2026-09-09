@@ -85,84 +85,77 @@ all proven natively in binary fields without bit-decomposition overhead.
 Real 32-bit-integer Fibonacci. The CPU side holds five columns and the two Fibonacci transition
 constraints. Every `u32` ADD is offloaded to the `IntArithmeticChiplet`, its own trace, own
 commitment, own ZeroCheck, own evaluation argument, and is wired in by a LogUp bus
-(`(val_a, val_b, val_res, opcode, request_idx)` keys with a row-index clock).
+(`(val_a, val_b, val_res, opcode, request_idx)` keys with a row-index clock). The result reaches
+the verdict through `publish`: a boundary pin to the public input on a row whose schedule a fixed
+column forces, with the transition chain determined from the pinned origins.
 
 ```rust
 use hekate::core::errors;
-use hekate::core::trace::ColumnType;
-use hekate::math::Block128;
-use hekate_gadgets::{CpuArithColumns, CpuIntArithmeticUnit, IntArithmeticChiplet};
+use hekate::math::{Block128, TowerField};
+use hekate_gadgets::{CpuArithColumns, IntArithmeticChiplet};
+use hekate_program::FixedShape;
 use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
-use hekate_program::permutation::PermutationCheckSpec;
-use hekate_program::{Air, Program};
+use hekate_program::circuit::{Circuit, CircuitProgram};
 
 type F = Block128;
 
-#[derive(Clone)]
-struct FibProgram {
-    num_rows: usize,
-}
+fn build_program(num_rows: usize) -> errors::Result<CircuitProgram<F>> {
+    let mut cx = Circuit::<F>::new("Fibonacci", num_rows)?;
 
-impl Air<F> for FibProgram {
-    fn num_columns(&self) -> usize {
-        CpuArithColumns::NUM_COLUMNS
-    }
+    let cpu = cx.schema(&CpuArithColumns::build_layout());
+    let selector = cpu.at(CpuArithColumns::SELECTOR);
+    let a = cpu.at(CpuArithColumns::VAL_A);
+    let b = cpu.at(CpuArithColumns::VAL_B);
+    let res = cpu.at(CpuArithColumns::VAL_RES);
 
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        LAYOUT.get_or_init(CpuArithColumns::build_layout)
-    }
+    let cs = cx.cs();
 
-    fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
-        vec![BoundaryConstraint::with_public_input(
-            CpuArithColumns::VAL_B,
-            self.num_rows - 1,
-            0,
-        )]
-    }
+    let s = cs.col(selector.index());
+    let val_b = cs.col(b.index());
+    let val_res = cs.col(res.index());
+    let next_a = cs.next(a.index());
+    let next_b = cs.next(b.index());
 
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![(
-            IntArithmeticChiplet::BUS_ID.into(),
-            CpuIntArithmeticUnit::linking_spec(),
-        )]
-    }
+    cs.constrain(s * (next_a + val_b));     // next_a = b
+    cs.constrain(s * (next_b + val_res));   // next_b = a + b (chiplet provides val_res)
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
+    cx.bus(
+        IntArithmeticChiplet::BUS_ID,
+        IntArithmeticChiplet::cpu_linking_spec(),
+    );
 
-        let s = cs.col(CpuArithColumns::SELECTOR);
-        let val_b = cs.col(CpuArithColumns::VAL_B);
-        let val_res = cs.col(CpuArithColumns::VAL_RES);
-        let next_a = cs.next(CpuArithColumns::VAL_A);
-        let next_b = cs.next(CpuArithColumns::VAL_B);
+    cx.attach(ChipletDef::from_air(&IntArithmeticChiplet::new(
+        32,
+        num_rows,
+        num_rows - 1,
+    )?)?);
 
-        cs.assert_boolean(s);
-        cs.constrain(s * (next_a + val_b));     // next_a = b
-        cs.constrain(s * (next_b + val_res));   // next_b = a + b (chiplet provides val_res)
+    cx.fix(
+        selector,
+        FixedShape::Cadence {
+            stride: 1,
+            count: num_rows - 1,
+            origin: 0,
+            values: vec![F::ONE],
+        },
+    );
 
-        cs.build()
-    }
-}
+    cx.boundary(a, 0, F::ZERO);
+    cx.boundary(b, 0, F::ONE);
 
-impl Program<F> for FibProgram {
-    fn num_public_inputs(&self) -> usize { 1 }
+    cx.publish(b, num_rows - 1);
 
-    fn chiplet_defs(&self) -> errors::Result<Vec<ChipletDef<F>>> {
-        let arith = IntArithmeticChiplet::new(32, self.num_rows)?;
-        Ok(vec![ChipletDef::from_air(&arith)?])
-    }
+    cx.compile()
 }
 ```
 
 Trace generation builds the CPU columns and the chiplet trace independently; they meet on the bus.
+`CpuArithColumns` is the shipped CPU-side schema for that bus.
 
 ```rust
 use hekate::core::errors;
 use hekate::core::trace::{ColumnTrace, TraceBuilder};
-use hekate::math::{Bit, Block32};
+use hekate::math::{Bit, Block32, TowerField};
 use hekate_gadgets::{
     ArithmeticOpcode, CpuArithColumns, IntArithmeticLayout, IntArithmeticOp,
     generate_arithmetic_trace,
@@ -197,7 +190,7 @@ fn generate_traces(num_rows: usize) -> errors::Result<(ColumnTrace, ColumnTrace,
         b = res;
     }
 
-    // Padding row: selector = 0, val_b carries fib[N-1] for the boundary check.
+    // Padding row: selector = 0, val_b carries fib[N-1] for the boundary pin.
     tb.set_b32(CpuArithColumns::VAL_A, num_rows - 1, Block32::from(a))?;
     tb.set_b32(CpuArithColumns::VAL_B, num_rows - 1, Block32::from(b))?;
 
@@ -221,7 +214,6 @@ and the evaluation openings hold.
 
 ```rust
 use hekate::core::config::Config;
-use hekate::core::errors;
 use hekate::crypto::DefaultHasher;
 use hekate::crypto::transcript::Transcript;
 use hekate_program::{ProgramInstance, ProgramWitness};
@@ -229,17 +221,17 @@ use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 use rand::{TryRngCore, rngs::OsRng};
 
-fn run(num_rows: usize) -> errors::Result<bool> {
+fn run(num_rows: usize, audited_id: &[u8; 32]) -> Result<bool, Box<dyn core::error::Error>> {
     let (cpu, arith, fib_n) = generate_traces(num_rows)?;
 
-    let program = FibProgram { num_rows };
+    let program = build_program(num_rows)?;
     let instance = ProgramInstance::new(num_rows, vec![F::from(fib_n as u128)]);
     let witness = ProgramWitness::new(cpu).with_chiplets(vec![arith]);
 
     let config = Config::default();
 
     let mut blinding_seed = [0u8; 32];
-    OsRng.try_fill_bytes(&mut blinding_seed).unwrap();
+    OsRng.try_fill_bytes(&mut blinding_seed)?;
 
     let proof = prove(
         b"Fibonacci",
@@ -253,13 +245,16 @@ fn run(num_rows: usize) -> errors::Result<bool> {
 
     let mut transcript = Transcript::<DefaultHasher>::new(b"Fibonacci");
 
-    HekateVerifier::<F, DefaultHasher>::verify(
+    // `audited_id` is a constant of the verifying build,
+    // printed once by `digest::program_id_hex`.
+    Ok(HekateVerifier::<F, DefaultHasher>::verify(
+        audited_id,
         &program,
         &instance,
         &proof,
         &mut transcript,
         &config,
-    )
+    )?)
 }
 ```
 

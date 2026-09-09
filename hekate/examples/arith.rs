@@ -5,7 +5,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use hekate::core::trace::{ColumnTrace, ColumnType};
+use hekate::core::trace::ColumnTrace;
 use hekate::crypto::DefaultHasher;
 use hekate::crypto::transcript::Transcript;
 use hekate::math::Block128;
@@ -16,9 +16,8 @@ use hekate_gadgets::{
     generate_arithmetic_trace,
 };
 use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::ConstraintAst;
-use hekate_program::expander::VirtualExpander;
-use hekate_program::{Air, InlineKernelHint, Program, ProgramInstance, ProgramWitness};
+use hekate_program::circuit::{Circuit, CircuitProgram};
+use hekate_program::{ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 use rand::{TryRngCore, rngs::OsRng};
@@ -39,46 +38,14 @@ type H = DefaultHasher;
 // Workload     = cycle through ADD, SUB, AND, XOR, NOT, LT.
 // =================================================================
 
-#[derive(Clone)]
-struct ArithProgram {
-    chiplet: IntArithmeticChiplet,
+fn build_program(num_rows: usize, num_ops: usize) -> errors::Result<CircuitProgram<F>> {
+    let chiplet = IntArithmeticChiplet::new(32, num_rows, num_ops)?;
+
+    let mut cx = Circuit::<F>::new("ArithInline", num_rows)?;
+    cx.mount_unlinked(ChipletDef::from_air(&chiplet)?);
+
+    cx.compile()
 }
-
-impl ArithProgram {
-    fn new(num_rows: usize) -> Self {
-        let chiplet = IntArithmeticChiplet::new(32, num_rows)
-            .expect("IntArithmeticChiplet::new(32, num_rows)");
-        Self { chiplet }
-    }
-}
-
-impl Air<F> for ArithProgram {
-    fn column_layout(&self) -> &[ColumnType] {
-        <IntArithmeticChiplet as Air<F>>::column_layout(&self.chiplet)
-    }
-
-    fn virtual_expander(&self) -> Option<&VirtualExpander> {
-        <IntArithmeticChiplet as Air<F>>::virtual_expander(&self.chiplet)
-    }
-
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        <IntArithmeticChiplet as Air<F>>::constraint_ast(&self.chiplet)
-    }
-
-    fn inline_chiplets(&self) -> errors::Result<Vec<ChipletDef<F>>> {
-        Ok(vec![ChipletDef::from_air(&self.chiplet)?])
-    }
-
-    fn inline_chiplet_kernels(&self) -> Vec<InlineKernelHint> {
-        vec![InlineKernelHint {
-            chiplet_idx: 0,
-            root_offset: 0,
-            column_offset: 0,
-        }]
-    }
-}
-
-impl Program<F> for ArithProgram {}
 
 // =================================================================
 // 2. WORKLOAD + TRACE GENERATION
@@ -152,7 +119,7 @@ fn main() {
         generate_arith_trace(num_ops, num_rows).expect("arith trace")
     });
 
-    let program = ArithProgram::new(num_rows);
+    let program = build_program(num_rows, num_ops).expect("program build");
     let instance = ProgramInstance::new(num_rows, vec![]);
     let witness = ProgramWitness::new(trace);
 
@@ -173,8 +140,10 @@ fn main() {
 
     let mut verifier_transcript = Transcript::<H>::new(b"Arith_Example");
 
+    let pinned_id = common::audited_id(&program);
     let is_valid = common::phase_with_mem("Verifying", || {
         HekateVerifier::<F, H>::verify(
+            &pinned_id,
             &program,
             &instance,
             &proof,

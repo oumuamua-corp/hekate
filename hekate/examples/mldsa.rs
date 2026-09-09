@@ -18,20 +18,18 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use hekate::core::trace::{ColumnType, TraceBuilder};
+use hekate::core::trace::TraceBuilder;
 use hekate::crypto::DefaultHasher;
 use hekate::crypto::transcript::Transcript;
 use hekate::math::{Bit, Block32, Block128};
 use hekate_core::config::Config;
+use hekate_core::errors;
 use hekate_math::TowerField;
 use hekate_pqc::mldsa::{
-    self, CpuMlDsaColumns, CpuMlDsaUnit, MlDsaChiplet, MlDsaLevel, MlDsaPublicKey, MlDsaSignature,
+    self, CpuMlDsaColumns, MlDsaChiplet, MlDsaLevel, MlDsaPublicKey, MlDsaSignature,
 };
-use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
-use hekate_program::permutation::PermutationCheckSpec;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::circuit::{Circuit, CircuitProgram};
+use hekate_program::{FixedShape, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 use ml_dsa::signature::{Keypair, Signer};
@@ -46,54 +44,40 @@ type H = DefaultHasher;
 // ML-DSA Verification Program
 // =================================================================
 
-#[derive(Clone)]
-struct MlDsaVerifyProgram {
-    mldsa: MlDsaChiplet<F>,
+/// The commitment hash words are read on the rows
+/// the pinned `SELECTOR` forces onto the data bus.
+fn build_program(
+    cpu_rows: usize,
     num_public: usize,
-}
+    mldsa: &MlDsaChiplet<F>,
+) -> errors::Result<CircuitProgram<F>> {
+    let mut cx = Circuit::<F>::new("MlDsaVerifyProgram", cpu_rows)?;
+    let cpu = cx.schema(&CpuMlDsaColumns::build_layout());
 
-impl Air<F> for MlDsaVerifyProgram {
-    fn name(&self) -> String {
-        "MlDsaVerifyProgram".into()
+    let data = cpu.at(CpuMlDsaColumns::DATA);
+    let selector = cpu.at(CpuMlDsaColumns::SELECTOR);
+
+    cx.bus(mldsa::MLDSA_DATA_BUS_ID, mldsa::cpu_data_spec());
+
+    cx.fix(
+        selector,
+        FixedShape::Cadence {
+            stride: 1,
+            count: num_public,
+            origin: 0,
+            values: vec![F::ONE],
+        },
+    );
+
+    for row in 0..num_public {
+        cx.publish(data, row);
     }
 
-    fn num_columns(&self) -> usize {
-        CpuMlDsaUnit::num_columns()
+    for def in mldsa.composite().flatten_defs()? {
+        cx.attach(def);
     }
 
-    fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
-        (0..self.num_public)
-            .map(|k| BoundaryConstraint::with_public_input(CpuMlDsaColumns::DATA, k, k))
-            .collect()
-    }
-
-    fn column_layout(&self) -> &[ColumnType] {
-        Box::leak(CpuMlDsaColumns::build_layout().into_boxed_slice())
-    }
-
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![(
-            mldsa::MLDSA_DATA_BUS_ID.into(),
-            CpuMlDsaUnit::linking_spec(),
-        )]
-    }
-
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CpuMlDsaColumns::SELECTOR));
-
-        cs.build()
-    }
-}
-
-impl Program<F> for MlDsaVerifyProgram {
-    fn num_public_inputs(&self) -> usize {
-        self.num_public
-    }
-
-    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        self.mldsa.composite().flatten_defs()
-    }
+    cx.compile()
 }
 
 // =================================================================
@@ -115,7 +99,7 @@ fn run_mldsa(label: &str, level: MlDsaLevel, pk_bytes: &[u8], sig_bytes: &[u8], 
 
     // Phase 1:
     // Generate traces.
-    let mldsa_chiplet = MlDsaChiplet::<F>::new(level);
+    let mldsa_chiplet = MlDsaChiplet::<F>::new(level, msg.len());
 
     let (cpu_trace, chiplet_traces, io_public) = common::phase("Trace Generation", || {
         let chiplet_traces = mldsa_chiplet
@@ -165,10 +149,7 @@ fn run_mldsa(label: &str, level: MlDsaLevel, pk_bytes: &[u8], sig_bytes: &[u8], 
 
     // Phase 2:
     // Prove
-    let air = MlDsaVerifyProgram {
-        mldsa: mldsa_chiplet,
-        num_public: ct_public.len(),
-    };
+    let air = build_program(cpu_num_rows, ct_public.len(), &mldsa_chiplet).unwrap();
 
     let instance = ProgramInstance::new(cpu_num_rows, ct_public);
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(chiplet_traces);
@@ -199,9 +180,18 @@ fn run_mldsa(label: &str, level: MlDsaLevel, pk_bytes: &[u8], sig_bytes: &[u8], 
     // Phase 3:
     // Verify
     let mut verifier_transcript = Transcript::<H>::new(domain);
+    let pinned_id = common::audited_id(&air);
+
     let is_valid = common::phase_with_mem("Verifying", || {
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut verifier_transcript, &config)
-            .expect("Verifier failed")
+        HekateVerifier::<F, H>::verify(
+            &pinned_id,
+            &air,
+            &instance,
+            &proof,
+            &mut verifier_transcript,
+            &config,
+        )
+        .expect("Verifier failed")
     });
 
     common::result(is_valid);

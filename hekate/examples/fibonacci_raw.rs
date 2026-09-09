@@ -13,19 +13,17 @@ use hekate_core::errors;
 use hekate_core::trace::{Trace, TraceBuilder};
 use hekate_crypto::transcript::Transcript;
 use hekate_gadgets::atoms::int_arith::add_carry_chain_with_carry_in;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
+use hekate_program::circuit::{Circuit, CircuitProgram};
 use hekate_program::define_columns;
-use hekate_program::expander::VirtualExpander;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::{FixedShape, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 use rand::{TryRngCore, rngs::OsRng};
-use std::sync::OnceLock;
 
 // =================================================================
 // 1. CONFIGURATION
 // =================================================================
+
 type F = Block128;
 type H = DefaultHasher;
 
@@ -39,9 +37,6 @@ type H = DefaultHasher;
 // virtually into 128 bit slots the adder operates
 // on; the same four expose a packed view for
 // transition equalities.
-//
-// Total:
-// 17 bytes/row, 133 virtual cols.
 // =================================================================
 define_columns! {
     FibIntPhys {
@@ -53,86 +48,48 @@ define_columns! {
     }
 }
 
-define_columns! {
-    FibIntVirt {
-        A_BITS: [Bit; 32],
-        B_BITS: [Bit; 32],
-        SUM_BITS: [Bit; 32],
-        CARRY_BITS: [Bit; 32],
-        A_PACKED: B32,
-        B_PACKED: B32,
-        SUM_PACKED: B32,
-        CARRY_PACKED: B32,
-        Q: Bit,
-    }
-}
+fn build_program(num_rows: usize) -> errors::Result<CircuitProgram<F>> {
+    let mut cx = Circuit::<F>::new("FibonacciRaw", num_rows)?;
 
-#[derive(Clone)]
-struct FibIntProgram {
-    num_rows: usize,
-}
+    let words = cx.expand_bits(4, ColumnType::B32);
+    let packed = cx.reuse_pass_through(&words);
 
-impl Air<F> for FibIntProgram {
-    fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
-        vec![BoundaryConstraint::with_public_input(
-            FibIntVirt::B_PACKED,
-            self.num_rows - 1,
-            0,
-        )]
-    }
+    let q = cx.column(ColumnType::Bit);
 
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: OnceLock<Vec<ColumnType>> = OnceLock::new();
-        LAYOUT.get_or_init(FibIntPhys::build_layout)
-    }
+    let [a_packed, b_packed_col, sum_packed_col] = [packed.at(0), packed.at(1), packed.at(2)];
 
-    fn virtual_expander(&self) -> Option<&VirtualExpander> {
-        static E: OnceLock<VirtualExpander> = OnceLock::new();
-        Some(E.get_or_init(|| {
-            VirtualExpander::new()
-                .expand_bits(4, ColumnType::B32)
-                .reuse_pass_through(0, 4)
-                .control_bits(1)
-                .build()
-                .expect("FibIntProgram expander")
-        }))
-    }
+    let cs = cx.cs();
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
+    let a_bits: Vec<_> = words.bits(0).iter().map(|c| cs.col(c.index())).collect();
+    let b_bits: Vec<_> = words.bits(1).iter().map(|c| cs.col(c.index())).collect();
+    let sum_bits: Vec<_> = words.bits(2).iter().map(|c| cs.col(c.index())).collect();
+    let carry_v: Vec<_> = words.bits(3).iter().map(|c| cs.col(c.index())).collect();
 
-        let a_bits: Vec<_> = (0..32).map(|i| cs.col(FibIntVirt::A_BITS + i)).collect();
-        let b_bits: Vec<_> = (0..32).map(|i| cs.col(FibIntVirt::B_BITS + i)).collect();
-        let sum_bits: Vec<_> = (0..32).map(|i| cs.col(FibIntVirt::SUM_BITS + i)).collect();
-        let carry_v: Vec<_> = (0..32)
-            .map(|i| cs.col(FibIntVirt::CARRY_BITS + i))
-            .collect();
+    let zero = cs.constant(F::ZERO);
 
-        let zero = cs.constant(F::ZERO);
+    let mut carry = Vec::with_capacity(33);
+    carry.push(zero);
+    carry.extend(carry_v.iter().copied());
 
-        let mut carry = Vec::with_capacity(33);
-        carry.push(zero);
-        carry.extend(carry_v.iter().copied());
+    add_carry_chain_with_carry_in(cs, &a_bits, &b_bits, &sum_bits, &carry);
 
-        add_carry_chain_with_carry_in(&cs, &a_bits, &b_bits, &sum_bits, &carry);
+    let q_cell = cs.col(q.index());
+    let b_packed = cs.col(b_packed_col.index());
+    let sum_packed = cs.col(sum_packed_col.index());
+    let next_a = cs.next(a_packed.index());
+    let next_b = cs.next(b_packed_col.index());
 
-        let q = cs.col(FibIntVirt::Q);
-        let b_packed = cs.col(FibIntVirt::B_PACKED);
-        let sum_packed = cs.col(FibIntVirt::SUM_PACKED);
-        let next_a = cs.next(FibIntVirt::A_PACKED);
-        let next_b = cs.next(FibIntVirt::B_PACKED);
+    cs.constrain(q_cell * (next_a + b_packed));
+    cs.constrain(q_cell * (next_b + sum_packed));
 
-        cs.constrain(q * (next_a + b_packed));
-        cs.constrain(q * (next_b + sum_packed));
+    cx.fix(q, FixedShape::LastRow);
 
-        cs.build()
-    }
-}
+    cx.boundary(a_packed, 0, F::ZERO);
+    cx.boundary(b_packed_col, 0, F::ONE);
 
-impl Program<F> for FibIntProgram {
-    fn num_public_inputs(&self) -> usize {
-        1
-    }
+    cx.publish(b_packed_col, num_rows - 1);
+
+    cx.compile()
 }
 
 // =================================================================
@@ -213,7 +170,7 @@ fn main() {
 
     let instance = ProgramInstance::new(num_rows, vec![expected_result]);
     let witness = ProgramWitness::new(trace);
-    let program = FibIntProgram { num_rows };
+    let program = build_program(num_rows).expect("program build");
 
     let proof = common::phase("Proving", || {
         prove(
@@ -232,8 +189,11 @@ fn main() {
 
     let mut verifier_transcript = Transcript::<H>::new(b"FibonacciInt");
 
+    let pinned_id = common::audited_id::<F, _>(&program);
+
     let is_valid = common::phase_with_mem("Verifying", || {
         HekateVerifier::<F, H>::verify(
+            &pinned_id,
             &program,
             &instance,
             &proof,

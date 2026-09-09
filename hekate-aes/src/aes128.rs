@@ -17,16 +17,16 @@ use hekate_core::errors::Error;
 use hekate_core::trace::{ColumnTrace, ColumnType, TraceCompatibleField};
 use hekate_math::TowerField;
 use hekate_math::{Flat, HardwareField, PackableField};
-use hekate_program::Air;
 use hekate_program::chiplet::CompositeChiplet;
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
 use hekate_program::define_columns;
 use hekate_program::expander::VirtualExpander;
-use hekate_program::permutation::{PermutationCheckSpec, REQUEST_IDX_LABEL, Source};
+use hekate_program::permutation::{BusKind, PermutationCheckSpec, Service, ServiceSlot};
+use hekate_program::{Air, FixedColumn, FixedShape, fix};
 
 use super::sbox_rom;
-use super::{AES_BYTE_LABELS, AES_DIRECTION_LABEL, ROT_MAP, SBOX_IN_LABELS, SBOX_OUT_LABELS};
+use super::{AES_BYTE_LABELS, AES_DIRECTION_LABEL, ROT_MAP};
 
 #[rustfmt::skip]
 pub const AES_KEY_LABELS: [&[u8]; 16] = [
@@ -121,9 +121,14 @@ define_columns! {
     }
 }
 
+/// AES-128 as 10 round rows plus one output row per block.
+///
+/// Blocks sit contiguously at rows `0..11·num_blocks`.
+/// The schedule columns are fixed columns on
+/// a stride-11 cadence of `num_blocks` blocks.
 #[derive(Clone, Debug)]
 pub struct AesRound128Air {
-    pub num_rows: usize,
+    num_blocks: usize,
 }
 
 impl AesRound128Air {
@@ -133,71 +138,91 @@ impl AesRound128Air {
     /// 9 full rounds and the final round.
     pub const ACTIVE_ROWS: usize = 10;
 
+    /// Rounds plus the output row.
+    pub const BLOCK_ROWS: usize = Self::ACTIVE_ROWS + 1;
+
     /// FIPS 197 §5.2 round constants.
     const RCON: [u8; Self::ACTIVE_ROWS] =
         [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36];
 
-    pub(crate) fn new(num_rows: usize) -> Self {
-        Self { num_rows }
+    pub(crate) fn new(num_blocks: usize) -> Self {
+        Self { num_blocks }
     }
 
-    pub fn for_constraints() -> Self {
-        Self { num_rows: 0 }
-    }
+    /// Both endpoints derive from this schema: 16 state
+    /// bytes, the request-index clock, direction.
+    pub fn link_service() -> Service {
+        let mut slots = Vec::with_capacity(18);
 
-    /// External bus:
-    /// 16 state_in bytes gated by s_in_out.
-    pub fn link_spec() -> PermutationCheckSpec {
-        let mut sources: Vec<_> = (0..16)
-            .map(|i| {
-                (
-                    Source::Column(Aes128Columns::STATE_IN + i),
-                    AES_BYTE_LABELS[i],
-                )
-            })
-            .collect();
-
-        sources.push((
-            Source::Column(Aes128Columns::REQUEST_IDX_LINK),
-            REQUEST_IDX_LABEL,
-        ));
-        sources.push((Source::Column(Aes128Columns::S_INPUT), AES_DIRECTION_LABEL));
-
-        PermutationCheckSpec::new(sources, Some(Aes128Columns::S_IN_OUT))
-    }
-
-    /// External bus:
-    /// 16 K0 bytes gated by s_input.
-    pub fn key_spec() -> PermutationCheckSpec {
-        let mut sources: Vec<_> = (0..16)
-            .map(|i| (Source::Column(Aes128Columns::K0 + i), AES_KEY_LABELS[i]))
-            .collect();
-
-        sources.push((
-            Source::Column(Aes128Columns::REQUEST_IDX_KEY),
-            REQUEST_IDX_LABEL,
-        ));
-
-        PermutationCheckSpec::new(sources, Some(Aes128Columns::S_INPUT))
-    }
-
-    /// Per-byte-position S-box bus specs.
-    pub fn sbox_specs() -> Vec<(String, PermutationCheckSpec)> {
-        let mut sources = Vec::with_capacity(32);
-        for i in 0..16 {
-            sources.push((
-                Source::Column(Aes128Columns::STATE_IN + i),
-                SBOX_IN_LABELS[i],
-            ));
-            sources.push((
-                Source::Column(Aes128Columns::SBOX_OUT + i),
-                SBOX_OUT_LABELS[i],
-            ));
+        for label in AES_BYTE_LABELS {
+            slots.push(ServiceSlot::Value(label));
         }
 
-        sources.push((Source::RowIndexLeBytes(4), REQUEST_IDX_LABEL));
+        slots.push(ServiceSlot::RequestIdx { num_bytes: 4 });
+        slots.push(ServiceSlot::Value(AES_DIRECTION_LABEL));
 
-        let spec = PermutationCheckSpec::new(sources, Some(Aes128Columns::S_ACTIVE));
+        Service {
+            bus_id: Self::LINK_BUS_ID,
+            kind: BusKind::Permutation,
+            slots,
+            clock_waiver: None,
+        }
+    }
+
+    /// Both endpoints derive from this schema:
+    /// 16 key bytes and the request-index clock.
+    pub fn key_service() -> Service {
+        let mut slots = Vec::with_capacity(17);
+
+        for label in AES_KEY_LABELS {
+            slots.push(ServiceSlot::Value(label));
+        }
+
+        slots.push(ServiceSlot::RequestIdx { num_bytes: 4 });
+
+        Service {
+            bus_id: Self::KEY_BUS_ID,
+            kind: BusKind::Permutation,
+            slots,
+            clock_waiver: None,
+        }
+    }
+
+    pub fn link_spec() -> PermutationCheckSpec {
+        let mut values: Vec<usize> = (0..16).map(|i| Aes128Columns::STATE_IN + i).collect();
+        values.push(Aes128Columns::S_INPUT);
+
+        Self::link_service()
+            .respond(
+                &values,
+                &[Aes128Columns::REQUEST_IDX_LINK],
+                Aes128Columns::S_IN_OUT,
+            )
+            .expect("service slots match the responder columns")
+    }
+
+    pub fn key_spec() -> PermutationCheckSpec {
+        let values: Vec<usize> = (0..16).map(|i| Aes128Columns::K0 + i).collect();
+
+        Self::key_service()
+            .respond(
+                &values,
+                &[Aes128Columns::REQUEST_IDX_KEY],
+                Aes128Columns::S_INPUT,
+            )
+            .expect("service slots match the responder columns")
+    }
+
+    pub fn sbox_specs() -> Vec<(String, PermutationCheckSpec)> {
+        let spec = sbox_rom::SboxRomChiplet::service()
+            .request(
+                &sbox_rom::SboxRomChiplet::byte_columns(
+                    Aes128Columns::STATE_IN,
+                    Aes128Columns::SBOX_OUT,
+                ),
+                Aes128Columns::S_ACTIVE,
+            )
+            .expect("service slots match the requester columns");
 
         vec![(sbox_rom::SboxRomChiplet::BUS_ID.into(), spec)]
     }
@@ -220,6 +245,46 @@ impl<F: TowerField> Air<F> for AesRound128Air {
         checks.extend(Self::sbox_specs());
 
         checks
+    }
+
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        const ACTIVE: usize = AesRound128Air::ACTIVE_ROWS;
+
+        let stride = Self::BLOCK_ROWS;
+        let block = |values: Vec<F>| FixedShape::Cadence {
+            stride,
+            count: self.num_blocks,
+            origin: 0,
+            values,
+        };
+
+        let shape = |pred: &dyn Fn(usize) -> bool| {
+            block(
+                (0..stride)
+                    .map(|off| if pred(off) { F::ONE } else { F::ZERO })
+                    .collect(),
+            )
+        };
+
+        let mut pins = Vec::with_capacity(21);
+
+        pins.push(fix(Aes128Columns::S_ROUND, shape(&|off| off < ACTIVE - 1)));
+        pins.push(fix(Aes128Columns::S_FINAL, shape(&|off| off == ACTIVE - 1)));
+        pins.push(fix(
+            Aes128Columns::S_IN_OUT,
+            shape(&|off| off == 0 || off == stride - 1),
+        ));
+        pins.push(fix(Aes128Columns::S_ACTIVE, shape(&|off| off < ACTIVE)));
+        pins.push(fix(Aes128Columns::S_INPUT, shape(&|off| off == 0)));
+
+        for k in 0..16 {
+            pins.push(fix(
+                Aes128Columns::ROUND_BITS + k,
+                shape(&|off| k < ACTIVE && off == k),
+            ));
+        }
+
+        pins
     }
 
     fn virtual_expander(&self) -> Option<&VirtualExpander> {
@@ -249,67 +314,14 @@ impl<F: TowerField> Air<F> for AesRound128Air {
         let cs = ConstraintSystem::<F>::new();
 
         let s_round = cs.col(Aes128Columns::S_ROUND);
-        let s_final = cs.col(Aes128Columns::S_FINAL);
-        let s_in_out = cs.col(Aes128Columns::S_IN_OUT);
-        let s_active = cs.col(Aes128Columns::S_ACTIVE);
-
         let s_input = cs.col(Aes128Columns::S_INPUT);
         let one = cs.one();
 
-        // Bus selectors: link, sbox, key
-        cs.assert_boolean(s_in_out);
-        cs.assert_boolean(s_active);
-        cs.assert_boolean(s_input);
-
-        // Round index: one-hot at 0 on the input row, one
-        // shift per active row, block ends after round 9.
+        // The schedule is cadence pins; only the round
+        // function and key schedule remain as roots.
         const ACTIVE: usize = AesRound128Air::ACTIVE_ROWS;
 
         let round = |k: usize| cs.col(Aes128Columns::ROUND_BITS + k);
-        let weighted = |lo: usize, hi: usize| {
-            cs.sum(
-                &(lo..hi)
-                    .map(|k| cs.scale(F::from(1u128 << k), round(k)))
-                    .collect::<Vec<_>>(),
-            )
-        };
-        let weighted_next = |lo: usize, hi: usize| {
-            cs.sum(
-                &(lo..hi)
-                    .map(|k| cs.scale(F::from(1u128 << k), cs.next(Aes128Columns::ROUND_BITS + k)))
-                    .collect::<Vec<_>>(),
-            )
-        };
-
-        cs.constrain(weighted(ACTIVE, 16));
-
-        // Every selector is a function of the index;
-        // none of them is free witness anywhere.
-        cs.constrain(s_active + cs.sum(&(0..ACTIVE).map(round).collect::<Vec<_>>()));
-        cs.constrain(s_final + round(ACTIVE - 1));
-        cs.constrain(s_input + round(0));
-        cs.constrain(s_round + s_active + s_final);
-
-        // A run may only begin on an input row
-        let not_active = one + s_active;
-
-        cs.assert_zero_when(not_active, weighted(0, ACTIVE));
-        cs.assert_zero_when(not_active, weighted_next(1, ACTIVE));
-        cs.constrain(round(0) * (one + s_in_out));
-
-        for k in 0..ACTIVE - 1 {
-            cs.constrain(s_active * (cs.next(Aes128Columns::ROUND_BITS + k + 1) + round(k)));
-        }
-
-        let next_s_active = cs.next(Aes128Columns::S_ACTIVE);
-        let next_s_in_out = cs.next(Aes128Columns::S_IN_OUT);
-
-        // An active row is followed by an active row or an output
-        // row, and the row before an output row is active. `next`
-        // wraps at the trace end, which carries this onto row 0.
-        cs.constrain(s_active * (one + next_s_active + next_s_in_out));
-        cs.constrain(next_s_in_out * (one + next_s_active) * (one + s_active));
-        cs.constrain(s_active * (next_s_active + one + round(ACTIVE - 1)));
 
         super::build_round_constraints(
             &cs,
@@ -443,68 +455,6 @@ define_columns! {
     }
 }
 
-/// The host writes `KEY_SELECTOR` on each block's input
-/// row, `SELECTOR` on both emit rows, and calls `constrain`.
-pub struct CpuAes128Unit;
-
-impl CpuAes128Unit {
-    pub const NUM_ROOTS: usize = 5;
-
-    pub fn num_columns() -> usize {
-        CpuAes128Columns::NUM_COLUMNS
-    }
-
-    /// Requires each call's two emits on adjacent rows;
-    /// a host that separates them pins `KEY_SELECTOR` itself.
-    ///
-    /// `offset` is where `CpuAes128Columns` starts in the host layout.
-    pub fn constrain<F: TowerField>(cs: &ConstraintSystem<F>, offset: usize) {
-        let sel = cs.col(offset + CpuAes128Columns::SELECTOR);
-        let dir = cs.col(offset + CpuAes128Columns::KEY_SELECTOR);
-        let next_sel = cs.next(offset + CpuAes128Columns::SELECTOR);
-        let next_dir = cs.next(offset + CpuAes128Columns::KEY_SELECTOR);
-        let one = cs.one();
-
-        cs.assert_boolean(sel);
-        cs.assert_boolean(dir);
-
-        cs.constrain(dir * (one + sel));
-        cs.constrain(sel * (dir + next_dir + next_sel));
-        cs.constrain(next_sel * (one + sel) * (one + next_dir));
-    }
-
-    /// `KEY_SELECTOR` doubles as the emit direction;
-    /// it must fire on exactly the block's input row.
-    pub fn linking_spec() -> PermutationCheckSpec {
-        let mut sources: Vec<_> = (0..16)
-            .map(|i| {
-                (
-                    Source::Column(CpuAes128Columns::DATA + i),
-                    AES_BYTE_LABELS[i],
-                )
-            })
-            .collect();
-
-        sources.push((Source::RowIndexLeBytes(4), REQUEST_IDX_LABEL));
-        sources.push((
-            Source::Column(CpuAes128Columns::KEY_SELECTOR),
-            AES_DIRECTION_LABEL,
-        ));
-
-        PermutationCheckSpec::new(sources, Some(CpuAes128Columns::SELECTOR))
-    }
-
-    pub fn key_linking_spec() -> PermutationCheckSpec {
-        let mut sources: Vec<_> = (0..16)
-            .map(|i| (Source::Column(CpuAes128Columns::KEY + i), AES_KEY_LABELS[i]))
-            .collect();
-
-        sources.push((Source::RowIndexLeBytes(4), REQUEST_IDX_LABEL));
-
-        PermutationCheckSpec::new(sources, Some(CpuAes128Columns::KEY_SELECTOR))
-    }
-}
-
 // =================================================================
 // AES-128 Composite Chiplet
 // =================================================================
@@ -522,7 +472,7 @@ where
     <F as PackableField>::Packed: Copy + Send + Sync,
     Flat<F>: Send + Sync,
 {
-    pub fn new(num_rows: usize, sbox_rom_rows: usize) -> Result<Self, Error> {
+    pub fn new(num_rows: usize, sbox_rom_rows: usize, num_blocks: usize) -> Result<Self, Error> {
         if !num_rows.is_power_of_two() {
             return Err(Error::Protocol {
                 protocol: "aes128_chiplet",
@@ -530,8 +480,23 @@ where
             });
         }
 
-        let round_air = AesRound128Air::new(num_rows);
-        let sbox_rom = sbox_rom::SboxRomChiplet::new(sbox_rom_rows)?;
+        let span = num_blocks
+            .checked_mul(AesRound128Air::BLOCK_ROWS)
+            .ok_or(Error::Protocol {
+                protocol: "aes128_chiplet",
+                message: "num_blocks exceeds the trace height",
+            })?;
+
+        if span > num_rows {
+            return Err(Error::Protocol {
+                protocol: "aes128_chiplet",
+                message: "num_blocks exceeds the trace height",
+            });
+        }
+
+        let round_air = AesRound128Air::new(num_blocks);
+        let sbox_rom =
+            sbox_rom::SboxRomChiplet::new(sbox_rom_rows, num_blocks * AesRound128Air::ACTIVE_ROWS)?;
 
         let composite = CompositeChiplet::<F>::builder("aes128")
             .chiplet(round_air)
@@ -603,6 +568,7 @@ where
 mod tests {
     use super::*;
     use hekate_math::Block128;
+    use hekate_program::permutation::REQUEST_IDX_LABEL;
 
     type F = Block128;
 
@@ -632,6 +598,7 @@ mod tests {
     #[test]
     fn physical_column_count() {
         let layout = PhysAes128Columns::build_layout();
+
         assert_eq!(layout.len(), PhysAes128Columns::NUM_COLUMNS);
         assert_eq!(PhysAes128Columns::NUM_COLUMNS, 96);
 
@@ -651,13 +618,46 @@ mod tests {
 
     #[test]
     fn constraint_count() {
-        let ast: ConstraintAst<F> = AesRound128Air::for_constraints().constraint_ast();
-        assert_eq!(ast.roots.len(), 207);
+        let ast: ConstraintAst<F> = AesRound128Air::new(4).constraint_ast();
+        assert_eq!(ast.roots.len(), 184);
+    }
+
+    #[test]
+    fn cadence_pins_pin_every_schedule_column() {
+        let air = AesRound128Air::new(4);
+        let pins = Air::<F>::fixed_columns(&air);
+
+        assert_eq!(pins.len(), 21);
+
+        let at = |col: usize, row: usize| {
+            pins.iter()
+                .find(|p| p.col_idx == col)
+                .unwrap()
+                .shape
+                .value_at_row(row, 10)
+        };
+
+        let one = Flat::from_raw(F::ONE);
+        let zero = Flat::from_raw(F::ZERO);
+
+        assert_eq!(at(Aes128Columns::S_INPUT, 0), one);
+        assert_eq!(at(Aes128Columns::S_IN_OUT, 0), one);
+        assert_eq!(at(Aes128Columns::S_ROUND, 8), one);
+        assert_eq!(at(Aes128Columns::S_ROUND, 9), zero);
+        assert_eq!(at(Aes128Columns::S_FINAL, 9), one);
+        assert_eq!(at(Aes128Columns::S_ACTIVE, 9), one);
+        assert_eq!(at(Aes128Columns::S_ACTIVE, 10), zero);
+        assert_eq!(at(Aes128Columns::S_IN_OUT, 10), one);
+        assert_eq!(at(Aes128Columns::ROUND_BITS + 3, 11 + 3), one);
+        assert_eq!(at(Aes128Columns::ROUND_BITS + 3, 11 + 4), zero);
+        assert_eq!(at(Aes128Columns::ROUND_BITS + 12, 12), zero);
+        assert_eq!(at(Aes128Columns::S_IN_OUT, 4 * 11), zero);
     }
 
     #[test]
     fn link_spec_structure() {
         let spec = AesRound128Air::link_spec();
+
         assert_eq!(spec.num_sources(), 18);
         assert_eq!(spec.selector, Some(Aes128Columns::S_IN_OUT));
         assert_eq!(spec.sources[16].1, REQUEST_IDX_LABEL);
@@ -665,17 +665,17 @@ mod tests {
     }
 
     #[test]
-    fn cpu_num_roots_matches_constrain() {
-        let cs = ConstraintSystem::<F>::new();
-        CpuAes128Unit::constrain(&cs, 0);
-
-        assert_eq!(cs.build().roots.len(), CpuAes128Unit::NUM_ROOTS);
-    }
-
-    #[test]
     fn link_endpoints_agree() {
         let chiplet = AesRound128Air::link_spec();
-        let cpu = CpuAes128Unit::linking_spec();
+
+        let cpu_values: Vec<usize> = (0..16)
+            .map(|i| CpuAes128Columns::DATA + i)
+            .chain([CpuAes128Columns::KEY_SELECTOR])
+            .collect();
+
+        let cpu = AesRound128Air::link_service()
+            .request(&cpu_values, CpuAes128Columns::SELECTOR)
+            .unwrap();
 
         assert_eq!(chiplet.num_sources(), cpu.num_sources());
 
@@ -690,6 +690,7 @@ mod tests {
         assert_eq!(specs.len(), 1);
 
         let (bus_id, spec) = &specs[0];
+
         assert_eq!(bus_id, sbox_rom::SboxRomChiplet::BUS_ID);
         assert_eq!(spec.num_sources(), 33);
         assert_eq!(spec.sources[32].1, REQUEST_IDX_LABEL);
@@ -700,6 +701,7 @@ mod tests {
     #[test]
     fn key_spec_structure() {
         let spec = AesRound128Air::key_spec();
+
         assert_eq!(spec.num_sources(), 17);
         assert_eq!(spec.selector, Some(Aes128Columns::S_INPUT));
         assert_eq!(spec.sources[16].1, REQUEST_IDX_LABEL);
@@ -707,7 +709,7 @@ mod tests {
 
     #[test]
     fn virtual_expander_dimensions() {
-        let air = AesRound128Air::for_constraints();
+        let air = AesRound128Air::new(4);
         let exp = Air::<F>::virtual_expander(&air).expect("expander must exist");
 
         assert_eq!(exp.num_physical_columns(), PhysAes128Columns::NUM_COLUMNS);
@@ -716,14 +718,15 @@ mod tests {
 
     #[test]
     fn composite_builds() {
-        let aes = Aes128Chiplet::<F>::new(16, 256).unwrap();
+        let aes = Aes128Chiplet::<F>::new(16, 256, 1).unwrap();
         assert_eq!(aes.composite().flatten_defs().unwrap().len(), 2);
     }
 
     #[test]
     fn new_validates() {
-        assert!(Aes128Chiplet::<F>::new(100, 256).is_err());
-        assert!(Aes128Chiplet::<F>::new(16, 7).is_err());
-        assert!(Aes128Chiplet::<F>::new(16, 16).is_ok());
+        assert!(Aes128Chiplet::<F>::new(100, 256, 1).is_err());
+        assert!(Aes128Chiplet::<F>::new(16, 7, 1).is_err());
+        assert!(Aes128Chiplet::<F>::new(16, 16, 2).is_err());
+        assert!(Aes128Chiplet::<F>::new(16, 16, 1).is_ok());
     }
 }

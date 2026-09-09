@@ -295,6 +295,40 @@ impl VirtualExpander {
         self
     }
 
+    /// Append another expander's entries after this
+    /// one's, shifting its physical references onto
+    /// this expander's coordinate space.
+    pub fn append(mut self, other: &VirtualExpander) -> Self {
+        if self.error.is_some() {
+            return self;
+        }
+
+        if let Some(e) = &other.error {
+            self.error = Some(*e);
+            return self;
+        }
+
+        let phy_shift = self.num_physical;
+        let byte_shift = self.physical_row_bytes;
+
+        for entry in &other.entries {
+            self.entries.push(CompiledEntry {
+                phy_col_start: entry.phy_col_start + phy_shift,
+                byte_offset: entry.byte_offset + byte_shift,
+                kind: entry.kind,
+                reuse: entry.reuse,
+            });
+        }
+
+        self.virtual_layout.extend_from_slice(&other.virtual_layout);
+
+        self.num_virtual += other.num_virtual;
+        self.num_physical += other.num_physical;
+        self.physical_row_bytes += other.physical_row_bytes;
+
+        self
+    }
+
     #[inline]
     pub fn num_virtual_columns(&self) -> usize {
         self.num_virtual

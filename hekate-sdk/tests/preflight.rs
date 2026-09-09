@@ -7,7 +7,7 @@ use hekate_core::trace::{ColumnTrace, ColumnType, TraceBuilder, TraceColumn};
 use hekate_math::{Bit, Block32, Block128, HardwareField, TowerField};
 use hekate_program::chiplet::ChipletDef;
 use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
+use hekate_program::constraint::{BoundaryConstraint, BoundaryTarget, ConstraintAst};
 use hekate_program::expander::VirtualExpander;
 use hekate_program::permutation::{BusKind, PermutationCheckSpec, REQUEST_IDX_LABEL, Source};
 use hekate_program::{Air, FixedColumn, Program, ProgramInstance, ProgramWitness, define_columns};
@@ -15,6 +15,8 @@ use hekate_sdk::preflight;
 use hekate_sdk::preflight::TableId;
 
 type F = Block128;
+
+const ACTIVE_BUS_ROWS: usize = 4;
 
 // =================================================================
 // COLUMN SCHEMAS
@@ -51,8 +53,16 @@ impl Air<F> for FibAir {
 
     fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
         vec![
-            BoundaryConstraint::with_public_input(FibCols::A, 0, 0),
-            BoundaryConstraint::with_public_input(FibCols::B, 0, 1),
+            BoundaryConstraint {
+                col_idx: FibCols::A,
+                row_idx: 0,
+                target: BoundaryTarget::PublicInput(0),
+            },
+            BoundaryConstraint {
+                col_idx: FibCols::B,
+                row_idx: 0,
+                target: BoundaryTarget::PublicInput(1),
+            },
         ]
     }
 
@@ -142,6 +152,10 @@ impl Air<F> for CpuWithBus {
         )]
     }
 
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::prefix(BusCols::SEL, ACTIVE_BUS_ROWS)]
+    }
+
     fn constraint_ast(&self) -> ConstraintAst<F> {
         ConstraintSystem::<F>::new().build()
     }
@@ -182,15 +196,19 @@ impl Air<F> for MemChiplet {
         )]
     }
 
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::prefix(BusCols::SEL, ACTIVE_BUS_ROWS)]
+    }
+
     fn constraint_ast(&self) -> ConstraintAst<F> {
         let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(BusCols::SEL));
 
         let [sel, addr, req] = [
             cs.col(BusCols::SEL),
             cs.col(BusCols::ADDR),
             cs.col(BusCols::REQUEST_IDX),
         ];
+
         cs.constrain_named("req_addr_match", sel * (addr + req));
 
         cs.build()
@@ -567,6 +585,10 @@ impl Air<F> for CpuWithLookupBus {
         vec![("lookup_bus".to_string(), lookup_spec())]
     }
 
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::prefix(BusCols::SEL, ACTIVE_BUS_ROWS)]
+    }
+
     fn constraint_ast(&self) -> ConstraintAst<F> {
         ConstraintSystem::<F>::new().build()
     }
@@ -595,11 +617,12 @@ impl Air<F> for MemLookupChiplet {
         vec![("lookup_bus".to_string(), lookup_spec())]
     }
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(BusCols::SEL));
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::prefix(BusCols::SEL, ACTIVE_BUS_ROWS)]
+    }
 
-        cs.build()
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        ConstraintSystem::<F>::new().build()
     }
 }
 
@@ -672,6 +695,8 @@ fn forged_pair_lookup_traces(num_vars: usize) -> (ColumnTrace, ColumnTrace) {
         cpu_tb.set_bit(BusCols::SEL, i, Bit::ONE).unwrap();
         cpu_tb.set_b32(BusCols::ADDR, i, x_addr).unwrap();
         cpu_tb.set_b32(BusCols::VAL, i, x_val).unwrap();
+
+        mem_tb.set_bit(BusCols::SEL, i, Bit::ONE).unwrap();
     }
 
     (cpu_tb.build(), mem_tb.build())
@@ -1234,162 +1259,6 @@ fn chiplet_boundary_clean_passes() {
     assert!(report.boundary_violations.is_empty());
 }
 
-// =================================================================
-// PAIRED BUS MUTEX DIAGNOSTICS
-// =================================================================
-
-define_columns! {
-    PairedBusCols {
-        KEY: B32,
-        S_SEND: Bit,
-        S_RECV: Bit,
-    }
-}
-
-#[derive(Clone)]
-struct PairedBusChiplet;
-
-impl Air<F> for PairedBusChiplet {
-    fn num_columns(&self) -> usize {
-        PairedBusCols::NUM_COLUMNS
-    }
-
-    fn column_layout(&self) -> &[ColumnType] {
-        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
-        LAYOUT.get_or_init(PairedBusCols::build_layout)
-    }
-
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        let sources = vec![
-            (Source::Column(PairedBusCols::KEY), b"k_a" as &[u8]),
-            (Source::RowIndexLeBytes(4), b"k_clk" as &[u8]),
-        ];
-
-        vec![(
-            "paired_diag_bus".into(),
-            PermutationCheckSpec::new_paired(
-                sources,
-                PairedBusCols::S_SEND,
-                PairedBusCols::S_RECV,
-                BusKind::Permutation,
-            ),
-        )]
-    }
-
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-
-        cs.assert_paired_bus_mutex(PairedBusCols::S_SEND, PairedBusCols::S_RECV);
-
-        cs.build()
-    }
-}
-
-#[derive(Clone)]
-struct PairedBusHost;
-
-impl Air<F> for PairedBusHost {
-    fn num_columns(&self) -> usize {
-        0
-    }
-
-    fn column_layout(&self) -> &[ColumnType] {
-        &[]
-    }
-
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        ConstraintSystem::<F>::new().build()
-    }
-}
-
-impl Program<F> for PairedBusHost {
-    fn chiplet_defs(&self) -> errors::Result<Vec<ChipletDef<F>>> {
-        Ok(vec![ChipletDef::from_air(&PairedBusChiplet)?])
-    }
-}
-
-fn paired_bus_chiplet_trace(num_vars: usize, rows: &[(u32, Bit, Bit)]) -> ColumnTrace {
-    let layout = PairedBusCols::build_layout();
-    let mut tb = TraceBuilder::new(&layout, num_vars).unwrap();
-
-    for (i, (key, send, recv)) in rows.iter().enumerate() {
-        tb.set_b32(PairedBusCols::KEY, i, hekate_math::Block32::from(*key))
-            .unwrap();
-        tb.set_bit(PairedBusCols::S_SEND, i, *send).unwrap();
-        tb.set_bit(PairedBusCols::S_RECV, i, *recv).unwrap();
-    }
-
-    tb.build()
-}
-
-#[test]
-fn exploit_preflight_misses_bidirectional_mutex_violation() {
-    let num_vars = 3;
-    let num_rows = 1 << num_vars;
-
-    let main_layout: Vec<ColumnType> = vec![];
-    let main = TraceBuilder::new(&main_layout, num_vars).unwrap().build();
-
-    let chip = paired_bus_chiplet_trace(
-        num_vars,
-        &[(0xA1A1_A1A1, Bit::ONE, Bit::ONE), (0, Bit::ZERO, Bit::ZERO)],
-    );
-
-    let instance = ProgramInstance::new(num_rows, vec![]);
-    let witness = ProgramWitness::<F>::new(main).with_chiplets(vec![chip]);
-
-    let report = preflight(&PairedBusHost, &instance, &witness).unwrap();
-    eprintln!("{}", report);
-
-    assert!(!report.is_clean());
-
-    let diag = report
-        .bus_diagnostics
-        .iter()
-        .find(|d| d.bus_id == "paired_diag_bus")
-        .expect("diagnostic for paired_diag_bus must exist");
-
-    assert!(
-        diag.selector_mutex_violations
-            .iter()
-            .any(|(_, row)| *row == 0),
-        "preflight must report row 0 as a mutex violation"
-    );
-}
-
-#[test]
-fn preflight_bidirectional_aligned_witness_clean() {
-    let num_vars = 3;
-    let num_rows = 1 << num_vars;
-
-    let main_layout: Vec<ColumnType> = vec![];
-    let main = TraceBuilder::new(&main_layout, num_vars).unwrap().build();
-
-    let chip = paired_bus_chiplet_trace(
-        num_vars,
-        &[
-            (0xA1A1_A1A1, Bit::ONE, Bit::ZERO),
-            (0xB2B2_B2B2, Bit::ZERO, Bit::ONE),
-        ],
-    );
-
-    let instance = ProgramInstance::new(num_rows, vec![]);
-    let witness = ProgramWitness::<F>::new(main).with_chiplets(vec![chip]);
-
-    let report = preflight(&PairedBusHost, &instance, &witness).unwrap();
-    eprintln!("{}", report);
-
-    let bus_with_mutex_violations = report
-        .bus_diagnostics
-        .iter()
-        .any(|d| !d.selector_mutex_violations.is_empty());
-
-    assert!(
-        !bus_with_mutex_violations,
-        "honest disjoint witness must not report mutex violations"
-    );
-}
-
 #[test]
 fn chiplet_boundary_public_input_rejected_at_snapshot() {
     #[derive(Clone)]
@@ -1401,11 +1270,11 @@ fn chiplet_boundary_public_input_rejected_at_snapshot() {
         }
 
         fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
-            vec![BoundaryConstraint::with_public_input(
-                BoundaryCols::FLAG,
-                0,
-                0,
-            )]
+            vec![BoundaryConstraint {
+                col_idx: BoundaryCols::FLAG,
+                row_idx: 0,
+                target: BoundaryTarget::PublicInput(0),
+            }]
         }
 
         fn column_layout(&self) -> &[ColumnType] {
@@ -1779,4 +1648,295 @@ fn boundary_on_expanded_bit_detects_violation() {
     assert!(matches!(v.table, TableId::Chiplet(0)));
     assert_eq!(v.col_idx, 31);
     assert_eq!(v.row_idx, 0);
+}
+
+// =================================================================
+// CLOCK WIDTH FLOOR
+// (a row-index clock narrower than the trace folds two
+//  emit rows onto one key; the pair annihilates in char-2)
+// =================================================================
+
+const NARROW_VARS: usize = 9;
+const COLLIDING_ROW: usize = 256;
+
+#[derive(Clone)]
+struct NarrowClockCpu {
+    clock_bytes: usize,
+}
+
+impl Air<F> for NarrowClockCpu {
+    fn num_columns(&self) -> usize {
+        BusCols::NUM_COLUMNS
+    }
+
+    fn column_layout(&self) -> &[ColumnType] {
+        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
+        LAYOUT.get_or_init(BusCols::build_layout)
+    }
+
+    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
+        vec![(
+            "narrow_bus".to_string(),
+            PermutationCheckSpec::new(
+                vec![
+                    (Source::Column(BusCols::ADDR), b"k0"),
+                    (Source::RowIndexLeBytes(self.clock_bytes), REQUEST_IDX_LABEL),
+                ],
+                Some(BusCols::SEL),
+            ),
+        )]
+    }
+
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::sparse(
+            BusCols::SEL,
+            vec![(0, F::ONE), (COLLIDING_ROW, F::ONE)],
+        )]
+    }
+
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        ConstraintSystem::<F>::new().build()
+    }
+}
+
+impl Program<F> for NarrowClockCpu {
+    fn chiplet_defs(&self) -> errors::Result<Vec<ChipletDef<F>>> {
+        Ok(vec![ChipletDef::from_air(&NarrowClockResponder)?])
+    }
+}
+
+#[derive(Clone)]
+struct NarrowClockResponder;
+
+impl Air<F> for NarrowClockResponder {
+    fn num_columns(&self) -> usize {
+        BusCols::NUM_COLUMNS
+    }
+
+    fn column_layout(&self) -> &[ColumnType] {
+        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
+        LAYOUT.get_or_init(BusCols::build_layout)
+    }
+
+    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
+        vec![(
+            "narrow_bus".to_string(),
+            PermutationCheckSpec::new(
+                vec![
+                    (Source::Column(BusCols::ADDR), b"k0"),
+                    (Source::Column(BusCols::REQUEST_IDX), REQUEST_IDX_LABEL),
+                ],
+                Some(BusCols::SEL),
+            ),
+        )]
+    }
+
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::prefix(BusCols::SEL, 2)]
+    }
+
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        ConstraintSystem::<F>::new().build()
+    }
+}
+
+fn narrow_clock_traces(clock_bytes: usize) -> (ColumnTrace, ColumnTrace) {
+    let layout = BusCols::build_layout();
+
+    let mut cpu = TraceBuilder::new(&layout, NARROW_VARS).unwrap();
+    let mut resp = TraceBuilder::new(&layout, NARROW_VARS).unwrap();
+
+    let mask = u32::MAX >> (32 - 8 * clock_bytes as u32);
+
+    for (slot, row) in [0usize, COLLIDING_ROW].into_iter().enumerate() {
+        let addr = Block32::from(7 + slot as u32);
+
+        cpu.set_bit(BusCols::SEL, row, Bit::ONE).unwrap();
+        cpu.set_b32(BusCols::ADDR, row, addr).unwrap();
+
+        resp.set_bit(BusCols::SEL, slot, Bit::ONE).unwrap();
+        resp.set_b32(BusCols::ADDR, slot, addr).unwrap();
+        resp.set_b32(BusCols::REQUEST_IDX, slot, Block32::from(row as u32 & mask))
+            .unwrap();
+    }
+
+    (cpu.build(), resp.build())
+}
+
+fn narrow_clock_report(clock_bytes: usize) -> preflight::PreflightReport<F> {
+    let (cpu, resp) = narrow_clock_traces(clock_bytes);
+
+    let instance = ProgramInstance::new(1 << NARROW_VARS, vec![]);
+    let witness = ProgramWitness::<F>::new(cpu).with_chiplets(vec![resp]);
+
+    preflight(&NarrowClockCpu { clock_bytes }, &instance, &witness).unwrap()
+}
+
+#[test]
+fn detects_clock_too_narrow_to_separate_emit_rows() {
+    let report = narrow_clock_report(1);
+    eprintln!("{}", report);
+
+    assert!(!report.is_clean());
+    assert_eq!(report.bus_diagnostics.len(), 1);
+
+    let diag = &report.bus_diagnostics[0];
+
+    assert!(!diag.bus_imbalance);
+    assert_eq!(diag.clock_collisions.len(), 1);
+
+    let (table, a, b) = diag.clock_collisions[0];
+
+    assert!(matches!(table, TableId::Main));
+    assert_eq!((a, b), (0, COLLIDING_ROW));
+}
+
+#[test]
+fn clock_covering_every_row_bit_reports_no_collision() {
+    let report = narrow_clock_report(4);
+    eprintln!("{}", report);
+
+    assert!(report.is_clean());
+}
+
+// =================================================================
+// INERT BUS FLOOR
+// (both endpoints pinned off on every row: the claimed sums
+//  cancel at zero and the declared binding enforces nothing)
+// =================================================================
+
+const INERT_VARS: usize = 4;
+
+#[derive(Clone)]
+struct InertCpu {
+    live_rows: usize,
+}
+
+impl Air<F> for InertCpu {
+    fn num_columns(&self) -> usize {
+        BusCols::NUM_COLUMNS
+    }
+
+    fn column_layout(&self) -> &[ColumnType] {
+        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
+        LAYOUT.get_or_init(BusCols::build_layout)
+    }
+
+    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
+        vec![(
+            "inert_bus".to_string(),
+            PermutationCheckSpec::new(
+                vec![
+                    (Source::Column(BusCols::ADDR), b"k0"),
+                    (Source::RowIndexLeBytes(4), REQUEST_IDX_LABEL),
+                ],
+                Some(BusCols::SEL),
+            ),
+        )]
+    }
+
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        vec![FixedColumn::prefix(BusCols::SEL, self.live_rows)]
+    }
+
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        ConstraintSystem::<F>::new().build()
+    }
+}
+
+impl Program<F> for InertCpu {
+    fn chiplet_defs(&self) -> errors::Result<Vec<ChipletDef<F>>> {
+        Ok(vec![ChipletDef::from_air(&InertResponder {
+            live_rows: self.live_rows,
+        })?])
+    }
+}
+
+#[derive(Clone)]
+struct InertResponder {
+    live_rows: usize,
+}
+
+impl Air<F> for InertResponder {
+    fn num_columns(&self) -> usize {
+        BusCols::NUM_COLUMNS
+    }
+
+    fn column_layout(&self) -> &[ColumnType] {
+        static LAYOUT: std::sync::OnceLock<Vec<ColumnType>> = std::sync::OnceLock::new();
+        LAYOUT.get_or_init(BusCols::build_layout)
+    }
+
+    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
+        vec![(
+            "inert_bus".to_string(),
+            PermutationCheckSpec::new(
+                vec![
+                    (Source::Column(BusCols::ADDR), b"k0"),
+                    (Source::Column(BusCols::REQUEST_IDX), REQUEST_IDX_LABEL),
+                ],
+                Some(BusCols::SEL),
+            ),
+        )]
+    }
+
+    fn fixed_columns(&self) -> Vec<FixedColumn<F>> {
+        let sel = match self.live_rows {
+            0 => FixedColumn::sparse(BusCols::SEL, Vec::new()),
+            n => FixedColumn::prefix(BusCols::SEL, n),
+        };
+
+        vec![sel]
+    }
+
+    fn constraint_ast(&self) -> ConstraintAst<F> {
+        ConstraintSystem::<F>::new().build()
+    }
+}
+
+fn inert_report(live_rows: usize) -> preflight::PreflightReport<F> {
+    let layout = BusCols::build_layout();
+
+    let mut cpu = TraceBuilder::new(&layout, INERT_VARS).unwrap();
+    let mut resp = TraceBuilder::new(&layout, INERT_VARS).unwrap();
+
+    for row in 0..live_rows {
+        let addr = Block32::from(7 + row as u32);
+
+        cpu.set_bit(BusCols::SEL, row, Bit::ONE).unwrap();
+        cpu.set_b32(BusCols::ADDR, row, addr).unwrap();
+
+        resp.set_bit(BusCols::SEL, row, Bit::ONE).unwrap();
+        resp.set_b32(BusCols::ADDR, row, addr).unwrap();
+        resp.set_b32(BusCols::REQUEST_IDX, row, Block32::from(row as u32))
+            .unwrap();
+    }
+
+    let instance = ProgramInstance::new(1 << INERT_VARS, vec![]);
+    let witness = ProgramWitness::<F>::new(cpu.build()).with_chiplets(vec![resp.build()]);
+
+    preflight(&InertCpu { live_rows }, &instance, &witness).unwrap()
+}
+
+#[test]
+fn detects_bus_switched_off_on_every_row() {
+    let report = inert_report(0);
+    eprintln!("{}", report);
+
+    assert!(!report.is_clean());
+    assert_eq!(report.bus_diagnostics.len(), 1);
+
+    let diag = &report.bus_diagnostics[0];
+
+    assert!(diag.inert);
+    assert!(!diag.bus_imbalance);
+    assert!(diag.endpoints.iter().all(|e| e.active_rows == 0));
+}
+
+#[test]
+fn one_live_row_clears_the_inert_report() {
+    let report = inert_report(1);
+    eprintln!("{}", report);
+
+    assert!(report.is_clean());
 }

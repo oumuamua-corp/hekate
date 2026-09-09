@@ -8,6 +8,7 @@ extern crate alloc;
 extern crate core;
 
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
 use constraint::{BoundaryConstraint, Constraint, ConstraintAst};
 use core::marker::PhantomData;
@@ -18,7 +19,9 @@ use hekate_math::{Flat, HardwareField, TowerField};
 use permutation::PermutationCheckSpec;
 
 pub mod chiplet;
+pub mod circuit;
 pub mod constraint;
+pub mod digest;
 pub mod expander;
 pub mod linearized;
 pub mod outer;
@@ -27,7 +30,6 @@ pub mod predicate;
 pub mod schema;
 
 // =================================================================
-// AIR TRAIT:
 // Core Algebraic Intermediate Representation
 // =================================================================
 
@@ -57,8 +59,7 @@ pub trait Air<F: TowerField>: Sized + Clone + Sync {
         Vec::new()
     }
 
-    /// Returns the physical layout
-    /// of the columns in the trace.
+    /// Returns the physical layout of the columns in the trace.
     ///
     /// This describes the storage type
     /// (Bit, B8, B32, etc.) of each column.
@@ -104,14 +105,12 @@ pub trait Air<F: TowerField>: Sized + Clone + Sync {
         None
     }
 
-    /// Parses a raw physical row (bytes) into
-    /// the full Virtual Row (fields). Used by
-    /// the Verifier to reconstruct the virtual
-    /// trace from committed data.
+    /// Parses a raw physical row (bytes) into the full
+    /// Virtual Row (fields). Used by the Verifier to
+    /// reconstruct the virtual trace from committed data.
     ///
-    /// Delegates to `virtual_expander().parse_row()`
-    /// when present. Falls back to 1:1 parsing
-    /// from `column_layout()`.
+    /// Delegates to `virtual_expander().parse_row()` when present.
+    /// Falls back to 1:1 parsing from `column_layout()`.
     fn parse_virtual_row(&self, bytes: &[u8], res: &mut Vec<Flat<F>>)
     where
         F: TraceCompatibleField,
@@ -149,7 +148,7 @@ pub trait Air<F: TowerField>: Sized + Clone + Sync {
 }
 
 // =================================================================
-// PROGRAM TRAIT — Composition over Air
+// Composition over Air
 // =================================================================
 
 /// Extends `Air<F>` with multi-table composition:
@@ -292,18 +291,55 @@ pub struct InlineKernelHint {
 // FIXED COLUMNS
 // =================================================================
 
-/// Row-index-determined shape a fixed column is
-/// pinned to. `FirstRow`/`LastRow`/`Custom` are
-/// single-row indicators; `Periodic`/`Sparse`/`Dense`
-/// are arbitrary row-indexed patterns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CadenceSegment<F> {
+    pub stride: usize,
+    pub count: usize,
+    pub origin: usize,
+    pub values: Vec<F>,
+}
+
+/// Row-index-determined shape a fixed column is pinned to.
+/// `LastRow` is one on every row but the last.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FixedShape<F> {
     LastRow,
     FirstRow,
     Custom(Vec<bool>),
-    Periodic { period: usize, values: Vec<F> },
+    Periodic {
+        period: usize,
+        values: Vec<F>,
+    },
     Sparse(Vec<(usize, F)>),
     Dense(Vec<F>),
+
+    /// `values[(row - origin) % stride]` on rows
+    /// `[origin, origin + stride·count)`, zero outside.
+    Cadence {
+        stride: usize,
+        count: usize,
+        origin: usize,
+        values: Vec<F>,
+    },
+
+    /// Disjoint union of cadence blocks, sorted by
+    /// origin; the MLE is the sum of the block MLEs.
+    Segments(Vec<CadenceSegment<F>>),
+}
+
+impl<F> FixedShape<F> {
+    /// Whether the shape keeps the committed column readable.
+    /// The rest are supplied as indicators, never read back.
+    pub fn is_overlay(&self) -> bool {
+        match self {
+            Self::Periodic { .. }
+            | Self::Sparse(..)
+            | Self::Dense(..)
+            | Self::Cadence { .. }
+            | Self::Segments(..) => true,
+            Self::LastRow | Self::FirstRow | Self::Custom(..) => false,
+        }
+    }
 }
 
 impl<F: HardwareField> FixedShape<F> {
@@ -367,6 +403,20 @@ impl<F: HardwareField> FixedShape<F> {
 
                 acc
             }
+            FixedShape::Cadence {
+                stride,
+                count,
+                origin,
+                values,
+            } => cadence_mle(r, *stride, *count, *origin, values),
+            FixedShape::Segments(segments) => {
+                let mut acc = Flat::from_raw(F::ZERO);
+                for seg in segments {
+                    acc += cadence_mle(r, seg.stride, seg.count, seg.origin, &seg.values);
+                }
+
+                acc
+            }
         }
     }
 
@@ -412,24 +462,22 @@ impl<F: HardwareField> FixedShape<F> {
                 acc
             }
             FixedShape::Dense(values) => values[row].to_hardware(),
+            FixedShape::Cadence {
+                stride,
+                count,
+                origin,
+                values,
+            } => cadence_value_at(row, *stride, *count, *origin, values),
+            FixedShape::Segments(segments) => {
+                let mut acc = zero;
+                for seg in segments {
+                    acc += cadence_value_at(row, seg.stride, seg.count, seg.origin, &seg.values);
+                }
+
+                acc
+            }
         }
     }
-}
-
-fn eq_index<F: HardwareField>(r: &[Flat<F>], index: usize) -> Flat<F> {
-    let one = Flat::from_raw(F::ONE);
-
-    let mut prod = one;
-    for (k, &r_k) in r.iter().enumerate() {
-        let factor = if (index >> k) & 1 == 1 {
-            r_k
-        } else {
-            one - r_k
-        };
-        prod *= factor;
-    }
-
-    prod
 }
 
 /// One committed column pinned to a fixed shape.
@@ -451,6 +499,21 @@ impl<F> FixedColumn<F> {
         Self {
             col_idx,
             shape: FixedShape::FirstRow,
+        }
+    }
+
+    pub fn prefix(col_idx: usize, count: usize) -> Self
+    where
+        F: TowerField,
+    {
+        Self {
+            col_idx,
+            shape: FixedShape::Cadence {
+                stride: 1,
+                count,
+                origin: 0,
+                values: vec![F::ONE],
+            },
         }
     }
 
@@ -479,6 +542,13 @@ impl<F> FixedColumn<F> {
         Self {
             col_idx,
             shape: FixedShape::Dense(values),
+        }
+    }
+
+    pub fn segments(col_idx: usize, segments: Vec<CadenceSegment<F>>) -> Self {
+        Self {
+            col_idx,
+            shape: FixedShape::Segments(segments),
         }
     }
 }
@@ -517,6 +587,131 @@ pub fn validate_fixed_columns<F: TowerField>(
     }
 
     Ok(())
+}
+
+/// `Σ_{i < limit, i ≡ c (mod stride)} eq(r, i)` per residue class `c`.
+fn prefix_residue_sums<F: HardwareField>(
+    r: &[Flat<F>],
+    limit: usize,
+    stride: usize,
+) -> Vec<Flat<F>> {
+    let one = Flat::from_raw(F::ONE);
+    let zero = Flat::from_raw(F::ZERO);
+    let nv = r.len();
+
+    let full = match 1usize.checked_shl(nv as u32) {
+        Some(cap) => limit >= cap,
+        None => false,
+    };
+
+    let mut pow2_mod = Vec::with_capacity(nv);
+    let mut p2 = 1usize % stride;
+
+    for _ in 0..nv {
+        pow2_mod.push(p2);
+        p2 = (p2 * 2) % stride;
+    }
+
+    let mut free = alloc::vec![zero; stride];
+    let mut next_free = alloc::vec![zero; stride];
+    let mut tight = if full { zero } else { one };
+    let mut tight_residue = 0usize;
+
+    if full {
+        free[0] = one;
+    }
+
+    for k in (0..nv).rev() {
+        let p2k = pow2_mod[k];
+        for slot in next_free.iter_mut() {
+            *slot = zero;
+        }
+
+        for c in 0..stride {
+            let w = free[c];
+
+            next_free[c] += w * (one - r[k]);
+            next_free[(c + p2k) % stride] += w * r[k];
+        }
+
+        if (limit >> k) & 1 == 1 {
+            next_free[tight_residue] += tight * (one - r[k]);
+            tight *= r[k];
+            tight_residue = (tight_residue + p2k) % stride;
+        } else {
+            tight *= one - r[k];
+        }
+
+        core::mem::swap(&mut free, &mut next_free);
+    }
+
+    free
+}
+
+fn cadence_mle<F: HardwareField>(
+    r: &[Flat<F>],
+    stride: usize,
+    count: usize,
+    origin: usize,
+    values: &[F],
+) -> Flat<F> {
+    if stride == 0 || values.len() != stride {
+        return Flat::from_raw(F::ZERO);
+    }
+
+    let end = origin.saturating_add(stride.saturating_mul(count));
+
+    let mut class_sums = prefix_residue_sums(r, end, stride);
+    let start_sums = prefix_residue_sums(r, origin, stride);
+
+    for (c, s) in start_sums.iter().enumerate() {
+        class_sums[c] += *s;
+    }
+
+    let mut acc = Flat::from_raw(F::ZERO);
+    for (c, sum) in class_sums.iter().enumerate() {
+        let offset = (c + stride - origin % stride) % stride;
+        acc += values[offset].to_hardware() * *sum;
+    }
+
+    acc
+}
+
+fn cadence_value_at<F: HardwareField>(
+    row: usize,
+    stride: usize,
+    count: usize,
+    origin: usize,
+    values: &[F],
+) -> Flat<F> {
+    if stride == 0 || values.len() != stride {
+        return Flat::from_raw(F::ZERO);
+    }
+
+    let end = origin.saturating_add(stride.saturating_mul(count));
+
+    if row < origin || row >= end {
+        Flat::from_raw(F::ZERO)
+    } else {
+        values[(row - origin) % stride].to_hardware()
+    }
+}
+
+fn eq_index<F: HardwareField>(r: &[Flat<F>], index: usize) -> Flat<F> {
+    let one = Flat::from_raw(F::ONE);
+    let mut prod = one;
+
+    for (k, &r_k) in r.iter().enumerate() {
+        let factor = if (index >> k) & 1 == 1 {
+            r_k
+        } else {
+            one - r_k
+        };
+
+        prod *= factor;
+    }
+
+    prod
 }
 
 fn validate_shape<F: TowerField>(
@@ -594,6 +789,108 @@ fn validate_shape<F: TowerField>(
             }
 
             check_bit_domain(values.iter().copied(), col_type)
+        }
+        FixedShape::Cadence {
+            stride,
+            count,
+            origin,
+            values,
+        } => {
+            if *stride == 0 {
+                return Err(errors::Error::Protocol {
+                    protocol: "fixed_column",
+                    message: "Cadence stride must be non-zero",
+                });
+            }
+
+            if values.len() != *stride {
+                return Err(errors::Error::Protocol {
+                    protocol: "fixed_column",
+                    message: "Cadence values length != stride",
+                });
+            }
+
+            let end = stride
+                .checked_mul(*count)
+                .and_then(|span| span.checked_add(*origin))
+                .ok_or(errors::Error::Protocol {
+                    protocol: "fixed_column",
+                    message: "Cadence active range overflows",
+                })?;
+
+            if let Some(nv) = num_vars
+                && end > (1usize << nv)
+            {
+                return Err(errors::Error::Protocol {
+                    protocol: "fixed_column",
+                    message: "Cadence active range exceeds trace height",
+                });
+            }
+
+            check_bit_domain(values.iter().copied(), col_type)
+        }
+        FixedShape::Segments(segments) => {
+            if segments.is_empty() {
+                return Err(errors::Error::Protocol {
+                    protocol: "fixed_column",
+                    message: "Segments list is empty",
+                });
+            }
+
+            let mut prev_end = 0usize;
+            for seg in segments {
+                if seg.stride == 0 {
+                    return Err(errors::Error::Protocol {
+                        protocol: "fixed_column",
+                        message: "Segments stride must be non-zero",
+                    });
+                }
+
+                if seg.count == 0 {
+                    return Err(errors::Error::Protocol {
+                        protocol: "fixed_column",
+                        message: "Segments count must be non-zero",
+                    });
+                }
+
+                if seg.values.len() != seg.stride {
+                    return Err(errors::Error::Protocol {
+                        protocol: "fixed_column",
+                        message: "Segments values length != stride",
+                    });
+                }
+
+                let end = seg
+                    .stride
+                    .checked_mul(seg.count)
+                    .and_then(|span| span.checked_add(seg.origin))
+                    .ok_or(errors::Error::Protocol {
+                        protocol: "fixed_column",
+                        message: "Segments active range overflows",
+                    })?;
+
+                if seg.origin < prev_end {
+                    return Err(errors::Error::Protocol {
+                        protocol: "fixed_column",
+                        message: "Segments must be sorted by origin and disjoint",
+                    });
+                }
+
+                prev_end = end;
+
+                check_bit_domain(seg.values.iter().copied(), col_type)?;
+            }
+
+            if let Some(nv) = num_vars
+                && prev_end > (1usize << nv)
+            {
+                return Err(errors::Error::Protocol {
+                    protocol: "fixed_column",
+                    message: "Segments active range exceeds trace height",
+                });
+            }
+
+            Ok(())
         }
     }
 }

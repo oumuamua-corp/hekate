@@ -10,10 +10,12 @@ use hekate::math::{Block128, TowerField};
 use hekate_core::trace::TraceBuilder;
 use hekate_math::{Bit, Block32, HardwareField};
 use hekate_program::chiplet::ChipletDef;
+use hekate_program::circuit::{Circuit, CircuitProgram};
 use hekate_program::constraint::ConstraintAst;
 use hekate_program::constraint::builder::ConstraintSystem;
+use hekate_program::digest::program_id;
 use hekate_program::expander::VirtualExpander;
-use hekate_program::{Air, FixedColumn, Program, ProgramInstance, ProgramWitness};
+use hekate_program::{Air, FixedColumn, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 
@@ -75,32 +77,17 @@ impl Air<F> for PackedBitChiplet {
     }
 }
 
-#[derive(Clone)]
-struct PackedBitHost {
-    defs: Vec<ChipletDef<F>>,
-}
+fn packed_bit_host() -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("packed_bit_host", NUM_ROWS).unwrap();
 
-impl Air<F> for PackedBitHost {
-    fn name(&self) -> String {
-        "packed_bit_host".to_string()
-    }
+    let flag = cx.column(ColumnType::Bit);
 
-    fn column_layout(&self) -> &'static [ColumnType] {
-        &[ColumnType::Bit]
-    }
+    let cs = cx.cs();
+    cs.assert_boolean(cs.col(flag.index()));
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(0));
+    cx.attach(ChipletDef::from_air(&PackedBitChiplet::new()).unwrap());
 
-        cs.build()
-    }
-}
-
-impl Program<F> for PackedBitHost {
-    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        Ok(self.defs.clone())
-    }
+    cx.compile().unwrap()
 }
 
 // =========================================================
@@ -109,7 +96,6 @@ impl Program<F> for PackedBitHost {
 
 fn make_chiplet_trace(magic: u32) -> hekate_core::trace::ColumnTrace {
     let layout = [ColumnType::B32, ColumnType::Bit];
-
     let mut tb = TraceBuilder::new(&layout, NUM_VARS).unwrap();
 
     tb.set_b32(0, 0, Block32(magic)).unwrap();
@@ -152,14 +138,11 @@ fn make_main_trace() -> hekate_core::trace::ColumnTrace {
 }
 
 fn make_test_system() -> (
-    PackedBitHost,
+    CircuitProgram<F>,
     ProgramInstance<F>,
     ProgramWitness<F, hekate_core::trace::ColumnTrace>,
 ) {
-    let chiplet = PackedBitChiplet::new();
-    let air = PackedBitHost {
-        defs: vec![ChipletDef::from_air(&chiplet).unwrap()],
-    };
+    let air = packed_bit_host();
     let instance = ProgramInstance::new(NUM_ROWS, vec![]);
     let witness =
         ProgramWitness::new(make_main_trace()).with_chiplets(vec![make_chiplet_trace(MAGIC)]);
@@ -206,7 +189,9 @@ fn virtual_packing_eval_forgery_rejected() {
     .expect("honest proof must succeed");
 
     let mut vt = Transcript::<H>::new(b"VirtualPackEvalForgery");
-    let ok = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config)
+    let pinned_id = program_id(&air).unwrap();
+
+    let ok = HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config)
         .expect("verification must not error");
 
     assert!(ok, "baseline must verify");
@@ -217,7 +202,8 @@ fn virtual_packing_eval_forgery_rejected() {
     evals[17] += F::ONE;
 
     let mut at = Transcript::<H>::new(b"VirtualPackEvalForgery");
-    let attack = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut at, &config);
+    let attack =
+        HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut at, &config);
 
     assert!(
         attack.is_err() || !attack.unwrap(),
@@ -272,8 +258,13 @@ fn virtual_expansion_witness_isolation() {
     .expect("ZK proof must succeed");
 
     let mut vt_zk = Transcript::<H>::new(b"VirtualPackWitnessIsolation");
+    let pinned_id = program_id(&air).unwrap();
+
     assert!(
-        HekateVerifier::<F, H>::verify(&air, &instance, &proof_zk, &mut vt_zk, &config_zk).unwrap(),
+        HekateVerifier::<F, H>::verify(
+            &pinned_id, &air, &instance, &proof_zk, &mut vt_zk, &config_zk
+        )
+        .unwrap(),
         "ZK proof must verify"
     );
 

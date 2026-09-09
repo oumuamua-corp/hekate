@@ -16,7 +16,7 @@ pub mod builder;
 /// Represents a single term in a polynomial constraint.
 /// Form: `coeff * product(cells)`
 /// Example: `5 * x_curr * y_next`
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConstraintTerm<F> {
     pub coeff: F,
     pub poly_ind: Vec<ProgramCell>, // Multiplicands (variables)
@@ -33,7 +33,7 @@ impl<F: TowerField> ConstraintTerm<F> {
 
 /// Represents a full constraint equation:
 /// sum(terms) == 0.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Constraint<F> {
     pub terms: Vec<ConstraintTerm<F>>,
 }
@@ -48,9 +48,8 @@ impl<F: TowerField> Constraint<F> {
 /// pins `Trace(row_idx, col_idx)` to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoundaryTarget<F> {
-    /// `instance.public_inputs[idx]`. Main-program
-    /// use only; `ChipletDef::from_air` rejects
-    /// this variant on chiplets.
+    /// `instance.public_inputs[idx]`. Main table only;
+    /// `ChipletDef::from_air` rejects this variant on chiplets.
     PublicInput(usize),
 
     /// Literal field value. Required for
@@ -68,19 +67,19 @@ pub struct BoundaryConstraint<F> {
 }
 
 impl<F> BoundaryConstraint<F> {
-    pub fn with_public_input(col_idx: usize, row_idx: usize, public_input_idx: usize) -> Self {
-        Self {
-            col_idx,
-            row_idx,
-            target: BoundaryTarget::PublicInput(public_input_idx),
-        }
-    }
-
     pub fn with_constant(col_idx: usize, row_idx: usize, val: F) -> Self {
         Self {
             col_idx,
             row_idx,
             target: BoundaryTarget::Constant(val),
+        }
+    }
+
+    pub fn with_public_input(col_idx: usize, row_idx: usize, input_idx: usize) -> Self {
+        Self {
+            col_idx,
+            row_idx,
+            target: BoundaryTarget::PublicInput(input_idx),
         }
     }
 }

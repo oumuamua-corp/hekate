@@ -11,9 +11,9 @@ use hekate::crypto::transcript::Transcript;
 use hekate::math::{Bit, Block64, Block128, Flat, HardwareField, TowerField};
 use hekate_core::poly::PolyVariant;
 use hekate_core::trace::{Trace, TraceBuilder};
-use hekate_program::constraint::ConstraintAst;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_program::circuit::{Circuit, CircuitProgram};
+use hekate_program::digest::program_id;
+use hekate_program::{ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 
@@ -25,36 +25,26 @@ const ACTIVE: usize = 1;
 const NUM_VARS: usize = 10;
 const BLOCK: Range<usize> = 128..742;
 
-#[derive(Clone)]
-struct SlotConstantAir;
+const SLOT_LAYOUT: [ColumnType; 2] = [ColumnType::B64, ColumnType::Bit];
 
-impl Air<F> for SlotConstantAir {
-    fn num_columns(&self) -> usize {
-        2
-    }
+fn slot_constant_air() -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("SlotConstant", 1 << NUM_VARS).unwrap();
+    cx.schema(&SLOT_LAYOUT);
 
-    fn column_layout(&self) -> &'static [ColumnType] {
-        &[ColumnType::B64, ColumnType::Bit]
-    }
+    let cs = cx.cs();
 
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
+    let [secret, active] = [cs.col(SECRET), cs.col(ACTIVE)];
+    let [next_secret, next_active] = [cs.next(SECRET), cs.next(ACTIVE)];
 
-        let [secret, active] = [cs.col(SECRET), cs.col(ACTIVE)];
-        let [next_secret, next_active] = [cs.next(SECRET), cs.next(ACTIVE)];
+    cs.assert_boolean(active);
+    cs.constrain(active * next_active * (next_secret + secret));
+    cs.assert_zero_when(cs.one() + active, secret);
 
-        cs.assert_boolean(active);
-        cs.constrain(active * next_active * (next_secret + secret));
-        cs.assert_zero_when(cs.one() + active, secret);
-
-        cs.build()
-    }
+    cx.compile().unwrap()
 }
 
-impl Program<F> for SlotConstantAir {}
-
 fn slot_constant_trace(secret: Block64) -> ColumnTrace {
-    let mut tb = TraceBuilder::new(SlotConstantAir.column_layout(), NUM_VARS).unwrap();
+    let mut tb = TraceBuilder::new(&SLOT_LAYOUT, NUM_VARS).unwrap();
     for row in BLOCK {
         tb.set_b64(SECRET, row, secret).unwrap();
         tb.set_bit(ACTIVE, row, Bit::ONE).unwrap();
@@ -89,7 +79,7 @@ fn recover_from_proof(zero_knowledge: bool) -> (F, F) {
         .unwrap()
         .to_tower();
 
-    let air = SlotConstantAir;
+    let air = slot_constant_air();
     let instance = ProgramInstance::new(1 << NUM_VARS, vec![]);
     let witness = ProgramWitness::new(trace);
 
@@ -116,7 +106,12 @@ fn recover_from_proof(zero_knowledge: bool) -> (F, F) {
     .unwrap();
 
     let mut vt = Transcript::<H>::new(b"SlotConstant");
-    assert!(HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config).unwrap());
+    let pinned_id = program_id(&air).unwrap();
+
+    assert!(
+        HekateVerifier::<F, H>::verify(&pinned_id, &air, &instance, &proof, &mut vt, &config)
+            .unwrap()
+    );
 
     let recovered = recover_slot_constant(&proof.eval_proof.point_evaluation, SECRET, BLOCK);
 

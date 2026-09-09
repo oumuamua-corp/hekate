@@ -18,6 +18,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use hekate_math::TowerField;
+use hekate_program::FixedShape;
 use hekate_program::constraint::builder::ConstraintSystem;
 
 pub(crate) mod sbox_rom;
@@ -27,20 +28,48 @@ pub mod aes256;
 pub mod trace;
 
 pub use aes128::{
-    Aes128Chiplet, Aes128Columns, AesRound128Air, CpuAes128Columns, CpuAes128Unit,
-    PhysAes128Columns,
+    Aes128Chiplet, Aes128Columns, AesRound128Air, CpuAes128Columns, PhysAes128Columns,
 };
 pub use aes256::{
-    Aes256Chiplet, Aes256Columns, AesRound256Air, CpuAes256Columns, CpuAes256Unit,
-    PhysAes256Columns,
+    Aes256Chiplet, Aes256Columns, AesRound256Air, CpuAes256Columns, PhysAes256Columns,
 };
 pub use sbox_rom::{PhysSboxRomColumns, SboxRomColumns};
 
+/// Host emit schedule:
+/// `SELECTOR` fires on each block's input row
+/// at offset 0 and output row at offset 1.
+pub fn host_selector_shape<F: TowerField>(stride: usize, count: usize) -> FixedShape<F> {
+    assert!(stride >= 2);
+
+    FixedShape::Cadence {
+        stride,
+        count,
+        origin: 0,
+        values: (0..stride)
+            .map(|off| if off <= 1 { F::ONE } else { F::ZERO })
+            .collect(),
+    }
+}
+
+/// Host emit direction:
+/// `KEY_SELECTOR` fires only on each
+/// block's input row at offset 0.
+pub fn host_key_selector_shape<F: TowerField>(stride: usize, count: usize) -> FixedShape<F> {
+    assert!(stride >= 2);
+
+    FixedShape::Cadence {
+        stride,
+        count,
+        origin: 0,
+        values: (0..stride)
+            .map(|off| if off == 0 { F::ONE } else { F::ZERO })
+            .collect(),
+    }
+}
+
 /// FIPS 197 §5.1.2:
-/// ShiftRows byte permutation.
-/// `SHIFT_MAP[j]` = source byte
-/// index for output position j.
-/// AES state is column-major 4×4:
+/// ShiftRows byte permutation. `SHIFT_MAP[j]` = source byte
+/// index for output position j. AES state is column-major 4×4:
 /// byte[i] = state[i%4][i/4].
 #[rustfmt::skip]
 const SHIFT_MAP: [usize; 16] = [

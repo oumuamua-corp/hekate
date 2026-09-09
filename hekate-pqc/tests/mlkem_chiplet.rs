@@ -9,19 +9,15 @@
 
 use hekate_core::config::Config;
 use hekate_core::trace::TraceColumn;
-use hekate_core::trace::{ColumnTrace, ColumnType, TraceBuilder};
+use hekate_core::trace::{ColumnTrace, TraceBuilder};
 use hekate_crypto::DefaultHasher;
 use hekate_crypto::transcript::Transcript;
 use hekate_keccak::{KeccakChiplet, KeccakWitness};
 use hekate_math::{Bit, Block32, Block64, Block128, Flat, HardwareField, TowerField};
-use hekate_pqc::mlkem::{
-    self, CpuMlKemColumns, CpuMlKemUnit, MlKemChiplet, MlKemCtrlColumns, MlKemLevel,
-};
-use hekate_program::chiplet::ChipletDef;
-use hekate_program::constraint::builder::ConstraintSystem;
-use hekate_program::constraint::{BoundaryConstraint, ConstraintAst};
-use hekate_program::permutation::PermutationCheckSpec;
-use hekate_program::{Air, Program, ProgramInstance, ProgramWitness};
+use hekate_pqc::mlkem::{self, CpuMlKemColumns, MlKemChiplet, MlKemCtrlColumns, MlKemLevel};
+use hekate_program::circuit::{Circuit, CircuitProgram};
+use hekate_program::digest::program_id;
+use hekate_program::{FixedShape, ProgramInstance, ProgramWitness};
 use hekate_prover_sys::prove;
 use hekate_verifier::HekateVerifier;
 #[allow(deprecated)]
@@ -60,57 +56,42 @@ nist_mlkem!(nist_mlkem_512, MlKem512);
 nist_mlkem!(nist_mlkem_768, MlKem768);
 nist_mlkem!(nist_mlkem_1024, MlKem1024);
 
-#[derive(Clone)]
-struct MlKemTestProgram {
-    mlkem: MlKemChiplet<F>,
+fn mlkem_test_program(
+    mlkem: &MlKemChiplet<F>,
+    cpu_rows: usize,
     num_public: usize,
-}
+) -> CircuitProgram<F> {
+    let mut cx = Circuit::<F>::new("MlKemTest", cpu_rows).unwrap();
+    let cpu = cx.schema(&CpuMlKemColumns::build_layout());
 
-impl Air<F> for MlKemTestProgram {
-    fn num_columns(&self) -> usize {
-        CpuMlKemUnit::num_columns()
+    cx.bus(mlkem::MLKEM_DATA_BUS_ID, mlkem::cpu_data_spec());
+    cx.bus(mlkem::MLKEM_SS_BUS_ID, mlkem::cpu_ss_spec());
+
+    let selector = cpu.at(CpuMlKemColumns::SELECTOR);
+
+    cx.fix(
+        selector,
+        FixedShape::Cadence {
+            stride: 1,
+            count: num_public,
+            origin: 0,
+            values: vec![F::ONE],
+        },
+    );
+    cx.fix(
+        cpu.at(CpuMlKemColumns::SS_SELECTOR),
+        FixedShape::Sparse(vec![(num_public, F::ONE)]),
+    );
+
+    for k in 0..num_public {
+        cx.publish(cpu.at(CpuMlKemColumns::DATA), k);
     }
 
-    fn boundary_constraints(&self) -> Vec<BoundaryConstraint<F>> {
-        (0..self.num_public)
-            .map(|k| BoundaryConstraint::with_public_input(CpuMlKemColumns::DATA, k, k))
-            .collect()
+    for def in mlkem.composite().flatten_defs().unwrap() {
+        cx.attach(def);
     }
 
-    fn column_layout(&self) -> &[ColumnType] {
-        Box::leak(CpuMlKemColumns::build_layout().into_boxed_slice())
-    }
-
-    fn permutation_checks(&self) -> Vec<(String, PermutationCheckSpec)> {
-        vec![
-            (
-                mlkem::MLKEM_DATA_BUS_ID.into(),
-                CpuMlKemUnit::linking_spec(),
-            ),
-            (
-                mlkem::MLKEM_SS_BUS_ID.into(),
-                CpuMlKemUnit::ss_linking_spec(),
-            ),
-        ]
-    }
-
-    fn constraint_ast(&self) -> ConstraintAst<F> {
-        let cs = ConstraintSystem::<F>::new();
-        cs.assert_boolean(cs.col(CpuMlKemColumns::SELECTOR));
-        cs.assert_boolean(cs.col(CpuMlKemColumns::SS_SELECTOR));
-
-        cs.build()
-    }
-}
-
-impl Program<F> for MlKemTestProgram {
-    fn num_public_inputs(&self) -> usize {
-        self.num_public
-    }
-
-    fn chiplet_defs(&self) -> hekate_core::errors::Result<Vec<ChipletDef<F>>> {
-        self.mlkem.composite().flatten_defs()
-    }
+    cx.compile().unwrap()
 }
 
 fn prove_and_verify_mlkem(ct: &[u8], sk: &[u8]) -> Result<bool, String> {
@@ -174,10 +155,7 @@ fn prove_and_verify_mlkem_level(level: MlKemLevel, ct: &[u8], sk: &[u8]) -> Resu
         })
         .collect();
 
-    let air = MlKemTestProgram {
-        mlkem: mlkem_chiplet,
-        num_public: ct_public.len(),
-    };
+    let air = mlkem_test_program(&mlkem_chiplet, cpu_rows, ct_public.len());
 
     let instance = ProgramInstance::new(cpu_rows, ct_public);
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(chiplet_traces);
@@ -202,8 +180,15 @@ fn prove_and_verify_mlkem_level(level: MlKemLevel, ct: &[u8], sk: &[u8]) -> Resu
     .map_err(|e| format!("prover: {e:?}"))?;
 
     let mut vt = Transcript::<H>::new(b"MLKem_Adversarial");
-    HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config)
-        .map_err(|e| format!("verifier: {e:?}"))
+    HekateVerifier::<F, H>::verify(
+        &program_id(&air).unwrap(),
+        &air,
+        &instance,
+        &proof,
+        &mut vt,
+        &config,
+    )
+    .map_err(|e| format!("verifier: {e:?}"))
 }
 
 /// Builds an honest ML-KEM-768 trace,
@@ -275,10 +260,7 @@ where
         })
         .collect();
 
-    let air = MlKemTestProgram {
-        mlkem: mlkem_chiplet,
-        num_public: ct_public.len(),
-    };
+    let air = mlkem_test_program(&mlkem_chiplet, cpu_rows, ct_public.len());
     let instance = ProgramInstance::new(cpu_rows, ct_public);
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(chiplet_traces);
 
@@ -304,7 +286,14 @@ where
         Err(_) => true,
         Ok(proof) => {
             let mut vt = Transcript::<H>::new(b"MLKem_Adversarial");
-            let result = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
+            let result = HekateVerifier::<F, H>::verify(
+                &program_id(&air).unwrap(),
+                &air,
+                &instance,
+                &proof,
+                &mut vt,
+                &config,
+            );
 
             result.is_err() || !result.unwrap()
         }
@@ -376,10 +365,7 @@ where
         })
         .collect();
 
-    let air = MlKemTestProgram {
-        mlkem: mlkem_chiplet,
-        num_public: ct_public.len(),
-    };
+    let air = mlkem_test_program(&mlkem_chiplet, cpu_rows, ct_public.len());
 
     let instance = ProgramInstance::new(cpu_rows, ct_public);
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(chiplet_traces);
@@ -406,7 +392,14 @@ where
         Err(_) => true,
         Ok(proof) => {
             let mut vt = Transcript::<H>::new(b"MLKem_Adversarial");
-            let result = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
+            let result = HekateVerifier::<F, H>::verify(
+                &program_id(&air).unwrap(),
+                &air,
+                &instance,
+                &proof,
+                &mut vt,
+                &config,
+            );
 
             result.is_err() || !result.unwrap()
         }
@@ -648,10 +641,7 @@ fn exploit_ntt_ram_binding_mismatch() {
         .unwrap()
         .build();
 
-    let air = MlKemTestProgram {
-        mlkem: mlkem_chiplet,
-        num_public: 0,
-    };
+    let air = mlkem_test_program(&mlkem_chiplet, cpu_rows, 0);
 
     let instance = ProgramInstance::new(cpu_rows, vec![]);
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(chiplet_traces);
@@ -680,7 +670,14 @@ fn exploit_ntt_ram_binding_mismatch() {
         }
         Ok(proof) => {
             let mut vt = Transcript::<H>::new(b"MLKem_Adversarial");
-            let verify = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
+            let verify = HekateVerifier::<F, H>::verify(
+                &program_id(&air).unwrap(),
+                &air,
+                &instance,
+                &proof,
+                &mut vt,
+                &config,
+            );
 
             assert!(
                 verify.is_err() || !verify.unwrap(),
@@ -751,10 +748,7 @@ fn exploit_ntt_flow_connectivity_scramble() {
         .unwrap()
         .build();
 
-    let air = MlKemTestProgram {
-        mlkem: mlkem_chiplet,
-        num_public: 0,
-    };
+    let air = mlkem_test_program(&mlkem_chiplet, cpu_rows, 0);
 
     let instance = ProgramInstance::new(cpu_rows, vec![]);
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(chiplet_traces);
@@ -783,7 +777,14 @@ fn exploit_ntt_flow_connectivity_scramble() {
         }
         Ok(proof) => {
             let mut vt = Transcript::<H>::new(b"MLKem_FlowExploit");
-            let verify = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
+            let verify = HekateVerifier::<F, H>::verify(
+                &program_id(&air).unwrap(),
+                &air,
+                &instance,
+                &proof,
+                &mut vt,
+                &config,
+            );
 
             assert!(
                 verify.is_err() || !verify.unwrap(),
@@ -970,10 +971,7 @@ fn exploit_keccak_input_unbound() {
         .unwrap()
         .build();
 
-    let air = MlKemTestProgram {
-        mlkem: mlkem_chiplet,
-        num_public: 0,
-    };
+    let air = mlkem_test_program(&mlkem_chiplet, cpu_rows, 0);
 
     let instance = ProgramInstance::new(cpu_rows, vec![]);
     let witness = ProgramWitness::new(cpu_trace).with_chiplets(chiplet_traces);
@@ -1009,7 +1007,14 @@ fn exploit_keccak_input_unbound() {
         Err(_) => true,
         Ok(proof) => {
             let mut vt = Transcript::<H>::new(b"MLKem_Adversarial");
-            let result = HekateVerifier::<F, H>::verify(&air, &instance, &proof, &mut vt, &config);
+            let result = HekateVerifier::<F, H>::verify(
+                &program_id(&air).unwrap(),
+                &air,
+                &instance,
+                &proof,
+                &mut vt,
+                &config,
+            );
 
             result.is_err() || !result.unwrap()
         }
@@ -1055,7 +1060,7 @@ fn exploit_io_phase_skip() {
 
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
-fn exploit_io_address_collision() {
+fn ram_packed_tamper_on_io_row_rejected() {
     let detected = run_tampered_mlkem_768(|traces| {
         let ctrl = &mut traces[0];
         let row = first_row_with_bit(ctrl, MlKemCtrlColumns::IO_SELECTOR);
@@ -1063,7 +1068,7 @@ fn exploit_io_address_collision() {
         flip_b32(ctrl, MlKemCtrlColumns::RAM_VAL_PACKED, row, 0xffff);
     });
 
-    assert!(detected, "IO write address collision must be rejected");
+    assert!(detected, "IO_DATA == RAM_VAL_PACKED on IO rows");
 }
 
 #[test]
@@ -1100,7 +1105,7 @@ fn exploit_io_data_vs_ram_packed_mismatch() {
 
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
-fn exploit_ct_substitution_at_h_ct() {
+fn io_lane_lo_tamper_rejected() {
     let detected = run_tampered_mlkem_768(|traces| {
         let ctrl = &mut traces[0];
         let row = first_row_with_bit(ctrl, MlKemCtrlColumns::IO_LANE_BIND_SEL);
@@ -1108,7 +1113,7 @@ fn exploit_ct_substitution_at_h_ct() {
         flip_b32(ctrl, MlKemCtrlColumns::IO_LANE_LO, row, 0x1);
     });
 
-    assert!(detected, "raw H(ct) read binding must be enforced");
+    assert!(detected, "IO lane packing root");
 }
 
 #[test]
