@@ -297,7 +297,7 @@ fn decode_id(s: &str) -> Option<[u8; 32]> {
     }
 
     let mut out = [0u8; 32];
-    for (i, pair) in hex.chunks_exact(2).enumerate() {
+    for (i, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
         let text = core::str::from_utf8(pair).ok()?;
         out[i] = u8::from_str_radix(text, 16).ok()?;
     }
