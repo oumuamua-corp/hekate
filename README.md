@@ -305,15 +305,15 @@ Cells: ZK / base.
 
 |              | ML-KEM-768        | ML-DSA-44         | ML-DSA-65         | ML-DSA-87         | AES-128           | AES-256           |
 |:-------------|:------------------|:------------------|:------------------|:------------------|:------------------|:------------------|
-| Proving      | 686 / 608 ms      | 982 / 889 ms      | 1.04 / 0.95 s     | 1.55 / 1.44 s     | 1.42 / 1.35 s     | 1.54 / 1.53 s     |
-| Verification | 46.0 / 22.0 ms    | 65.2 / 27.5 ms    | 66.1 / 28.7 ms    | 69.4 / 30.5 ms    | 23.1 / 17.9 ms    | 23.7 / 18.6 ms    |
-| Proof Size   | 3,948 / 3,335 KiB | 4,878 / 4,139 KiB | 4,897 / 4,148 KiB | 6,390 / 5,508 KiB | 5,901 / 5,242 KiB | 6,237 / 5,594 KiB |
-| Peak memory  | 426 / 415 MiB     | 497 / 474 MiB     | 503 / 457 MiB     | 848 / 852 MiB     | 1,190 / 1,130 MiB | 1,484 / 1,425 MiB |
+| Proving      | 629 / 579 ms      | 857 / 777 ms      | 892 / 820 ms      | 1.35 / 1.25 s     | 1.29 / 1.23 s     | 1.41 / 1.34 s     |
+| Verification | 38.4 / 19.1 ms    | 59.5 / 22.5 ms    | 59.7 / 22.6 ms    | 62.1 / 26.7 ms    | 20.7 / 16.4 ms    | 21.7 / 16.7 ms    |
+| Proof Size   | 3,942 / 3,335 KiB | 4,781 / 4,031 KiB | 4,789 / 4,051 KiB | 6,253 / 5,371 KiB | 5,902 / 5,243 KiB | 6,241 / 5,598 KiB |
+| Peak memory  | 450 / 422 MiB     | 451 / 435 MiB     | 450 / 401 MiB     | 800 / 749 MiB     | 1,183 / 1,121 MiB | 1,478 / 1,421 MiB |
 | Chiplets     | 6                 | 7                 | 7                 | 7                 | 2                 | 2                 |
 
 AES note: both AES-128 and AES-256 prove **31,250 blocks** (~500 KB plaintext) per run.
 CPU trace 2^16 rows; Round-AIR and S-box ROM chiplets at 2^19. Per-block proving cost:
-~46 µs (AES-128) / ~50 µs (AES-256).
+~41 µs (AES-128) / ~45 µs (AES-256).
 
 ### Keccak-f[1600], scaling
 
@@ -321,8 +321,8 @@ CPU trace 2^16 rows; Round-AIR and S-box ROM chiplets at 2^19. Per-block proving
 
 | Scale (rows) | Permutations | Hashed  | Proving       | Verify         | Proof Size        | Peak memory       |
 |:-------------|:-------------|:--------|:--------------|:---------------|:------------------|:------------------|
-| 2^15         | 1,310        | ~178 KB | 227 / 195 ms  | 16.8 / 5.3 ms  | 1,081 / 778 KiB   | 140 / 123 MiB     |
-| 2^20         | 41,943       | ~5.4 MB | 4.09 / 3.99 s | 25.3 / 12.9 ms | 4,507 / 3,986 KiB | 2,516 / 2,484 MiB |
+| 2^15         | 1,310        | ~178 KB | 211 / 186 ms  | 16.4 / 5.1 ms  | 1,083 / 782 KiB   | 169 / 131 MiB     |
+| 2^20         | 41,943       | ~5.4 MB | 3.73 / 3.79 s | 24.4 / 12.3 ms | 4,502 / 3,985 KiB | 2,486 / 2,457 MiB |
 
 ### Fibonacci (32-bit integer add), scaling
 
@@ -331,9 +331,9 @@ explicit carry chain, virtual-expanded into 32 bit + 32 sum + 32 carry columns. 
 
 | Scale (rows) | Proving         | Verify         | Proof Size        | Peak memory        |
 |:-------------|:----------------|:---------------|:------------------|:-------------------|
-| 2^20         | 441 / 388 ms    | 7.0 / 3.4 ms   | 1,297 / 739 KiB   | 228 / 144 MiB      |
-| 2^24         | 6.66 / 6.17 s   | 12.6 / 7.0 ms  | 4,555 / 2,834 KiB | 3,318 / 2,018 MiB  |
-| 2^26         | 29.24 / 24.45 s | 21.6 / 10.8 ms | 8,901 / 5,624 KiB | 13,312 / 7,840 MiB |
+| 2^20         | 336 / 287 ms    | 6.1 / 2.5 ms   | 1,295 / 738 KiB   | 250 / 165 MiB      |
+| 2^24         | 5.13 / 4.47 s   | 11.6 / 5.7 ms  | 4,558 / 2,841 KiB | 3,508 / 2,215 MiB  |
+| 2^26         | 23.05 / 18.42 s | 18.9 / 9.3 ms  | 8,903 / 5,630 KiB | 13,846 / 8,712 MiB |
 
 ---
 
